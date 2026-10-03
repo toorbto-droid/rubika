@@ -75,43 +75,80 @@ if DC:
         list(ex.map(_doh, [s.get("ip") if isinstance(s, dict) else str(s) for s in DC[:60]]))
 
 from rubpy import Client as _C
-from Crypto.PublicKey import RSA
-from Crypto.Signature import pkcs1_15
 
-def _import_rsa(pk):
-    if isinstance(pk, bytes): pk = pk.decode()
-    if not pk.startswith('-----BEGIN'):
-        pk = f'-----BEGIN RSA PRIVATE KEY-----\n{pk}\n-----END RSA PRIVATE KEY-----'
-    return pkcs1_15.new(RSA.import_key(pk.encode()))
+# ══════════════════════════════════════════════════════════════
+# patch_v57 — Persistent session (مثل اپلیکیشن اصلی)
+# ══════════════════════════════════════════════════════════════
 
+# ۱) hook روی __aexit__ کلاینت rubpy که بعد از هر بستن session رو ذخیره کنه
+_orig_aexit = _C.__aexit__
+
+async def _patched_aexit(self, *args, **kwargs):
+    try:
+        sess = getattr(self, "session", None)
+        auth = getattr(self, "auth", None)
+        guid = getattr(self, "guid", None)
+        priv = getattr(self, "private_key", None)
+        if sess and auth:
+            # ذخیره auth تازه در session
+            try:
+                if hasattr(sess, "insert"):
+                    sess.insert(
+                        auth=auth,
+                        guid=guid or "",
+                        private_key=priv,
+                        user_agent=getattr(self, "user_agent", None),
+                        phone_number=getattr(self, "phone_number", None),
+                        device_model=getattr(self, "name", None),
+                    )
+            except Exception:
+                pass
+            try:
+                if hasattr(sess, "save"):
+                    sess.save()
+            except Exception:
+                pass
+            try:
+                if hasattr(sess, "close"):
+                    sess.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return await _orig_aexit(self, *args, **kwargs)
+
+_C.__aexit__ = _patched_aexit
+
+
+# ۲) SafeClient با auto-detect .rp
 class SafeClient(_C):
     def __init__(self, *args, **kwargs):
-        # اگه فایل session وجود داره، auth/private_key از آرگومان‌ها حذف کن
-        # تا rubpy از .rp داخلی استفاده کنه
         name = kwargs.get("name") or (args[0] if args else "")
-        session_file = f"{name}.rp" if name else ""
-        if session_file and os.path.exists(session_file):
+        self._session_file = f"{name}.rp" if name else ""
+        # اگه فایل .rp هست، auth/private_key قدیمی رو پاس نده
+        if self._session_file and os.path.exists(self._session_file):
             kwargs.pop("auth", None)
             kwargs.pop("private_key", None)
         super().__init__(*args, **kwargs)
 
     async def start(self, phone_number=None):
-        if not hasattr(self, 'connection'):
+        if not hasattr(self, "connection"):
             await self.connect()
         from rubpy.crypto import Crypto
-        # rubpy خودش auth رو از session خونده
-        if getattr(self, 'auth', None):
+        if getattr(self, "auth", None):
             try: self.decode_auth = Crypto.decode_auth(self.auth)
             except Exception: pass
             try: self.key = Crypto.passphrase(self.auth)
             except Exception: pass
-        if getattr(self, 'private_key', None):
+        if getattr(self, "private_key", None):
             try: self.import_key = _import_rsa(self.private_key)
             except Exception: pass
         last_err = None
         for attempt in range(4):
             try:
-                r = await self.get_me(); self.guid = r.user.user_guid; return self
+                r = await self.get_me()
+                self.guid = r.user.user_guid
+                return self
             except Exception as e:
                 last_err = e
                 err = str(e).upper()
@@ -121,6 +158,15 @@ class SafeClient(_C):
                     await asyncio.sleep(1.5); continue
                 await asyncio.sleep(2)
         raise RuntimeError(f"AUTH_DEAD: {type(last_err).__name__}: {str(last_err)[:120]}")
+
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
+
+def _import_rsa(pk):
+    if isinstance(pk, bytes): pk = pk.decode()
+    if not pk.startswith('-----BEGIN'):
+        pk = f'-----BEGIN RSA PRIVATE KEY-----\n{pk}\n-----END RSA PRIVATE KEY-----'
+    return pkcs1_15.new(RSA.import_key(pk.encode()))
 
 def _g(o, *names, default=None):
     for n in names:
