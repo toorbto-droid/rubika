@@ -1,1 +1,1 @@
-worker: python rubika_tg_bot.py
+worker: python app.py
