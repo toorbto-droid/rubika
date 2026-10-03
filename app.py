@@ -85,15 +85,27 @@ def _import_rsa(pk):
     return pkcs1_15.new(RSA.import_key(pk.encode()))
 
 class SafeClient(_C):
+    def __init__(self, *args, **kwargs):
+        # اگه فایل session وجود داره، auth/private_key از آرگومان‌ها حذف کن
+        # تا rubpy از .rp داخلی استفاده کنه
+        name = kwargs.get("name") or (args[0] if args else "")
+        session_file = f"{name}.rp" if name else ""
+        if session_file and os.path.exists(session_file):
+            kwargs.pop("auth", None)
+            kwargs.pop("private_key", None)
+        super().__init__(*args, **kwargs)
+
     async def start(self, phone_number=None):
-        if not hasattr(self, 'connection'): await self.connect()
+        if not hasattr(self, 'connection'):
+            await self.connect()
         from rubpy.crypto import Crypto
-        if self.auth:
+        # rubpy خودش auth رو از session خونده
+        if getattr(self, 'auth', None):
             try: self.decode_auth = Crypto.decode_auth(self.auth)
             except Exception: pass
             try: self.key = Crypto.passphrase(self.auth)
             except Exception: pass
-        if self.private_key:
+        if getattr(self, 'private_key', None):
             try: self.import_key = _import_rsa(self.private_key)
             except Exception: pass
         last_err = None
@@ -109,7 +121,6 @@ class SafeClient(_C):
                     await asyncio.sleep(1.5); continue
                 await asyncio.sleep(2)
         raise RuntimeError(f"AUTH_DEAD: {type(last_err).__name__}: {str(last_err)[:120]}")
-
 
 def _g(o, *names, default=None):
     for n in names:
