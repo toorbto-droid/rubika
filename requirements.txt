@@ -10,3 +10,4 @@ python-multipart>=0.0.9
 websockets>=12.0
 rubpy>=7.0.0
 rulog>=1.0.3
+nest_asyncio>=1.6.0
