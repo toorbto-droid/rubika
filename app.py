@@ -1,24 +1,19 @@
-# app.py — v59 (Persistent Session + Version Display)
+# app.py — v60 (Fixed Session Persistence)
 # pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
 
-# ══════════════════════════════════════════════════════════════
-VERSION = "v59"
-# ══════════════════════════════════════════════════════════════
+VERSION = "v60"
 
 def _detect_data_dir():
-    # اگه env var هست، از اون استفاده کن
     env = os.environ.get("DATA_DIR", "").strip()
     if env and os.path.isdir(env) and os.access(env, os.W_OK):
         return env
-    # اگه Railway هست، /data
     if os.environ.get("RAILWAY_ENVIRONMENT"):
         for c in ["/data", "/app/data"]:
             if os.path.isdir(c) and os.access(c, os.W_OK):
                 return c
-    # وگرنه پوشه فعلی
     return os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIR = _detect_data_dir()
@@ -107,13 +102,13 @@ def _import_rsa(pk):
 
 
 # ══════════════════════════════════════════════════════════════
-# SafeClient v59 — Persistent auth
+# SafeClient v60 — auth منبع حقیقت، بدون فایل .rp
 # ══════════════════════════════════════════════════════════════
 _AUTH_SAVE_LOCK = threading.Lock()
 
 
 def _save_auth_now(aid, bot):
-    """auth تازه rubpy رو توی accounts.json ذخیره کن."""
+    """auth + key تازه رو توی accounts.json ذخیره کن."""
     if not aid: return False
     try:
         new_auth = getattr(bot, "auth", None)
@@ -126,10 +121,11 @@ def _save_auth_now(aid, bot):
             if accounts[aid].get("auth") != new_auth:
                 accounts[aid]["auth"] = new_auth
                 changed = True
+            # ★ key (passphrase) رو هم ذخیره کن — مثل سندر
             if new_key:
                 key_str = new_key if isinstance(new_key, str) else str(new_key)
-                if accounts[aid].get("session_key") != key_str:
-                    accounts[aid]["session_key"] = key_str
+                if accounts[aid].get("key") != key_str:
+                    accounts[aid]["key"] = key_str
                     changed = True
             if changed:
                 save_accounts(accounts)
@@ -141,14 +137,16 @@ def _save_auth_now(aid, bot):
 
 class SafeClient(_C):
     def __init__(self, *args, **kwargs):
-        # aid رو جدا کن — rubpy نمیشناسه
         self._aid = kwargs.pop("_aid", None)
         name = kwargs.get("name") or (args[0] if args else "")
         self._session_file = f"{name}.rp" if name else ""
-        # اگه فایل .rp وجود داره، auth/private_key قدیمی رو پاس نده
+        # ═══ CRITICAL FIX: فایل .rp رو حذف کن — auth قدیمی رو نمی‌خوایم ═══
         if self._session_file and os.path.exists(self._session_file):
-            kwargs.pop("auth", None)
-            kwargs.pop("private_key", None)
+            try:
+                os.remove(self._session_file)
+                print(f"[session] removed stale {self._session_file}")
+            except Exception: pass
+        # auth و private_key رو همیشه پاس بده
         super().__init__(*args, **kwargs)
 
     async def start(self, phone_number=None):
@@ -168,7 +166,6 @@ class SafeClient(_C):
             try:
                 r = await self.get_me()
                 self.guid = r.user.user_guid
-                # ★ ذخیره auth تازه بعد از اولین درخواست موفق
                 _save_auth_now(self._aid, self)
                 return self
             except Exception as e:
@@ -182,33 +179,13 @@ class SafeClient(_C):
         raise RuntimeError(f"AUTH_DEAD: {type(last_err).__name__}: {str(last_err)[:120]}")
 
     async def __aexit__(self, *args, **kwargs):
-        # ★ قبل از بستن، auth تازه رو ذخیره کن
-        try:
-            _save_auth_now(self._aid, self)
+        # ★ قبل از بستن، auth رو ذخیره کن
+        try: _save_auth_now(self._aid, self)
         except Exception: pass
-        # ★ ذخیره session rubpy
-        try:
-            sess = getattr(self, "session", None)
-            auth = getattr(self, "auth", None)
-            guid = getattr(self, "guid", None)
-            priv = getattr(self, "private_key", None)
-            if sess and auth:
-                try:
-                    if hasattr(sess, "insert"):
-                        sess.insert(
-                            auth=auth, guid=guid or "", private_key=priv,
-                            user_agent=getattr(self, "user_agent", None),
-                            phone_number=getattr(self, "phone_number", None),
-                            device_model=getattr(self, "name", None),
-                        )
-                except Exception: pass
-                try:
-                    if hasattr(sess, "save"): sess.save()
-                except Exception: pass
-                try:
-                    if hasattr(sess, "close"): sess.close()
-                except Exception: pass
-        except Exception: pass
+        # ★ فایل .rp رو پاک کن — نمی‌خوایم هرگز session فایل داشته باشیم
+        if self._session_file and os.path.exists(self._session_file):
+            try: os.remove(self._session_file)
+            except Exception: pass
         return await super().__aexit__(*args, **kwargs)
 
 
@@ -255,9 +232,6 @@ def _is_auth_error(ex):
 
 BAD_STATUS = {"left", "kicked", "banned", "deleted", "removed", "restricted",
               "no_access", "blocked", "inactive", "closed"}
-HARD_REASONS = {"not-found", "left", "kicked", "banned", "deleted", "removed",
-                "no_access", "info-error", "is_deleted", "is_removed",
-                "is_kicked", "is_banned"}
 
 def _is_ok_response(r):
     if r is None: return True
@@ -364,7 +338,6 @@ def extract_chat_guid(r):
                     if g: return g
     return _candidate_guid(r)
 
-def _clean(s): return re.sub(r'[*_`\[\]]', '', str(s))
 def _fmt_time(sec):
     sec = int(sec)
     if sec < 60: return f"{sec}s"
@@ -434,7 +407,6 @@ except Exception: pass
 
 MAX_ERRORS = 100
 RATE_LIMIT_WAIT = 20 * 60
-
 ANCHORS = {}
 JL_JOBS = {}
 
@@ -447,7 +419,6 @@ DEFAULT_CFG = {
 
 TG_TOKEN = (os.environ.get("TG_TOKEN","").strip()
             or "8921325744:AAF77FCsmhkFBJ01gvMOi3HK8Ed00sf2ZmE")
-
 
 _errors_lock = threading.Lock()
 
@@ -466,8 +437,7 @@ def add_error(source, error, target=None, account=None):
                 "target": str(target or "")[:120],
                 "account": str(account or "")[:60],
             })
-            if len(errors) > MAX_ERRORS:
-                errors = errors[-MAX_ERRORS:]
+            if len(errors) > MAX_ERRORS: errors = errors[-MAX_ERRORS:]
             try: _save(ERRORS_FILE, errors)
             except Exception: pass
     except Exception: pass
@@ -532,8 +502,7 @@ class TaskQueue:
             for t in self.tasks:
                 if t["id"] in idset and t["status"] in ("in_progress","pending"):
                     t["status"] = "pending"; t["assigned_to"] = None
-                    if t.get("attempts", 0) > 0:
-                        t["attempts"] -= 1
+                    if t.get("attempts", 0) > 0: t["attempts"] -= 1
             self._save()
     def stats(self):
         s = {"pending":0,"in_progress":0,"done":0,"failed":0}
@@ -549,15 +518,14 @@ class TaskQueue:
 def list_accounts(): return _load(ACC_FILE, {})
 def save_accounts(a): _save(ACC_FILE, a)
 def get_account(aid): return list_accounts().get(aid)
-def update_account_field(aid, key, value):
-    accounts = list_accounts()
-    if aid in accounts: accounts[aid][key] = value; save_accounts(accounts)
+
 def remove_account(aid, keep_session=False):
     accounts = list_accounts(); a = accounts.pop(aid, None); save_accounts(accounts)
-    if a and a.get("session_name") and not keep_session:
+    if a and a.get("session_name"):
         for f in glob.glob(a["session_name"] + "*"):
             try: os.remove(f)
             except Exception: pass
+
 def remove_channel_from_storage(aid, idx):
     accounts = list_accounts()
     if aid not in accounts: return None
@@ -565,16 +533,22 @@ def remove_channel_from_storage(aid, idx):
     if idx < 0 or idx >= len(chans): return None
     removed = chans.pop(idx); accounts[aid]["channels"] = chans
     save_accounts(accounts); return removed
+
 def add_channel_to_storage(aid, ch_data):
     accounts = list_accounts()
     if aid in accounts:
         accounts[aid].setdefault("channels",[]).append(ch_data)
         save_accounts(accounts)
+
 def update_channel_field(aid, idx, key, value):
     accounts = list_accounts()
     if aid in accounts and idx < len(accounts[aid].get("channels",[])):
         accounts[aid]["channels"][idx][key] = value
         save_accounts(accounts)
+
+def update_account_field(aid, key, value):
+    accounts = list_accounts()
+    if aid in accounts: accounts[aid][key] = value; save_accounts(accounts)
 
 
 async def rubika_send_code(phone):
@@ -608,13 +582,6 @@ async def rubika_complete_login(ctx, code):
     except Exception: pass
     try: c.import_key = _import_rsa(ctx["priv"])
     except Exception: pass
-    try:
-        c.session.insert(auth=auth, guid=sign.user.user_guid, user_agent=c.user_agent,
-                          phone_number=sign.user.phone, private_key=ctx["priv"])
-    except Exception: pass
-    try:
-        if hasattr(c.session, "save"): c.session.save()
-    except Exception: pass
     try: await c.register_device(device_model=c.name)
     except Exception: pass
     name = getattr(sign.user, "first_name", None) or sign.user.phone
@@ -626,6 +593,10 @@ async def rubika_complete_login(ctx, code):
                                    "user_guid": sign.user.user_guid})
             accounts[aid].setdefault("channels",[])
             save_accounts(accounts)
+            # ★ فایل .rp رو پاک کن
+            for f in glob.glob(ctx["session_name"] + "*"):
+                try: os.remove(f)
+                except Exception: pass
             return {"ok": True, "aid": aid, "name": name, "relogin": True}
     aid = "acc_" + secrets.token_hex(4)
     accounts[aid] = {"phone": phone, "auth": auth, "private_key": ctx["priv"],
@@ -633,6 +604,10 @@ async def rubika_complete_login(ctx, code):
                      "created": int(time.time()),
                      "user_guid": sign.user.user_guid, "channels": []}
     save_accounts(accounts)
+    # ★ فایل .rp رو پاک کن
+    for f in glob.glob(ctx["session_name"] + "*"):
+        try: os.remove(f)
+        except Exception: pass
     return {"ok": True, "aid": aid, "name": name, "relogin": False}
 
 
@@ -968,17 +943,18 @@ def _is_true_group(c):
     t = (c.get("type") or "").strip()
     if t != "Group": return False
     guid = str(c.get("guid") or "")
-    if guid and guid[0].lower() == "c":
-        return False
+    if guid and guid[0].lower() == "c": return False
     return True
 
 async def get_live_channels(bot):
     return [c for c in await get_all_chats_raw(bot) if c["type"] == "Channel"]
+
 async def collect_pv(bot):
     chats = await get_all_chats_raw(bot)
     me = await bot.get_me(); my = me.user.user_guid
     return [{"type":"pv","target":c["guid"],"name":c["title"] or "دوست"}
             for c in chats if c["type"]=="User" and c["guid"]!=my and not c["is_blocked"]]
+
 async def collect_groups(bot):
     chats = await get_all_chats_raw(bot)
     return [{"type":"group","target":c["guid"],"name":c["title"] or c["guid"][:15],
@@ -1128,17 +1104,13 @@ def _save_op(op):
 def _op_stats(op):
     if op.get("type") == "joinlef":
         p = op.get("progress") or {}
-        joined = p.get("joined", 0)
-        failed = p.get("failed", 0)
-        total = p.get("total", 0)
-        done = joined + failed
-        pending = max(0, total - done)
-        st = op.get("status", "")
+        joined = p.get("joined", 0); failed = p.get("failed", 0)
+        total = p.get("total", 0); done = joined + failed
+        pending = max(0, total - done); st = op.get("status", "")
         in_prog = 1 if (st == "running" and (total == 0 or pending > 0)) else 0
         return {"done": joined, "failed": failed,
                 "pending": pending, "in_progress": in_prog, "total": total}
-    q = TaskQueue(QUEUE_FILE)
-    ids = set(op.get("task_ids") or [])
+    q = TaskQueue(QUEUE_FILE); ids = set(op.get("task_ids") or [])
     s = {"done":0,"failed":0,"pending":0,"in_progress":0,"total":0}
     for t in q.tasks:
         if t.get("id") in ids:
@@ -1192,12 +1164,10 @@ def _op_status_label(st):
 
 def _op_progress_bar(op):
     s = _op_stats(op)
-    done = s["done"] + s["failed"]
-    tot = s["total"] or 0
+    done = s["done"] + s["failed"]; tot = s["total"] or 0
     if tot == 0:
         return ("▰"*8 + "▱"*8 + " در حال آماده‌سازی…", 0) if s["in_progress"] else ("▱"*16 + " 0%", 0)
-    pct = int(done * 100 / tot)
-    fill = int(done * 16 / tot)
+    pct = int(done * 100 / tot); fill = int(done * 16 / tot)
     return "▰"*fill + "▱"*(16-fill) + f" {pct}%", pct
 
 
@@ -1265,13 +1235,8 @@ async def can_send_to(bot, guid, kind="", raw=None):
 
 
 async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
-    found = set()
-    anchor = None
-    read_total = 0
-    batch = 25
-    rounds = 0
-    max_rounds = 50
-    seen_ids = set()
+    found = set(); anchor = None; read_total = 0; batch = 25
+    rounds = 0; max_rounds = 50; seen_ids = set()
     while read_total < limit and rounds < max_rounds:
         rounds += 1
         try:
@@ -1288,8 +1253,7 @@ async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
             mid = m.get("id")
             if mid is None: continue
             if mid in seen_ids: continue
-            seen_ids.add(mid)
-            new_msgs.append(m)
+            seen_ids.add(mid); new_msgs.append(m)
         if not new_msgs:
             if log: log("   تکراری، توقف")
             break
@@ -1460,8 +1424,6 @@ async def worker(aid, acc, queue, st, cfg, stop, log):
                                         batch_rate_limited = True; break
                                     ids = []
                                 ANCHORS[akey] = ids
-                                if not ids:
-                                    add_error("anchor", "message_id استخراج نشد", None, nm)
                             if use_forward and ids and t["target"] != my_guid:
                                 await forward_from_anchor(bot, t["target"], my_guid, ids)
                             else:
@@ -1479,7 +1441,6 @@ async def worker(aid, acc, queue, st, cfg, stop, log):
                                         await tg_send(
                                             f"⏸ <b>محدودیت روبیکا</b>\n"
                                             f"اکانت: <b>{esc(nm)}</b>\n"
-                                            f"متن: <code>{esc(err[:200])}</code>\n\n"
                                             f"⏳ ۲۰ دقیقه توقف."
                                         )
                                     except Exception: pass
@@ -1577,8 +1538,7 @@ async def _try_join_single(bot, link):
                 first_err = _fmt_error(e)
                 if "ALREADY" in first_err.upper() or "MEMBER" in first_err.upper():
                     return True, "join_group(already)"
-        else:
-            first_err = "join_group missing"
+        else: first_err = "join_group missing"
         fn = getattr(bot, "join_channel_by_link", None)
         if fn:
             try:
@@ -1613,11 +1573,9 @@ async def _try_join_single(bot, link):
                     g = (found.get("channel_guid") or found.get("group_guid") or
                          found.get("object_guid") or found.get("chat_guid") or
                          found.get("guid"))
-                    if g:
-                        guid = g; break
+                    if g: guid = g; break
             except Exception: continue
-        if not guid:
-            return False, "no-guid-for:" + bare[:40]
+        if not guid: return False, "no-guid-for:" + bare[:40]
         if guid[0].lower() == "c":
             fn = getattr(bot, "join_channel_action", None)
             if fn:
@@ -1661,11 +1619,9 @@ async def run_joiner_lefter(op, log):
         "joined": 0, "failed": 0, "total": 0,
         "phase": "شروع", "extracted": 0,
         "verified": 0, "new_chats": 0,
-        "linkdoni_ok": [], "linkdoni_fail": [],
-        "link_errors": [],
+        "linkdoni_ok": [], "linkdoni_fail": [], "link_errors": [],
     }
-    op["status"] = "running"
-    op["errors"] = []
+    op["status"] = "running"; op["errors"] = []
     _save_op(op)
     for aid in sel:
         a = accounts.get(aid)
@@ -1705,9 +1661,7 @@ async def run_joiner_lefter(op, log):
                     op["progress"]["phase"] = "هیچ لینکدونی"
                     _save_op(op); return
                 op["progress"]["phase"] = "۲/۴ صبر برای سینک"
-                _save_op(op)
-                log("⏳ " + acc_name + ": ۱۵ ثانیه استراحت")
-                await asyncio.sleep(15)
+                _save_op(op); await asyncio.sleep(15)
                 op["progress"]["phase"] = "۳/۴ استخراج لینک"
                 _save_op(op)
                 ordered_links = {}
@@ -1716,11 +1670,9 @@ async def run_joiner_lefter(op, log):
                     try:
                         found = await _extract_links_from_bot(bot, guid, limit=500, want=None, log=log)
                         for l in found:
-                            if l not in ordered_links:
-                                ordered_links[l] = True
+                            if l not in ordered_links: ordered_links[l] = True
                         op["progress"]["extracted"] = len(ordered_links)
                         _save_op(op)
-                        log("   کل: " + str(len(ordered_links)))
                     except Exception as e:
                         add_error("استخراج", _fmt_error(e), guid, acc_name)
                 if not ordered_links:
@@ -1730,7 +1682,7 @@ async def run_joiner_lefter(op, log):
                 op["progress"]["total"] = len(all_links)
                 op["progress"]["phase"] = "۴/۴ جوین"
                 _save_op(op)
-                log("🤝 " + acc_name + ": " + str(len(all_links)) + " لینک یکتا، هدف " + str(max_join))
+                log("🤝 " + acc_name + ": " + str(len(all_links)) + " لینک، هدف " + str(max_join))
                 before_chats = set()
                 try:
                     bc = await get_all_chats_raw(bot)
@@ -1739,7 +1691,7 @@ async def run_joiner_lefter(op, log):
                 seen_hashes = set()
                 for i, link in enumerate(all_links):
                     if max_join and op["progress"]["joined"] >= max_join:
-                        log("   ✅ به هدف رسیدیم (" + str(max_join) + ")")
+                        log("   ✅ به هدف رسیدیم")
                         break
                     if op["status"] == "cancelled": break
                     h = _hash_of(link)
@@ -1749,12 +1701,10 @@ async def run_joiner_lefter(op, log):
                         ok, msg = await _try_join_single(bot, link)
                         if ok:
                             op["progress"]["joined"] += 1
-                            log("   ✅ [" + str(op["progress"]["joined"]) + "] " + link[:55] + " → " + msg)
+                            log("   ✅ [" + str(op["progress"]["joined"]) + "] " + link[:55])
                         else:
                             op["progress"]["failed"] += 1
                             op["progress"]["link_errors"].append((link, str(msg)[:100]))
-                            if op["progress"]["failed"] <= 20:
-                                log("   ❌ " + link[:55] + " → " + str(msg)[:80])
                     except Exception as e:
                         op["progress"]["failed"] += 1
                         op["progress"]["link_errors"].append((link, _fmt_error(e)[:100]))
@@ -1763,62 +1713,25 @@ async def run_joiner_lefter(op, log):
                     _save_op(op)
                     await asyncio.sleep(4)
                 op["progress"]["phase"] = "verify"
-                _save_op(op)
-                log("🔍 verify...")
-                await asyncio.sleep(8)
+                _save_op(op); await asyncio.sleep(8)
                 try:
                     after = await get_all_chats_raw(bot)
                     after_guids = {c["guid"] for c in after}
                     new_guids = after_guids - before_chats
-                    op["progress"]["verified"] = len(new_guids)
                     op["progress"]["new_chats"] = len(new_guids)
                     log("   📊 چت جدید: " + str(len(new_guids)))
-                    log("   ✅ پیام موفق: " + str(op["progress"]["joined"]))
-                except Exception as e:
-                    log("   ⚠️ verify: " + _fmt_error(e)[:100])
+                except Exception: pass
             await with_bot(a, job, 3600, aid=aid)
         except asyncio.CancelledError:
             op["status"] = "cancelled"
             op["progress"]["phase"] = "لغو شد"
-            _save_op(op)
-            raise
+            _save_op(op); raise
         except Exception as e:
-            err_txt = type(e).__name__ + ": " + _fmt_error(e)
-            op.setdefault("errors", []).append(acc_name + ": " + err_txt)
+            op.setdefault("errors", []).append(acc_name + ": " + type(e).__name__)
     if op.get("status") != "cancelled":
-        op["status"] = "done"
-        op["progress"]["phase"] = "تمام"
+        op["status"] = "done"; op["progress"]["phase"] = "تمام"
     op["finished_at"] = int(time.time())
     _save_op(op)
-    p = op.get("progress") or {}
-    log("🎯 تمام: جوین " + str(p.get("joined",0)) +
-        " | چت جدید " + str(p.get("new_chats",0)))
-
-
-async def _session_keepalive_loop():
-    while True:
-        try:
-            await asyncio.sleep(4 * 60)
-        except asyncio.CancelledError:
-            raise
-        accounts = list_accounts()
-        for aid, acc in list(accounts.items()):
-            try:
-                cli = SafeClient(
-                    name=acc["session_name"], auth=acc.get("auth"),
-                    private_key=acc.get("private_key"),
-                    phone_number=acc["phone"], _aid=aid,
-                    platform='Android', display_welcome=False,
-                    timeout=30, max_retries=2,
-                )
-                try:
-                    async with cli as bot:
-                        await bot.get_me()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            await asyncio.sleep(3)
 
 
 async def with_bot(acc, fn, timeout=90, aid=None):
@@ -1917,7 +1830,6 @@ def log_cb(msg):
         loop.create_task(tg_send(str(msg)))
     except Exception as e: print(f"[!] log_cb: {e}")
 
-
 def get_conv(cid):
     c = STATE["conv"].get(cid)
     if not c: c = STATE["conv"][cid] = {}
@@ -1929,7 +1841,6 @@ async def show_main():
     accounts = list_accounts()
     ops = _load_ops()
     running_ops = [o for o in ops if _op_effective_status(o) == "running"]
-    # ★ VERSION نمایش داده می‌شه
     txt = head("🤖", f"پنل ربات روبیکا — {VERSION}")
     txt += f"📱 اکانت‌ها: <b>{len(accounts)}</b>\n"
     txt += f"📊 عملیات‌ها: <b>{len(ops)}</b>\n"
@@ -2033,10 +1944,8 @@ async def show_channel_view(aid, idx):
 
 
 SCHEDULE_OPTIONS = [
-    ("0", "⚡️ آنی", 0),
-    ("1h", "۱ ساعت بعد", 3600),
-    ("3h", "۳ ساعت بعد", 3*3600),
-    ("12h", "۱۲ ساعت بعد", 12*3600),
+    ("0", "⚡️ آنی", 0), ("1h", "۱ ساعت بعد", 3600),
+    ("3h", "۳ ساعت بعد", 3*3600), ("12h", "۱۲ ساعت بعد", 12*3600),
     ("24h", "۲۴ ساعت بعد", 24*3600),
 ]
 MAX_OPTIONS = [50, 100, 500, 1000]
@@ -2063,8 +1972,7 @@ def _send_summary(s):
     if "all" in accs: acc_label = f"همه ({len(all_a)})"
     elif not accs: acc_label = "—"
     elif len(accs) == 1:
-        a = get_account(accs[0])
-        acc_label = a.get("name","?") if a else "?"
+        a = get_account(accs[0]); acc_label = a.get("name","?") if a else "?"
     else:
         names = []
         for aid in accs[:3]:
@@ -2076,20 +1984,17 @@ def _send_summary(s):
     elif p.get("file"):
         msg_label = f"{KIND_ICON.get(p.get('kind'),'📎')} {p.get('file_name','فایل')}"
         if p.get("text"): msg_label += f" + «{short(p.get('text'),20)}»"
-    else:
-        msg_label = f"💬 «{short(p.get('text'),30)}»"
+    else: msg_label = f"💬 «{short(p.get('text'),30)}»"
     tgt = {"pv":"خصوصی","groups":"گروه‌ها","both":"هر دو"}.get(s.get("target","both"),"?")
     mx = s.get("max",0) or 0
     mx_label = f"{mx}" if mx else "بدون محدودیت"
-    sch = s.get("schedule",0)
-    sch_label = "آنی"
+    sch = s.get("schedule",0); sch_label = "آنی"
     if sch > 0:
         for code, label, secs in SCHEDULE_OPTIONS:
             if secs == sch: sch_label = label; break
         else: sch_label = _fmt_time(sch) + " بعد"
     return (f"📋 <b>خلاصه</b>\n"
-            f"👤 {esc(acc_label)}\n"
-            f"✉️ {esc(msg_label)}\n"
+            f"👤 {esc(acc_label)}\n✉️ {esc(msg_label)}\n"
             f"🎯 مقصد: <b>{esc(tgt)}</b>\n"
             f"🔢 حداکثر: <b>{esc(mx_label)}</b>\n"
             f"⏰ زمان: <b>{esc(sch_label)}</b>")
@@ -2109,16 +2014,12 @@ async def send_step_accounts(cid, s):
     rows.append([B("✅ لغو انتخاب همه" if all_sel else "☑ همه", "send:accall")])
     rows.append([B("▶️ مرحله بعد: پیام", "send:accnext")])
     rows.append([B("🏠 منو","menu:main")])
-    txt = head("📤","ارسال — انتخاب اکانت")
-    txt += "کدام اکانت(ها)؟\n\n" + _send_summary(s)
+    txt = head("📤","ارسال — انتخاب اکانت") + "کدام اکانت(ها)؟\n\n" + _send_summary(s)
     await panel(txt, kb_(*rows))
 
 async def send_step_compose(cid, s):
     txt = head("📤","ارسال — تنظیم پیام")
-    txt += ("یک پیام بفرست — می‌تونه:\n"
-            "• فقط متن\n"
-            "• فقط فایل (عکس/PDF/ZIP)\n"
-            "• هر دو (فایل با کپشن)\n\n")
+    txt += ("یک پیام بفرست:\n• فقط متن\n• فقط فایل\n• هر دو\n\n")
     txt += _send_summary(s)
     rows = []
     if s.get("payload"):
@@ -2132,7 +2033,7 @@ async def send_step_target(cid, s):
     tgt = s.get("target","both")
     rows = [
         [B(("✅ " if tgt=="pv" else "")+"👤 خصوصی (PV)", "send:tgt:pv")],
-        [B(("✅ " if tgt=="groups" else "")+"👥 گروه‌ها (بدون کانال)", "send:tgt:groups")],
+        [B(("✅ " if tgt=="groups" else "")+"👥 گروه‌ها", "send:tgt:groups")],
         [B(("✅ " if tgt=="both" else "")+"📨 هر دو", "send:tgt:both")],
         [B("▶️ مرحله بعد: حداکثر", "send:tgtnext")],
         [B("⬅️ پیام","send:prev")],
@@ -2157,13 +2058,12 @@ async def send_step_max(cid, s):
     rows.append([B("▶️ مرحله بعد: زمان‌بندی", "send:maxnext")])
     rows.append([B("⬅️ مقصد","send:prev")])
     rows.append([B("🏠 منو","menu:main")])
-    txt = (head("📤","ارسال — حداکثر پیام") +
-           "چند پیام حداکثر ارسال بشه؟\n\n" + _send_summary(s))
+    txt = head("📤","ارسال — حداکثر پیام") + "چند پیام حداکثر؟\n\n" + _send_summary(s)
     await panel(txt, kb_(*rows))
 
 async def send_step_schedule(cid, s):
     sch = s.get("schedule",0)
-    rows = [[B(("✅ " if sch==0 else "")+"⚡️ آنی (همین حالا)", "send:sch:0")]]
+    rows = [[B(("✅ " if sch==0 else "")+"⚡️ آنی", "send:sch:0")]]
     row = []
     for code, label, secs in SCHEDULE_OPTIONS[1:3]:
         row.append(B(("✅ " if sch==secs else "")+label, f"send:sch:{code}"))
@@ -2175,12 +2075,11 @@ async def send_step_schedule(cid, s):
     rows.append([B("▶️ آنالیز و تایید", "send:schedulenext")])
     rows.append([B("⬅️ حداکثر","send:prev")])
     rows.append([B("🏠 منو","menu:main")])
-    txt = (head("📤","ارسال — زمان‌بندی") +
-           "چه زمانی شروع بشه؟\n\n" + _send_summary(s))
+    txt = head("📤","ارسال — زمان‌بندی") + "چه زمانی شروع بشه؟\n\n" + _send_summary(s)
     await panel(txt, kb_(*rows))
 
 async def send_step_confirm(cid, s):
-    await panel("⏳ در حال آنالیز و تایید گروه‌ها...")
+    await panel("⏳ در حال آنالیز...")
     accounts = list_accounts()
     sel = s.get("accounts") or []
     if "all" in sel: sel = list(accounts.keys())
@@ -2188,9 +2087,7 @@ async def send_step_confirm(cid, s):
         s["step"] = "accounts"
         return await panel("⚠️ اکانت انتخاب نشده.", kb_([B("🏠 منو","menu:main")]))
     tgt = s.get("target","both")
-    total_targets = []
-    skipped = []
-    errors = []
+    total_targets = []; skipped = []; errors = []
     for aid in sel:
         a = accounts.get(aid)
         if not a: continue
@@ -2228,7 +2125,6 @@ async def send_step_confirm(cid, s):
                 valid_flags = await with_bot(a, validate_all, 120, aid=aid)
             except Exception as e:
                 errors.append(f"{a.get('name','?')}: validation {type(e).__name__}")
-                add_error("اعتبارسنجی", f"{type(e).__name__}: {_fmt_error(e)}", None, acc_name)
                 valid_flags = [True] * len(gr)
             for it, ok in zip(gr, valid_flags):
                 if not ok: continue
@@ -2236,25 +2132,18 @@ async def send_step_confirm(cid, s):
                 it["payload"] = s.get("payload") or {"kind":"text","text":"سلام"}
                 total_targets.append(it)
         except Exception as e:
-            err_txt = f"{type(e).__name__}: {_fmt_error(e)}"
             errors.append(f"{a.get('name','?')}: {type(e).__name__}")
-            add_error("آنالیز", err_txt, None, acc_name)
     mx = s.get("max",0) or 0
-    if mx and len(total_targets) > mx:
-        total_targets = total_targets[:mx]
+    if mx and len(total_targets) > mx: total_targets = total_targets[:mx]
     s["_targets"] = total_targets
-    s["_analysis_errors"] = errors
-    s["_skipped"] = skipped
+    s["_analysis_errors"] = errors; s["_skipped"] = skipped
     txt = head("📊","آنالیز")
     txt += f"📦 مقصد تایید شده: <b>{len(total_targets)}</b>\n"
-    if skipped:
-        txt += f"🚫 رد شده: <b>{len(skipped)}</b> <i>(جزئیات در «آمار ← خطاها»)</i>\n"
-    if errors:
-        txt += f"\n⚠️ اکانت‌های دارای خطا: <b>{len(errors)}</b>\n"
+    if skipped: txt += f"🚫 رد شده: <b>{len(skipped)}</b>\n"
+    if errors: txt += f"\n⚠️ خطا: <b>{len(errors)}</b>\n"
     txt += "\n" + _send_summary(s)
     rows = []
-    if total_targets:
-        rows.append([B("✅ تایید و شروع ارسال", "send:go")])
+    if total_targets: rows.append([B("✅ تایید و شروع ارسال", "send:go")])
     rows.append([B("⚠️ مشاهده خطاها", "menu:errors")])
     rows.append([B("✏️ ویرایش", "send:back_edit")])
     rows.append([B("❌ لغو", "send:cancel")])
@@ -2284,8 +2173,7 @@ async def show_stats():
             prog = f"{s['done']+s['failed']}/{s['total']}" if s['total'] else "—"
             rows.append([B(f"{ico} {short(_op_short_title(op,28),32)} · {prog}",
                            f"op:view:{op['id']}")])
-    else:
-        txt += "\n\nهنوز عملیاتی ثبت نشده."
+    else: txt += "\n\nهنوز عملیاتی ثبت نشده."
     rows.append([B("⚠️ خطاها", "menu:errors")])
     rows.append([B("🏠 منو","menu:main")])
     await panel(txt, kb_(*rows))
@@ -2329,13 +2217,10 @@ async def show_op_detail(oid):
     op = _get_op(oid)
     if not op: return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
     st = _op_effective_status(op)
-    ico = _op_status_icon(st)
-    ttl = _op_status_label(st)
-    s = _op_stats(op)
-    bar, _ = _op_progress_bar(op)
+    ico = _op_status_icon(st); ttl = _op_status_label(st)
+    s = _op_stats(op); bar, _ = _op_progress_bar(op)
     txt = head("📋", f"جزئیات {op['id']}")
-    txt += f"{ico} <b>{esc(ttl)}</b>\n\n"
-    txt += f"<code>{esc(bar)}</code>\n\n"
+    txt += f"{ico} <b>{esc(ttl)}</b>\n\n<code>{esc(bar)}</code>\n\n"
     if op.get("type") == "joinlef":
         p = op.get("progress") or {}
         txt += f"📍 مرحله: <b>{esc(p.get('phase','—'))}</b>\n\n"
@@ -2343,13 +2228,10 @@ async def show_op_detail(oid):
         txt += f"❌ ناموفق: <b>{s['failed']}</b>\n"
         txt += f"⏳ در انتظار: <b>{s['pending']}</b>\n"
         txt += f"📊 مجموع: <b>{s['total']}</b>\n\n"
-        if p.get("extracted"):
-            txt += f"🔗 لینک استخراج‌شده: <b>{p.get('extracted')}</b>\n"
-        if p.get("new_chats") is not None:
-            txt += f"📈 چت‌های واقعی جدید: <b>{p.get('new_chats',0)}</b>\n"
-        txt += f"🔢 حداکثر درخواستی: <b>{op.get('max_join',0) or 'بدون محدودیت'}</b>\n"
-        ok_l = p.get("linkdoni_ok") or []
-        fail_l = p.get("linkdoni_fail") or []
+        if p.get("extracted"): txt += f"🔗 لینک استخراج‌شده: <b>{p.get('extracted')}</b>\n"
+        if p.get("new_chats") is not None: txt += f"📈 چت‌های جدید: <b>{p.get('new_chats',0)}</b>\n"
+        txt += f"🔢 حداکثر: <b>{op.get('max_join',0) or 'بدون محدودیت'}</b>\n"
+        ok_l = p.get("linkdoni_ok") or []; fail_l = p.get("linkdoni_fail") or []
         if ok_l or fail_l:
             txt += f"\n📥 <b>لینکدونی‌ها:</b> ✅{len(ok_l)} ❌{len(fail_l)}\n"
             for link, err in fail_l[:3]:
@@ -2365,8 +2247,7 @@ async def show_op_detail(oid):
         if op.get("finished_at"):
             txt += f"🏁 پایان: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(op['finished_at'])))}</b>\n"
         rows = []
-        if st == "running":
-            rows.append([B("⏹ توقف", f"op:stop:{oid}")])
+        if st == "running": rows.append([B("⏹ توقف", f"op:stop:{oid}")])
         rows.append([B("⬅️ آمار","menu:stats"), B("🏠 منو","menu:main")])
         return await panel(txt, kb_(*rows))
     txt += f"✅ موفق: <b>{s['done']}</b>\n"
@@ -2374,23 +2255,14 @@ async def show_op_detail(oid):
     txt += f"⏳ انتظار: <b>{s['pending']}</b>\n"
     txt += f"🔄 جاری: <b>{s['in_progress']}</b>\n\n"
     p = op.get("payload") or {}
-    if p.get("file"):
-        txt += f"📎 فایل: <b>{esc(p.get('file_name','?'))}</b>\n"
-    if p.get("text"):
-        txt += f"💬 متن: <code>{esc(short(p.get('text'),200))}</code>\n"
-    if not p.get("file") and not p.get("text"):
-        txt += "💬 —\n"
+    if p.get("file"): txt += f"📎 فایل: <b>{esc(p.get('file_name','?'))}</b>\n"
+    if p.get("text"): txt += f"💬 متن: <code>{esc(short(p.get('text'),200))}</code>\n"
     txt += f"\n🎯 مقصد: <b>{esc(_op_target_label(op))}</b>\n"
     created = op.get("created",0)
     txt += f"📅 ارسال شده در: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(created)) if created else '—')}</b>\n"
-    sch = op.get("scheduled_at",0)
-    if st == "scheduled" and sch:
-        txt += f"⏰ شروع: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(sch)))}</b>\n"
     rows = []
-    if st == "running":
-        rows.append([B("⏹ توقف ارسال", f"op:stop:{oid}")])
-    elif st == "paused":
-        rows.append([B("▶️ از سرگیری", f"op:resume:{oid}")])
+    if st == "running": rows.append([B("⏹ توقف ارسال", f"op:stop:{oid}")])
+    elif st == "paused": rows.append([B("▶️ از سرگیری", f"op:resume:{oid}")])
     elif st == "scheduled":
         rows.append([B("⚡️ شروع فوری", f"op:force:{oid}")])
         rows.append([B("❌ لغو زمان‌بندی", f"op:cancel:{oid}")])
@@ -2401,7 +2273,6 @@ async def show_op_detail(oid):
 
 
 OP_VIEW_TASKS = {}
-
 async def op_view_loop(cid, oid):
     try:
         for _ in range(400):
@@ -2411,26 +2282,22 @@ async def op_view_loop(cid, oid):
             st = _op_effective_status(op)
             await show_op_detail(oid)
             if st in ("done","failed","cancelled"): return
-    except asyncio.CancelledError:
-        raise
-
+    except asyncio.CancelledError: raise
 def stop_op_view(cid):
     t = OP_VIEW_TASKS.pop(cid, None)
     if t: t.cancel()
-
 def start_op_view(cid, oid):
     stop_op_view(cid)
     OP_VIEW_TASKS[cid] = asyncio.create_task(op_view_loop(cid, oid))
 
 
 CFG_FIELDS = [
-    ("delay","⏱ تاخیر بین پیام‌ها","s",1,0,120),
-    ("cooldown","❄️ استراحت بعد محدودیت","s",30,0,3600),
-    ("batch_per_account","📦 پیام در هر دسته","",1,1,20),
-    ("max_parallel","🚀 اکانت هم‌زمان","",1,1,10),
-    ("max_attempts","🔁 تلاش مجدد","",1,1,10),
+    ("delay","⏱ تاخیر","s",1,0,120),
+    ("cooldown","❄️ استراحت","s",30,0,3600),
+    ("batch_per_account","📦 دسته","",1,1,20),
+    ("max_parallel","🚀 هم‌زمان","",1,1,10),
+    ("max_attempts","🔁 تلاش","",1,1,10),
 ]
-
 def _fmt_num(v):
     try:
         v = float(v)
@@ -2439,14 +2306,14 @@ def _fmt_num(v):
 
 async def show_cfg():
     cfg = _load(CFG_FILE, DEFAULT_CFG)
-    txt = head("⚙️","تنظیمات سرعت ارسال")
+    txt = head("⚙️","تنظیمات")
     rows = []
     for key, label, unit, step, lo, hi in CFG_FIELDS:
         v = cfg.get(key, DEFAULT_CFG[key])
         v_str = _fmt_num(v) + unit
         txt += f"{label}: <b>{esc(v_str)}</b>\n"
         rows.append([B("➖", f"cfg:adj:{key}:-1"), B(v_str, "noop"), B("➕", f"cfg:adj:{key}:1")])
-    txt += f"\n⏸ زمان توقف محدودیت: <b>{RATE_LIMIT_WAIT//60} دقیقه</b>"
+    txt += f"\n⏸ محدودیت: <b>{RATE_LIMIT_WAIT//60} دقیقه</b>"
     txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>"
     txt += f"\n🔖 نسخه: <b>{VERSION}</b>"
     rows.append([B("🏠 منو","menu:main")])
@@ -2467,32 +2334,19 @@ async def adjust_cfg(key, sign):
 async def show_help():
     txt = (head("❓","راهنما") +
            f"🔖 نسخه: <b>{VERSION}</b>\n\n"
-           "📤 <b>ارسال</b>\n"
-           "  پیام به گروه‌ها و PV — <b>کانال‌ها داخل ارسال نیستن</b>\n\n"
-           "🤝 <b>Joiner</b>\n"
-           "  • عضویت در کانال‌های لینکدونی\n"
-           "  • خواندن پیام‌ها و استخراج لینک\n"
-           "  • عضویت در لینک‌های جدید (به تعداد دلخواه)\n\n"
-           "📊 <b>آمار</b>\n"
-           "  جزئیات زنده + چت‌های واقعی جدید\n\n"
-           "⚠️ <b>خطاها</b>\n"
-           "  ۱۰۰ خطای اخیر\n\n"
-           "💾 <b>ذخیره‌سازی</b>\n"
-           f"  همه فایل‌ها در <code>{esc(DATA_DIR)}</code>\n"
-           "  روی Railway Volume باقی می‌مونن\n\n"
-           "🔐 <b>session پایدار</b>\n"
-           "  auth خودکار refresh و ذخیره می‌شه.\n"
-           "  keepalive هر ۴ دقیقه.\n\n"
-           "⏸ <b>محدودیت روبیکا</b>\n"
-           f"  در صورت «استفاده بیش از حد»، {RATE_LIMIT_WAIT//60} دقیقه توقف خودکار.\n\n"
-           "<i>فایل‌ها تا ۲۰MB.</i>")
+           "📤 ارسال — پیام به گروه‌ها و PV\n"
+           "🤝 Joiner — جوین در لینکدونی‌ها و استخراج لینک\n"
+           "📊 آمار — جزئیات زنده\n"
+           "⚠️ خطاها — ۱۰۰ خطای اخیر\n"
+           f"💾 همه فایل‌ها در <code>{esc(DATA_DIR)}</code>\n\n"
+           "🔐 session: auth تو <code>accounts.json</code> نگه داشته می‌شه، بدون فایل .rp.\n"
+           "⏸ محدودیت: ۲۰ دقیقه توقف خودکار.")
     await panel(txt, kb_([B("🏠 منو","menu:main")]))
 
 
 def _jl_conv(cid):
     c = get_conv(cid)
-    if "jl" not in c:
-        c["jl"] = {"step":"account","accounts":[],"max_join":0}
+    if "jl" not in c: c["jl"] = {"step":"account","accounts":[],"max_join":0}
     return c["jl"]
 
 async def show_jl_step(cid):
@@ -2514,12 +2368,7 @@ async def jl_step_account(cid, s):
                        f"jl:acc:{aid}")])
     rows.append([B("▶️ مرحله بعد", "jl:next")])
     rows.append([B("🏠 منو","menu:main")])
-    txt = (head("🤝","Joiner") +
-           "کدوم اکانت(ها)؟\n\n"
-           "این عملیات شامل:\n"
-           "• عضویت در کانال‌های لینکدونی پیش‌فرض\n"
-           "• خواندن پیام‌های لینکدونی‌ها و استخراج لینک\n"
-           "• عضویت در لینک‌های جدید (به تعداد دلخواه)\n\n"
+    txt = (head("🤝","Joiner") + "کدوم اکانت(ها)؟\n\n" +
            f"🎯 لینکدونی‌ها: <code>{esc(', '.join(JOIN_DEFAULTS))}</code>")
     await panel(txt, kb_(*rows))
 
@@ -2539,8 +2388,7 @@ async def jl_step_max(cid, s):
     rows.append([B("▶️ مرحله بعد", "jl:next")])
     rows.append([B("⬅️", "jl:back")])
     txt = (head("🤝","Joiner — حداکثر") +
-           "حداکثر چند لینک از لینکدونی‌ها استخراج و جوین بشم؟\n\n"
-           f"🎯 فعلاً: <b>{'بدون محدودیت' if mx==0 else mx}</b>")
+           f"حداکثر چند لینک؟\n\n🎯 فعلاً: <b>{'بدون محدودیت' if mx==0 else mx}</b>")
     await panel(txt, kb_(*rows))
 
 async def jl_step_confirm(cid, s):
@@ -2552,9 +2400,8 @@ async def jl_step_confirm(cid, s):
         return await panel("⚠️ اکانت انتخاب نشده.", kb_([B("🏠 منو","menu:main")]))
     txt = head("🤝","تایید Joiner")
     txt += f"👤 اکانت: <b>{len(sel)}</b>\n"
-    txt += f"🎯 لینکدونی پیش‌فرض: <b>{len(JOIN_DEFAULTS)}</b>\n"
-    txt += f"🔢 حداکثر جوین: <b>{'بدون محدودیت' if not s.get('max_join') else s['max_join']}</b>\n\n"
-    txt += "شروع کنم؟"
+    txt += f"🎯 لینکدونی: <b>{len(JOIN_DEFAULTS)}</b>\n"
+    txt += f"🔢 حداکثر جوین: <b>{'بدون محدودیت' if not s.get('max_join') else s['max_join']}</b>\n\nشروع کنم؟"
     await panel(txt, kb_(
         [B("✅ شروع", "jl:go")],
         [B("✏️ ویرایش", "jl:back")],
@@ -2579,11 +2426,14 @@ async def cmd_menu(update, context):
 
 async def cmd_version(update, context):
     if not authorized(update): return
-    await update.message.reply_text(
-        f"🔖 <b>{VERSION}</b>\n"
-        f"💾 <code>{DATA_DIR}</code>\n"
-        f"📱 اکانت‌ها: {len(list_accounts())}",
-        parse_mode="HTML")
+    accounts = list_accounts()
+    txt = f"🔖 <b>{VERSION}</b>\n💾 <code>{DATA_DIR}</code>\n📱 اکانت‌ها: {len(accounts)}"
+    if accounts:
+        txt += "\n\n"
+        for aid, a in accounts.items():
+            has_rp = os.path.exists(a.get("session_name","") + ".rp")
+            txt += f"• {a.get('name','?')} — .rp: {'❌' if not has_rp else '✅'}\n"
+    await update.message.reply_text(txt, parse_mode="HTML")
 
 
 PROF_PROMPT = {"name":"👤 اسم جدید:","bio":"📖 بیو جدید:",
@@ -2611,16 +2461,12 @@ async def on_callback(update, context):
 async def route_cb(cid, data):
     p = data.split(":")
     h = p[0]
-    if data == "conv:cancel":
-        clear_conv(cid); return await show_main()
+    if data == "conv:cancel": clear_conv(cid); return await show_main()
     if data == "menu:main":
         stop_op_view(cid); clear_conv(cid); return await show_main()
-    if data == "menu:acc":
-        stop_op_view(cid); return await show_accounts()
-    if data == "menu:stats":
-        stop_op_view(cid); return await show_stats()
-    if data == "menu:errors":
-        return await show_errors()
+    if data == "menu:acc": stop_op_view(cid); return await show_accounts()
+    if data == "menu:stats": stop_op_view(cid); return await show_stats()
+    if data == "menu:errors": return await show_errors()
     if data == "menu:cfg": return await show_cfg()
     if data == "menu:help": return await show_help()
 
@@ -2628,8 +2474,7 @@ async def route_cb(cid, data):
         sub = p[1] if len(p) > 1 else ""
         if sub == "page": return await show_errors(int(p[2]))
         if sub == "clear":
-            clear_errors()
-            await tg_send("🗑 خطاها پاک شد")
+            clear_errors(); await tg_send("🗑 خطاها پاک شد")
             return await show_errors()
 
     if h == "send":
@@ -2639,12 +2484,10 @@ async def route_cb(cid, data):
             s["step"] = "accounts"; s["accounts"] = s.get("accounts") or []
             return await show_send_step(cid)
         if sub == "jl":
-            c = get_conv(cid)
-            c["jl"] = {"step":"account","accounts":[],"max_join":0}
+            c = get_conv(cid); c["jl"] = {"step":"account","accounts":[],"max_join":0}
             return await jl_step_account(cid, c["jl"])
         if sub == "acc" and len(p) >= 3:
-            aid = p[2]
-            sel = s.setdefault("accounts", [])
+            aid = p[2]; sel = s.setdefault("accounts", [])
             if "all" in sel: sel.remove("all")
             if aid in sel: sel.remove(aid)
             else: sel.append(aid)
@@ -2656,16 +2499,12 @@ async def route_cb(cid, data):
         if sub == "accnext":
             if not s.get("accounts"): return await show_send_step(cid)
             s["step"] = "compose"; return await show_send_step(cid)
-        if sub == "recompose":
-            s["step"] = "compose"; s["payload"] = None
-            return await show_send_step(cid)
+        if sub == "recompose": s["step"] = "compose"; s["payload"] = None; return await show_send_step(cid)
         if sub == "composenext":
             if not s.get("payload"): return await show_send_step(cid)
             s["step"] = "target"; return await show_send_step(cid)
-        if sub == "tgt" and len(p) >= 3:
-            s["target"] = p[2]; return await show_send_step(cid)
-        if sub == "tgtnext":
-            s["step"] = "max"; return await show_send_step(cid)
+        if sub == "tgt" and len(p) >= 3: s["target"] = p[2]; return await show_send_step(cid)
+        if sub == "tgtnext": s["step"] = "max"; return await show_send_step(cid)
         if sub == "max" and len(p) >= 3:
             v = p[2]
             if v == "custom":
@@ -2674,67 +2513,44 @@ async def route_cb(cid, data):
             try: s["max"] = int(v)
             except: pass
             return await show_send_step(cid)
-        if sub == "maxnext":
-            s["step"] = "schedule"; return await show_send_step(cid)
+        if sub == "maxnext": s["step"] = "schedule"; return await show_send_step(cid)
         if sub == "sch" and len(p) >= 3:
             code = p[2]
             for c2, label, secs in SCHEDULE_OPTIONS:
-                if c2 == code:
-                    s["schedule"] = secs; break
+                if c2 == code: s["schedule"] = secs; break
             return await show_send_step(cid)
-        if sub == "schedulenext":
-            s["step"] = "confirm"; return await show_send_step(cid)
-        if sub == "back":
-            s["step"] = "accounts"; return await show_send_step(cid)
+        if sub == "schedulenext": s["step"] = "confirm"; return await show_send_step(cid)
+        if sub == "back": s["step"] = "accounts"; return await show_send_step(cid)
         if sub == "prev":
             order = ["accounts","compose","target","max","schedule","confirm"]
             i = order.index(s.get("step","accounts"))
             s["step"] = order[max(0, i-1)]
             return await show_send_step(cid)
-        if sub == "back_edit":
-            s["step"] = "accounts"; return await show_send_step(cid)
-        if sub == "cancel":
-            clear_conv(cid); return await show_main()
+        if sub == "back_edit": s["step"] = "accounts"; return await show_send_step(cid)
+        if sub == "cancel": clear_conv(cid); return await show_main()
         if sub == "go":
             accounts = list_accounts()
             sel = s.get("accounts") or []
             if "all" in sel: sel = list(accounts.keys())
             payload = s.get("payload") or {"kind":"text","text":"سلام"}
             targets = s.get("_targets") or []
-            if not targets:
-                return await panel("⚠️ چیزی برای ارسال نیست.",
-                                   kb_([B("🏠 منو","menu:main")]))
-            op = {
-                "id": "op_" + secrets.token_hex(5),
-                "created": int(time.time()),
-                "scheduled_at": int(time.time()) + s.get("schedule",0),
-                "payload": payload,
-                "target": s.get("target","both"),
-                "max": s.get("max",0) or 0,
-                "accounts": sel,
-                "status": "draft",
-                "task_ids": [],
-                "_targets": targets,
-            }
+            if not targets: return await panel("⚠️ چیزی برای ارسال نیست.", kb_([B("🏠 منو","menu:main")]))
+            op = {"id": "op_" + secrets.token_hex(5), "created": int(time.time()),
+                  "scheduled_at": int(time.time()) + s.get("schedule",0),
+                  "payload": payload, "target": s.get("target","both"),
+                  "max": s.get("max",0) or 0, "accounts": sel,
+                  "status": "draft", "task_ids": [], "_targets": targets}
             if s.get("schedule",0) > 0:
-                op["status"] = "scheduled"
-                _save_op(op)
-                clear_conv(cid)
-                await panel(
-                    head("⏰","زمان‌بندی شد") +
-                    f"⏰ شروع: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(op['scheduled_at'])))}</b>\n"
-                    f"📦 تعداد: <b>{len(targets)}</b>",
-                    kb_([B("📊 مشاهده","menu:stats")],[B("🏠 منو","menu:main")]))
+                op["status"] = "scheduled"; _save_op(op); clear_conv(cid)
+                await panel(head("⏰","زمان‌بندی شد") +
+                            f"📦 تعداد: <b>{len(targets)}</b>",
+                            kb_([B("📊 مشاهده","menu:stats")],[B("🏠 منو","menu:main")]))
             else:
-                n = await op_start_now(op)
-                clear_conv(cid)
-                await panel(
-                    head("🚀","ارسال شروع شد") +
-                    f"📦 تعداد: <b>{n}</b>\n"
-                    f"🎯 مقصد: <b>{esc(_op_target_label(op))}</b>",
-                    kb_([B("📊 آمار","menu:stats")],
-                        [B("⏹ توقف","op:stop:"+op["id"])],
-                        [B("🏠 منو","menu:main")]))
+                n = await op_start_now(op); clear_conv(cid)
+                await panel(head("🚀","ارسال شروع شد") + f"📦 تعداد: <b>{n}</b>",
+                            kb_([B("📊 آمار","menu:stats")],
+                                [B("⏹ توقف","op:stop:"+op["id"])],
+                                [B("🏠 منو","menu:main")]))
                 if not (STATE["job"] and not STATE["job"].done()):
                     cfg = _load(CFG_FILE, DEFAULT_CFG)
                     async def _job():
@@ -2747,30 +2563,22 @@ async def route_cb(cid, data):
     if h == "op":
         sub = p[1] if len(p) > 1 else ""
         oid = p[2] if len(p) > 2 else None
-        if sub == "view" and oid:
-            start_op_view(cid, oid)
-            return await show_op_detail(oid)
+        if sub == "view" and oid: start_op_view(cid, oid); return await show_op_detail(oid)
         if sub == "stop" and oid:
             op = _get_op(oid)
             if op:
                 if op.get("type") == "joinlef":
                     t = JL_JOBS.get(oid)
                     if t and not t.done(): t.cancel()
-                    op["status"] = "cancelled"
-                    op["progress"] = op.get("progress") or {}
-                    op["progress"]["phase"] = "لغو شد"
-                    op["finished_at"] = int(time.time())
-                    _save_op(op)
-                    await tg_send("⛔ Joiner لغو شد")
+                    op["status"] = "cancelled"; op["finished_at"] = int(time.time())
+                    _save_op(op); await tg_send("⛔ Joiner لغو شد")
                 else:
                     op["status"] = "paused"
                     q = TaskQueue(QUEUE_FILE)
                     for t in q.tasks:
                         if t.get("op_id") == oid and t["status"] in ("pending","in_progress"):
                             t["status"] = "paused"
-                    q._save()
-                    _save_op(op)
-                    await tg_send("⏸ توقف داده شد")
+                    q._save(); _save_op(op); await tg_send("⏸ توقف داده شد")
             return await show_op_detail(oid)
         if sub == "resume" and oid:
             op = _get_op(oid)
@@ -2780,8 +2588,7 @@ async def route_cb(cid, data):
                 for t in q.tasks:
                     if t.get("op_id") == oid and t["status"] == "paused":
                         t["status"] = "pending"; t["assigned_to"] = None
-                q._save()
-                _save_op(op)
+                q._save(); _save_op(op)
                 if not (STATE["job"] and not STATE["job"].done()):
                     cfg = _load(CFG_FILE, DEFAULT_CFG)
                     async def _job():
@@ -2792,26 +2599,19 @@ async def route_cb(cid, data):
                 await tg_send("▶️ از سرگیری")
             return await show_op_detail(oid)
         if sub == "force" and oid:
-            await op_activate_scheduled(oid)
-            await tg_send("⚡️ شروع شد")
+            await op_activate_scheduled(oid); await tg_send("⚡️ شروع شد")
             return await show_op_detail(oid)
         if sub == "cancel" and oid:
             op = _get_op(oid)
-            if op:
-                op["status"] = "cancelled"; op.pop("_targets", None)
-                _save_op(op)
-                await tg_send("⛔ لغو شد")
+            if op: op["status"] = "cancelled"; op.pop("_targets", None); _save_op(op); await tg_send("⛔ لغو شد")
             return await show_op_detail(oid)
         if sub == "repeat" and oid:
             op = _get_op(oid)
             if not op: return await show_stats()
             s = _send_conv(cid)
-            s["step"] = "accounts"
-            s["accounts"] = op.get("accounts") or []
-            s["payload"] = op.get("payload")
-            s["target"] = op.get("target","both")
-            s["max"] = op.get("max",0)
-            s["schedule"] = 0
+            s["step"] = "accounts"; s["accounts"] = op.get("accounts") or []
+            s["payload"] = op.get("payload"); s["target"] = op.get("target","both")
+            s["max"] = op.get("max",0); s["schedule"] = 0
             return await show_send_step(cid)
 
     if h == "acc":
@@ -2819,12 +2619,12 @@ async def route_cb(cid, data):
         if sub == "page": return await show_accounts(int(p[2]))
         if sub == "add":
             get_conv(cid)["acc"] = {"step":"phone"}
-            return await ask("📞 شماره را بفرست:\nمثال: <code>989121234567</code>")
+            return await ask("📞 شماره:\nمثال: <code>989121234567</code>")
         if sub == "view": return await show_account_detail(p[2])
         if sub == "del":
             a = get_account(p[2])
             if not a: return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
-            return await panel(f"🗑 اکانت <b>{esc(a.get('name','?'))}</b> حذف بشه؟",
+            return await panel(f"🗑 حذف <b>{esc(a.get('name','?'))}</b>؟",
                                kb_([B("✅ بله", f"acc:delok:{p[2]}")],
                                    [B("❌ انصراف", f"acc:view:{p[2]}")]))
         if sub == "delok":
@@ -2836,8 +2636,7 @@ async def route_cb(cid, data):
             await panel(f"⏳ ارسال کد به {esc(a.get('phone','?'))}...")
             try: ctx = await rubika_send_code(a["phone"])
             except Exception as e:
-                return await panel(f"❌ {esc(str(e)[:200])}",
-                                   kb_([B("⬅️", f"acc:view:{aid}")]))
+                return await panel(f"❌ {esc(str(e)[:200])}", kb_([B("⬅️", f"acc:view:{aid}")]))
             if ctx.get("status") == "SendPassKey":
                 get_conv(cid)["acc"] = {"step":"passkey","ctx":ctx,"relogin":aid}
                 return await ask(f"🔐 2FA\n{esc(ctx.get('hint') or '—')}")
@@ -2872,10 +2671,8 @@ async def route_cb(cid, data):
             a = get_account(aid); chans = (a or {}).get("channels",[])
             if not a or idx >= len(chans): return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
             await panel("⏳ در حال ساخت لینک...")
-            try:
-                ok, link = await with_bot(a, lambda b: rubika_create_join_link(b, chans[idx]["guid"]), aid=aid)
-            except Exception as e:
-                ok, link = False, _fmt_error(e)
+            try: ok, link = await with_bot(a, lambda b: rubika_create_join_link(b, chans[idx]["guid"]), aid=aid)
+            except Exception as e: ok, link = False, _fmt_error(e)
             if ok: update_channel_field(aid, idx, "join_link", link)
             return await panel((f"✅ لینک:\n<code>{esc(link)}</code>" if ok
                                 else f"⚠️ {esc(str(link)[:200])}"),
@@ -2884,7 +2681,7 @@ async def route_cb(cid, data):
             aid, idx = p[2], int(p[3])
             a = get_account(aid); chans = (a or {}).get("channels",[])
             if not a or idx >= len(chans): return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
-            return await panel(f"🗑 کانال <b>{esc(chans[idx].get('title','?'))}</b> حذف بشه؟",
+            return await panel(f"🗑 حذف کانال <b>{esc(chans[idx].get('title','?'))}</b>؟",
                                kb_([B("✅ بله", f"chan:delok:{aid}:{idx}")],
                                    [B("❌ انصراف", f"chan:view:{aid}:{idx}")]))
         if sub == "delok":
@@ -2892,8 +2689,7 @@ async def route_cb(cid, data):
             a = get_account(aid); chans = (a or {}).get("channels",[])
             if not a or idx >= len(chans): return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
             await panel("⏳ در حال حذف...")
-            try:
-                ok, info = await with_bot(a, lambda b: rubika_remove_channel(b, chans[idx]["guid"]), aid=aid)
+            try: ok, info = await with_bot(a, lambda b: rubika_remove_channel(b, chans[idx]["guid"]), aid=aid)
             except Exception as e: ok, info = False, _fmt_error(e)
             if ok: remove_channel_from_storage(aid, idx)
             return await panel(("✅ حذف شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
@@ -2905,16 +2701,13 @@ async def route_cb(cid, data):
         c["jl"] = s
         sub = p[1] if len(p) > 1 else ""
         if sub == "acc" and len(p) >= 3:
-            aid = p[2]
-            sel = s.setdefault("accounts", [])
+            aid = p[2]; sel = s.setdefault("accounts", [])
             if aid in sel: sel.remove(aid)
             else: sel.append(aid)
             return await jl_step_account(cid, s)
         if sub == "next":
-            if s["step"] == "account":
-                s["step"] = "max"; return await jl_step_max(cid, s)
-            elif s["step"] == "max":
-                s["step"] = "confirm"; return await jl_step_confirm(cid, s)
+            if s["step"] == "account": s["step"] = "max"; return await jl_step_max(cid, s)
+            elif s["step"] == "max": s["step"] = "confirm"; return await jl_step_confirm(cid, s)
         if sub == "back":
             if s["step"] == "max": s["step"] = "account"
             elif s["step"] == "confirm": s["step"] = "max"
@@ -2927,23 +2720,15 @@ async def route_cb(cid, data):
             try: s["max_join"] = int(v)
             except: pass
             return await jl_step_max(cid, s)
-        if sub == "cancel":
-            c.pop("jl", None)
-            return await show_main()
+        if sub == "cancel": c.pop("jl", None); return await show_main()
         if sub == "go":
-            op = {
-                "id": "jl_" + secrets.token_hex(5),
-                "created": int(time.time()),
-                "type": "joinlef",
-                "accounts": s.get("accounts") or [],
-                "max_join": s.get("max_join",0) or 0,
-                "status": "running",
-                "progress": {"joined":0,"failed":0,"total":0,"phase":"شروع",
-                             "linkdoni_ok":[], "linkdoni_fail":[], "link_errors":[]},
-                "errors": [],
-            }
-            _save_op(op)
-            c.pop("jl", None)
+            op = {"id": "jl_" + secrets.token_hex(5), "created": int(time.time()),
+                  "type": "joinlef", "accounts": s.get("accounts") or [],
+                  "max_join": s.get("max_join",0) or 0, "status": "running",
+                  "progress": {"joined":0,"failed":0,"total":0,"phase":"شروع",
+                               "linkdoni_ok":[], "linkdoni_fail":[], "link_errors":[]},
+                  "errors": []}
+            _save_op(op); c.pop("jl", None)
             task = asyncio.create_task(run_joiner_lefter(op, log_cb))
             JL_JOBS[op["id"]] = task
             start_op_view(cid, op["id"])
@@ -2959,23 +2744,18 @@ async def op_start_now(op):
     tid_map = []
     for t in targets:
         t.setdefault("id", secrets.token_hex(8))
-        t["op_id"] = op["id"]
-        t["use_forward"] = True
+        t["op_id"] = op["id"]; t["use_forward"] = True
         tid_map.append(t["id"])
     n = await q.add(targets)
-    op["task_ids"] = tid_map
-    op["status"] = "queued"
-    op["started_at"] = time.time()
-    op.pop("_targets", None)
-    _save_op(op)
-    return n
+    op["task_ids"] = tid_map; op["status"] = "queued"
+    op["started_at"] = time.time(); op.pop("_targets", None)
+    _save_op(op); return n
 
 async def op_activate_scheduled(op_id):
     op = _get_op(op_id)
     if not op or op.get("status") != "scheduled": return
     targets = op.get("_targets") or []
-    if not targets:
-        op["status"] = "empty"; _save_op(op); return
+    if not targets: op["status"] = "empty"; _save_op(op); return
     await op_start_now(op)
 
 
@@ -3005,8 +2785,7 @@ async def on_message(update, context):
         jl = get_conv(cid).get("jl") or {}
         if wait == "max":
             try: v = int(text); jl["max_join"] = max(0, v)
-            except Exception:
-                return await ask("🔢 عدد نامعتبر. دوباره:")
+            except Exception: return await ask("🔢 عدد نامعتبر. دوباره:")
             get_conv(cid)["jl"] = jl
             return await jl_step_max(cid, jl)
 
@@ -3015,13 +2794,11 @@ async def on_message(update, context):
         s = _send_conv(cid)
         if wait == "max":
             try: s["max"] = max(0, int(text))
-            except Exception:
-                return await ask("🔢 عدد نامعتبر. دوباره:")
+            except Exception: return await ask("🔢 عدد نامعتبر. دوباره:")
             return await show_send_step(cid)
         if wait == "sch":
             try: s["schedule"] = max(0, int(text)*60)
-            except Exception:
-                return await ask("⏰ عدد نامعتبر. دوباره (دقیقه):")
+            except Exception: return await ask("⏰ عدد نامعتبر. دوباره:")
             return await show_send_step(cid)
 
     if "send" in conv:
@@ -3029,15 +2806,12 @@ async def on_message(update, context):
         if s.get("step") == "compose":
             STATE["panel"].pop(cid, None)
             try: media = await extract_tg_media(msg)
-            except Exception as e:
-                return await ask("✉️ پیام را دوباره بفرست:", note=str(e)[:150])
+            except Exception as e: return await ask("✉️ پیام را دوباره بفرست:", note=str(e)[:150])
             cap = (msg.caption or msg.text or "").strip()
-            if not media and not cap:
-                return await ask("✉️ یک متن یا فایل بفرست:")
+            if not media and not cap: return await ask("✉️ یک متن یا فایل بفرست:")
             s["payload"] = ({**media, "text": cap} if media
                             else {"kind":"text","text":cap,"file":None})
-            s["step"] = "target"
-            return await show_send_step(cid)
+            s["step"] = "target"; return await show_send_step(cid)
 
     if "acc" in conv:
         a = conv["acc"]; step = a.get("step")
@@ -3045,8 +2819,7 @@ async def on_message(update, context):
         if step == "phone":
             ph = text.replace("+","").replace(" ","").replace("-","")
             if ph.startswith("0"): ph = "98" + ph[1:]
-            if not ph.isdigit() or len(ph) < 10:
-                return await ask("📞 شماره نامعتبر. دوباره:")
+            if not ph.isdigit() or len(ph) < 10: return await ask("📞 شماره نامعتبر. دوباره:")
             await panel("⏳ ارسال کد...")
             try: ctx = await rubika_send_code(ph)
             except Exception as e:
@@ -3142,8 +2915,7 @@ async def on_message(update, context):
                 "join_link": link, "created": int(time.time())})
             idx = len(get_account(aid).get("channels",[])) - 1
             txt = head("✅", text[:60]) + f"🆔 <code>{esc(guid)}</code>"
-            if not public:
-                txt += f"\n🔗 {esc(link)}" if link else "\n⚠️ لینک ساخته نشد"
+            if not public: txt += f"\n🔗 {esc(link)}" if link else "\n⚠️ لینک ساخته نشد"
             return await panel(txt, kb_([B("⚙️ مدیریت", f"chan:view:{aid}:{idx}")],
                                          [B("⬅️", f"chan:list:{aid}")]))
         if step == "edit":
@@ -3217,8 +2989,6 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.create_task(_scheduler_loop())
-    loop.create_task(_session_keepalive_loop())
-    print("[+] keepalive started")
 
     print("[+] polling...")
     APP.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=30.0)
