@@ -1,5 +1,5 @@
 # app.py — v62 (login با pyrubi — session پایدار)
-# pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx pyrubi
+# pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx pyrubi pyrogram tgcrypto
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
@@ -131,7 +131,6 @@ def _save_auth_now(aid, bot):
         new_auth = getattr(bot, "auth", None)
         if not new_auth: return False
 
-        # ★ private_key از import_key استخراج کن
         new_private = None
         imp = getattr(bot, "import_key", None)
         if imp is not None and hasattr(imp, "export_key"):
@@ -168,7 +167,6 @@ class SafeClient(_C):
         self._aid = kwargs.pop("_aid", None)
         self._lock = _get_account_lock(self._aid)
         name = kwargs.get("name") or (args[0] if args else "")
-        # ★ اگه name خالیه، از aid اسم بساز
         if not name:
             name = f"session_{self._aid or secrets.token_hex(4)}"
             if args:
@@ -209,15 +207,12 @@ class SafeClient(_C):
             try:
                 r = await self.get_me()
                 self.guid = r.user.user_guid
-
-                # ★ چک عملیاتی — auth باید برای خواندن چت‌ها کار کنه
                 try:
                     await self.get_chats()
                 except Exception as e2:
                     err2 = (str(e2) + " " + _fmt_error(e2)).upper()
                     if "INVALID_AUTH" in err2 or "NOT_REGISTERED" in err2:
                         raise RuntimeError(f"AUTH_DEAD: {err2[:120]}")
-
                 _save_auth_now(self._aid, self)
                 return self
             except RuntimeError:
@@ -600,7 +595,7 @@ def update_account_field(aid, key, value):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ login/session با pyrubi — دقیقاً مثل کدِ کارکننده
+# ★ login/session با pyrubi — با apiVersion=6
 # ══════════════════════════════════════════════════════════════
 async def rubika_send_code(phone):
     """Login با pyrubi — send code"""
@@ -611,6 +606,7 @@ async def rubika_send_code(phone):
         methods = Methods(
             sessionData={},
             platform=client.platform,
+            apiVersion=6,
             proxy=client.proxy,
             timeOut=client.timeOut,
             showProgressBar=False,
@@ -672,14 +668,12 @@ async def rubika_complete_login(ctx, code):
     if signInData.get("status") != "OK":
         return {"ok": False, "status": signInData.get("status", "?")}
 
-    # ★ decrypt auth با private_key برگشتی از signIn
     auth_plain = Cryption.decryptRsaOaep(
         signInData["private_key"], signInData["auth"]
     )
     private_key = signInData["private_key"]
     user = signInData["user"]
 
-    # ★ register device
     def _sync_register():
         try:
             methods.registerDevice(deviceModel=f"pyrubi-{ctx['client'].session}")
@@ -688,7 +682,6 @@ async def rubika_complete_login(ctx, code):
 
     await loop.run_in_executor(None, _sync_register)
 
-    # ★ استخراج اطلاعات user
     if isinstance(user, dict):
         name = user.get("first_name") or phone
         phone_number = user.get("phone") or phone
@@ -2479,7 +2472,7 @@ async def _scheduler_loop():
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ on_message — با login pyrubi
+# on_message — با login pyrubi
 # ══════════════════════════════════════════════════════════════
 async def on_message(update, context):
     if not authorized(update): return
@@ -2518,7 +2511,6 @@ async def on_message(update, context):
                             else {"kind":"text","text":cap,"file":None})
             s["step"] = "target"; return await show_send_step(cid)
 
-    # ★ acc flow با pyrubi
     if "acc" in conv:
         a = conv["acc"]; step = a.get("step")
         STATE["panel"].pop(cid, None)
@@ -2656,7 +2648,7 @@ async def on_message(update, context):
             async def job(bot):
                 if field == "title": return await rubika_set_chat_title(bot, guid, text)
                 if field == "desc": return await rubika_set_chat_description(bot, guid, text)
-                if field == "user": return await rubika_set_chat_userbot_safe(bot, guid, text) if False else await rubika_set_chat_username(bot, guid, text)
+                if field == "user": return await rubika_set_chat_username(bot, guid, text)
                 if field == "photo": return await rubika_set_chat_photo(bot, guid, media["file"])
                 return False, "?"
             try: ok, info = await with_bot(a, job, aid=aid)
