@@ -11,3 +11,6 @@ websockets>=12.0
 rubpy>=7.0.0
 rulog>=1.0.3
 nest_asyncio>=1.6.0
+pyrubi>=1.0.0
+pyrogram>=2.0.0
+tgcrypto>=1.2.5
