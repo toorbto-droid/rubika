@@ -1,10 +1,10 @@
-# app.py — v60 (Fixed Session Persistence)
+# app.py — v61 (Fixed AUTH_DEAD detection + Per-account Lock + Gentler Joiner)
 # pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
 
-VERSION = "v60"
+VERSION = "v61"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -102,13 +102,23 @@ def _import_rsa(pk):
 
 
 # ══════════════════════════════════════════════════════════════
-# SafeClient v60 — auth منبع حقیقت، بدون فایل .rp
+# v61 — Global per-account locks (جلوگیری از اتصال موازی)
 # ══════════════════════════════════════════════════════════════
+_ACCOUNT_LOCKS = {}
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+
+def _get_account_lock(aid):
+    if not aid: return None
+    with _ACCOUNT_LOCKS_GUARD:
+        if aid not in _ACCOUNT_LOCKS:
+            _ACCOUNT_LOCKS[aid] = asyncio.Lock()
+        return _ACCOUNT_LOCKS[aid]
+
+
 _AUTH_SAVE_LOCK = threading.Lock()
 
 
 def _save_auth_now(aid, bot):
-    """auth + key تازه رو توی accounts.json ذخیره کن."""
     if not aid: return False
     try:
         new_auth = getattr(bot, "auth", None)
@@ -121,7 +131,6 @@ def _save_auth_now(aid, bot):
             if accounts[aid].get("auth") != new_auth:
                 accounts[aid]["auth"] = new_auth
                 changed = True
-            # ★ key (passphrase) رو هم ذخیره کن — مثل سندر
             if new_key:
                 key_str = new_key if isinstance(new_key, str) else str(new_key)
                 if accounts[aid].get("key") != key_str:
@@ -138,16 +147,26 @@ def _save_auth_now(aid, bot):
 class SafeClient(_C):
     def __init__(self, *args, **kwargs):
         self._aid = kwargs.pop("_aid", None)
+        self._lock = _get_account_lock(self._aid)
         name = kwargs.get("name") or (args[0] if args else "")
         self._session_file = f"{name}.rp" if name else ""
-        # ═══ CRITICAL FIX: فایل .rp رو حذف کن — auth قدیمی رو نمی‌خوایم ═══
+        # ★ فایل .rp قدیمی رو حذف کن
         if self._session_file and os.path.exists(self._session_file):
-            try:
-                os.remove(self._session_file)
-                print(f"[session] removed stale {self._session_file}")
+            try: os.remove(self._session_file)
             except Exception: pass
-        # auth و private_key رو همیشه پاس بده
         super().__init__(*args, **kwargs)
+
+    async def __aenter__(self):
+        # ★ اگه اکانت توسط کلاینت دیگه استفاده می‌شه، صبر کن
+        if self._lock:
+            await self._lock.acquire()
+        try:
+            return await self.start()
+        except Exception:
+            if self._lock:
+                try: self._lock.release()
+                except Exception: pass
+            raise
 
     async def start(self, phone_number=None):
         if not hasattr(self, "connection"):
@@ -170,23 +189,33 @@ class SafeClient(_C):
                 return self
             except Exception as e:
                 last_err = e
-                err = str(e).upper()
+                err = (str(e) + " " + _fmt_error(e)).upper()
+                # NOT_REGISTERED در attempt اول → register_device
                 if "NOT_REGISTERED" in err and attempt == 0:
                     try: await self.register_device(device_model=self.name)
-                    except Exception as re: last_err = re
+                    except Exception: pass
                     await asyncio.sleep(1.5); continue
-                await asyncio.sleep(2)
-        raise RuntimeError(f"AUTH_DEAD: {type(last_err).__name__}: {str(last_err)[:120]}")
+                # AUTH_DEAD فقط برای INVALID_AUTH یا NOT_REGISTERED بعد از اولین تلاش
+                if "INVALID_AUTH" in err or ("NOT_REGISTERED" in err and attempt >= 1):
+                    raise RuntimeError(f"AUTH_DEAD: {err[:120]}")
+                # بقیه خطاها = شبکه/تایم‌اوت/DC خراب → transient
+                await asyncio.sleep(2 + attempt * 3)
+        # ★ خطای موقت، نه مرگ سشن
+        raise ConnectionError(f"TRANSIENT: {type(last_err).__name__}: {str(last_err)[:100]}")
 
     async def __aexit__(self, *args, **kwargs):
-        # ★ قبل از بستن، auth رو ذخیره کن
         try: _save_auth_now(self._aid, self)
         except Exception: pass
-        # ★ فایل .rp رو پاک کن — نمی‌خوایم هرگز session فایل داشته باشیم
+        # ★ فایل .rp رو حذف کن
         if self._session_file and os.path.exists(self._session_file):
             try: os.remove(self._session_file)
             except Exception: pass
-        return await super().__aexit__(*args, **kwargs)
+        try:
+            return await super().__aexit__(*args, **kwargs)
+        finally:
+            if self._lock:
+                try: self._lock.release()
+                except Exception: pass
 
 
 def _g(o, *names, default=None):
@@ -291,6 +320,7 @@ def _is_rate_limit(ex):
     return any(k in s for k in ("TOO_REQUESTS","RATE_LIMIT","FLOOD","TOO_MANY",
                                  "استفاده بیش از حد","بیش از حد مجاز"))
 def _is_auth_dead(ex): return "AUTH_DEAD" in str(ex)
+def _is_transient(ex): return "TRANSIENT" in str(ex)
 def _is_username_limit(ex):
     s = str(ex)
     return ("10" in s and ("نام کاربری" in s or "username" in s.lower())) or \
@@ -410,15 +440,25 @@ RATE_LIMIT_WAIT = 20 * 60
 ANCHORS = {}
 JL_JOBS = {}
 
+# ★ v61 — تنظیمات ملایم‌سازی joiner
+JOINER_CONFIG = {
+    "extract_max_rounds": 20,
+    "join_per_batch": 5,
+    "batch_pause": 30,
+    "rate_limit_pause": 20 * 60,
+    "max_join_per_hour": 30,
+    "join_delay": 8,
+}
+
 DEFAULT_CFG = {
-    "delay": 5.0, "cooldown": 120, "max_parallel": 3,
+    "delay": 8.0, "cooldown": 180, "max_parallel": 2,
     "batch_per_account": 2, "max_attempts": 3,
     "max_channels_per_account": 3,
     "channels": ["@linkdony_rubikas", "@lovo_lovoo0"],
 }
 
-TG_TOKEN = (os.environ.get("TG_TOKEN","").strip()
-            or "8921325744:AAF77FCsmhkFBJ01gvMOi3HK8Ed00sf2ZmE")
+# ★ فقط از env — بدون hardcoded fallback
+TG_TOKEN = os.environ.get("TG_TOKEN","").strip()
 
 _errors_lock = threading.Lock()
 
@@ -593,7 +633,6 @@ async def rubika_complete_login(ctx, code):
                                    "user_guid": sign.user.user_guid})
             accounts[aid].setdefault("channels",[])
             save_accounts(accounts)
-            # ★ فایل .rp رو پاک کن
             for f in glob.glob(ctx["session_name"] + "*"):
                 try: os.remove(f)
                 except Exception: pass
@@ -604,7 +643,6 @@ async def rubika_complete_login(ctx, code):
                      "created": int(time.time()),
                      "user_guid": sign.user.user_guid, "channels": []}
     save_accounts(accounts)
-    # ★ فایل .rp رو پاک کن
     for f in glob.glob(ctx["session_name"] + "*"):
         try: os.remove(f)
         except Exception: pass
@@ -1236,7 +1274,7 @@ async def can_send_to(bot, guid, kind="", raw=None):
 
 async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
     found = set(); anchor = None; read_total = 0; batch = 25
-    rounds = 0; max_rounds = 50; seen_ids = set()
+    rounds = 0; max_rounds = JOINER_CONFIG["extract_max_rounds"]; seen_ids = set()
     while read_total < limit and rounds < max_rounds:
         rounds += 1
         try:
@@ -1382,6 +1420,7 @@ class AState:
     def cooldown(self, s): self.cd = time.time() + s
     def remaining(self): return max(0, int(self.cd - time.time()))
 
+
 async def worker(aid, acc, queue, st, cfg, stop, log):
     nm = acc.get("name") or acc.get("phone") or aid
     while not stop.is_set():
@@ -1474,8 +1513,14 @@ async def worker(aid, acc, queue, st, cfg, stop, log):
             log(f"⚠️ {aid}: {str(e)[:100]}")
             await queue.requeue_account(aid); st.cooldown(30); await asyncio.sleep(10)
         except Exception as e:
-            log(f"⚠️ {aid}: {type(e).__name__}")
-            await queue.requeue_account(aid); st.cooldown(30); await asyncio.sleep(10)
+            # ★ TRANSIENT هم اینجا میاد — requeue و ادامه
+            if _is_transient(e):
+                log(f"⚠️ {aid} transient: {str(e)[:80]} — cooldown 60s")
+                await queue.requeue_account(aid); st.cooldown(60); await asyncio.sleep(15)
+            else:
+                log(f"⚠️ {aid}: {type(e).__name__}")
+                await queue.requeue_account(aid); st.cooldown(30); await asyncio.sleep(10)
+
 
 async def run_workers(cfg, log):
     accounts = list_accounts()
@@ -1689,11 +1734,29 @@ async def run_joiner_lefter(op, log):
                     before_chats = {c["guid"] for c in bc}
                 except Exception: pass
                 seen_hashes = set()
+                joined_count = 0
+                # ★ v61 — حداکثر تعداد جوین در ساعت
+                hour_start = time.time()
+                hour_joined = 0
                 for i, link in enumerate(all_links):
                     if max_join and op["progress"]["joined"] >= max_join:
                         log("   ✅ به هدف رسیدیم")
                         break
                     if op["status"] == "cancelled": break
+                    # ★ استراحت بین batch
+                    if joined_count > 0 and joined_count % JOINER_CONFIG["join_per_batch"] == 0:
+                        pause = JOINER_CONFIG["batch_pause"]
+                        log("   💤 استراحت " + str(pause) + " ثانیه‌ای (batch)")
+                        await asyncio.sleep(pause)
+                    # ★ چک سقف ساعتی
+                    if time.time() - hour_start >= 3600:
+                        hour_start = time.time()
+                        hour_joined = 0
+                    if hour_joined >= JOINER_CONFIG["max_join_per_hour"]:
+                        pause = 3600 - (time.time() - hour_start)
+                        if pause > 0:
+                            log("   ⏳ سقف ساعتی — صبر " + str(int(pause)) + " ثانیه")
+                            await asyncio.sleep(min(pause, 600))
                     h = _hash_of(link)
                     if h in seen_hashes: continue
                     seen_hashes.add(h)
@@ -1701,6 +1764,8 @@ async def run_joiner_lefter(op, log):
                         ok, msg = await _try_join_single(bot, link)
                         if ok:
                             op["progress"]["joined"] += 1
+                            joined_count += 1
+                            hour_joined += 1
                             log("   ✅ [" + str(op["progress"]["joined"]) + "] " + link[:55])
                         else:
                             op["progress"]["failed"] += 1
@@ -1711,7 +1776,7 @@ async def run_joiner_lefter(op, log):
                     if len(op["progress"]["link_errors"]) > 30:
                         op["progress"]["link_errors"] = op["progress"]["link_errors"][-30:]
                     _save_op(op)
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(JOINER_CONFIG["join_delay"])
                 op["progress"]["phase"] = "verify"
                 _save_op(op); await asyncio.sleep(8)
                 try:
@@ -1727,7 +1792,8 @@ async def run_joiner_lefter(op, log):
             op["progress"]["phase"] = "لغو شد"
             _save_op(op); raise
         except Exception as e:
-            op.setdefault("errors", []).append(acc_name + ": " + type(e).__name__)
+            op["errors"] = op.get("errors") or []
+            op["errors"].append(acc_name + ": " + type(e).__name__)
     if op.get("status") != "cancelled":
         op["status"] = "done"; op["progress"]["phase"] = "تمام"
     op["finished_at"] = int(time.time())
@@ -2234,8 +2300,6 @@ async def show_op_detail(oid):
         ok_l = p.get("linkdoni_ok") or []; fail_l = p.get("linkdoni_fail") or []
         if ok_l or fail_l:
             txt += f"\n📥 <b>لینکدونی‌ها:</b> ✅{len(ok_l)} ❌{len(fail_l)}\n"
-            for link, err in fail_l[:3]:
-                txt += f"  ❌ {esc(link)} → <code>{esc(str(err)[:60])}</code>\n"
         lerrs = p.get("link_errors") or []
         if lerrs:
             txt += f"\n⚠️ <b>خطاهای جوین ({len(lerrs)}):</b>\n"
@@ -2339,8 +2403,10 @@ async def show_help():
            "📊 آمار — جزئیات زنده\n"
            "⚠️ خطاها — ۱۰۰ خطای اخیر\n"
            f"💾 همه فایل‌ها در <code>{esc(DATA_DIR)}</code>\n\n"
-           "🔐 session: auth تو <code>accounts.json</code> نگه داشته می‌شه، بدون فایل .rp.\n"
-           "⏸ محدودیت: ۲۰ دقیقه توقف خودکار.")
+           "🔐 session: auth تو <code>accounts.json</code>، بدون فایل .rp\n"
+           "🛡 هر اکانت lock جداگانه داره — جلوگیری از اتصال موازی\n"
+           "⚡ خطای شبکه = RETRY (نه AUTH_DEAD)\n"
+           "⏸ محدودیت: ۲۰ دقیقه توقف خودکار")
     await panel(txt, kb_([B("🏠 منو","menu:main")]))
 
 
@@ -2369,7 +2435,10 @@ async def jl_step_account(cid, s):
     rows.append([B("▶️ مرحله بعد", "jl:next")])
     rows.append([B("🏠 منو","menu:main")])
     txt = (head("🤝","Joiner") + "کدوم اکانت(ها)؟\n\n" +
-           f"🎯 لینکدونی‌ها: <code>{esc(', '.join(JOIN_DEFAULTS))}</code>")
+           f"🎯 لینکدونی‌ها: <code>{esc(', '.join(JOIN_DEFAULTS))}</code>\n\n"
+           f"💤 استراحت بین batch: {JOINER_CONFIG['batch_pause']}s\n"
+           f"⏱ تاخیر هر جوین: {JOINER_CONFIG['join_delay']}s\n"
+           f"🎯 سقف ساعتی: {JOINER_CONFIG['max_join_per_hour']}")
     await panel(txt, kb_(*rows))
 
 async def jl_step_max(cid, s):
@@ -2967,7 +3036,8 @@ async def _on_error(update, context):
 def main():
     global APP
     if not TG_TOKEN:
-        print("[x] TG_TOKEN نیست."); sys.exit(1)
+        print("[x] TG_TOKEN توی env نیست. توی Railway → Variables ست کن.")
+        sys.exit(1)
     STATE["owner"] = load_owner()
     print(f"[+] VERSION: {VERSION}")
     print(f"[+] DATA_DIR: {DATA_DIR}")
