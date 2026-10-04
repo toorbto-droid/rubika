@@ -1,8 +1,29 @@
-# rubika_tg_bot.py — v55 یادگاری(complete)
+# app.py — v59 (Persistent Session + Version Display)
 # pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
+
+# ══════════════════════════════════════════════════════════════
+VERSION = "v59"
+# ══════════════════════════════════════════════════════════════
+
+def _detect_data_dir():
+    # اگه env var هست، از اون استفاده کن
+    env = os.environ.get("DATA_DIR", "").strip()
+    if env and os.path.isdir(env) and os.access(env, os.W_OK):
+        return env
+    # اگه Railway هست، /data
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        for c in ["/data", "/app/data"]:
+            if os.path.isdir(c) and os.access(c, os.W_OK):
+                return c
+    # وگرنه پوشه فعلی
+    return os.path.dirname(os.path.abspath(__file__))
+
+DATA_DIR = _detect_data_dir()
+print(f"[+] VERSION: {VERSION}")
+print(f"[+] DATA_DIR: {DATA_DIR}")
 
 try:
     import asyncio.unix_events as _ue
@@ -75,57 +96,56 @@ if DC:
         list(ex.map(_doh, [s.get("ip") if isinstance(s, dict) else str(s) for s in DC[:60]]))
 
 from rubpy import Client as _C
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
+
+def _import_rsa(pk):
+    if isinstance(pk, bytes): pk = pk.decode()
+    if not pk.startswith('-----BEGIN'):
+        pk = f'-----BEGIN RSA PRIVATE KEY-----\n{pk}\n-----END RSA PRIVATE KEY-----'
+    return pkcs1_15.new(RSA.import_key(pk.encode()))
+
 
 # ══════════════════════════════════════════════════════════════
-# patch_v57 — Persistent session (مثل اپلیکیشن اصلی)
+# SafeClient v59 — Persistent auth
 # ══════════════════════════════════════════════════════════════
+_AUTH_SAVE_LOCK = threading.Lock()
 
-# ۱) hook روی __aexit__ کلاینت rubpy که بعد از هر بستن session رو ذخیره کنه
-_orig_aexit = _C.__aexit__
 
-async def _patched_aexit(self, *args, **kwargs):
+def _save_auth_now(aid, bot):
+    """auth تازه rubpy رو توی accounts.json ذخیره کن."""
+    if not aid: return False
     try:
-        sess = getattr(self, "session", None)
-        auth = getattr(self, "auth", None)
-        guid = getattr(self, "guid", None)
-        priv = getattr(self, "private_key", None)
-        if sess and auth:
-            # ذخیره auth تازه در session
-            try:
-                if hasattr(sess, "insert"):
-                    sess.insert(
-                        auth=auth,
-                        guid=guid or "",
-                        private_key=priv,
-                        user_agent=getattr(self, "user_agent", None),
-                        phone_number=getattr(self, "phone_number", None),
-                        device_model=getattr(self, "name", None),
-                    )
-            except Exception:
-                pass
-            try:
-                if hasattr(sess, "save"):
-                    sess.save()
-            except Exception:
-                pass
-            try:
-                if hasattr(sess, "close"):
-                    sess.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return await _orig_aexit(self, *args, **kwargs)
-
-_C.__aexit__ = _patched_aexit
+        new_auth = getattr(bot, "auth", None)
+        new_key = getattr(bot, "key", None)
+        if not new_auth: return False
+        with _AUTH_SAVE_LOCK:
+            accounts = list_accounts()
+            if aid not in accounts: return False
+            changed = False
+            if accounts[aid].get("auth") != new_auth:
+                accounts[aid]["auth"] = new_auth
+                changed = True
+            if new_key:
+                key_str = new_key if isinstance(new_key, str) else str(new_key)
+                if accounts[aid].get("session_key") != key_str:
+                    accounts[aid]["session_key"] = key_str
+                    changed = True
+            if changed:
+                save_accounts(accounts)
+                return True
+    except Exception as e:
+        print(f"[auth-save] {e}")
+    return False
 
 
-# ۲) SafeClient با auto-detect .rp
 class SafeClient(_C):
     def __init__(self, *args, **kwargs):
+        # aid رو جدا کن — rubpy نمیشناسه
+        self._aid = kwargs.pop("_aid", None)
         name = kwargs.get("name") or (args[0] if args else "")
         self._session_file = f"{name}.rp" if name else ""
-        # اگه فایل .rp هست، auth/private_key قدیمی رو پاس نده
+        # اگه فایل .rp وجود داره، auth/private_key قدیمی رو پاس نده
         if self._session_file and os.path.exists(self._session_file):
             kwargs.pop("auth", None)
             kwargs.pop("private_key", None)
@@ -148,6 +168,8 @@ class SafeClient(_C):
             try:
                 r = await self.get_me()
                 self.guid = r.user.user_guid
+                # ★ ذخیره auth تازه بعد از اولین درخواست موفق
+                _save_auth_now(self._aid, self)
                 return self
             except Exception as e:
                 last_err = e
@@ -159,14 +181,36 @@ class SafeClient(_C):
                 await asyncio.sleep(2)
         raise RuntimeError(f"AUTH_DEAD: {type(last_err).__name__}: {str(last_err)[:120]}")
 
-from Crypto.PublicKey import RSA
-from Crypto.Signature import pkcs1_15
+    async def __aexit__(self, *args, **kwargs):
+        # ★ قبل از بستن، auth تازه رو ذخیره کن
+        try:
+            _save_auth_now(self._aid, self)
+        except Exception: pass
+        # ★ ذخیره session rubpy
+        try:
+            sess = getattr(self, "session", None)
+            auth = getattr(self, "auth", None)
+            guid = getattr(self, "guid", None)
+            priv = getattr(self, "private_key", None)
+            if sess and auth:
+                try:
+                    if hasattr(sess, "insert"):
+                        sess.insert(
+                            auth=auth, guid=guid or "", private_key=priv,
+                            user_agent=getattr(self, "user_agent", None),
+                            phone_number=getattr(self, "phone_number", None),
+                            device_model=getattr(self, "name", None),
+                        )
+                except Exception: pass
+                try:
+                    if hasattr(sess, "save"): sess.save()
+                except Exception: pass
+                try:
+                    if hasattr(sess, "close"): sess.close()
+                except Exception: pass
+        except Exception: pass
+        return await super().__aexit__(*args, **kwargs)
 
-def _import_rsa(pk):
-    if isinstance(pk, bytes): pk = pk.decode()
-    if not pk.startswith('-----BEGIN'):
-        pk = f'-----BEGIN RSA PRIVATE KEY-----\n{pk}\n-----END RSA PRIVATE KEY-----'
-    return pkcs1_15.new(RSA.import_key(pk.encode()))
 
 def _g(o, *names, default=None):
     for n in names:
@@ -224,8 +268,7 @@ def _is_ok_response(r):
         if s and ("ERROR" in s or "INVALID" in s or "FAIL" in s or "NOT_" in s):
             return False
     nested = d.get("data") or d.get("result")
-    if isinstance(nested, dict):
-        return _is_ok_response(nested)
+    if isinstance(nested, dict): return _is_ok_response(nested)
     return True
 
 def _extract_join_link(r):
@@ -292,6 +335,9 @@ def _load(path, default):
     except Exception: return dict(default) if isinstance(default, dict) else default
 
 def _save(path, data):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except Exception: pass
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(path + ".tmp", path)
@@ -376,12 +422,16 @@ LINK_RE = re.compile(r'@([A-Za-z][A-Za-z0-9_]{4,40})')
 URL_RE = re.compile(r'(?:rubika\.ir|ble\.rip)/joing/([A-Za-z0-9_\-]+)', re.I)
 URL_RE2 = re.compile(r'rubika\.ir/([A-Za-z0-9_\-]{20,})', re.I)
 
-ACC_FILE = "accounts.json"
-CFG_FILE = "multi_config.json"
-QUEUE_FILE = "queue.json"
-OWNER_FILE = "tg_owner.json"
-OPS_FILE = "ops.json"
-ERRORS_FILE = "errors.json"
+ACC_FILE = os.path.join(DATA_DIR, "accounts.json")
+CFG_FILE = os.path.join(DATA_DIR, "multi_config.json")
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
+OWNER_FILE = os.path.join(DATA_DIR, "tg_owner.json")
+OPS_FILE = os.path.join(DATA_DIR, "ops.json")
+ERRORS_FILE = os.path.join(DATA_DIR, "errors.json")
+MEDIA_DIR = os.path.join(DATA_DIR, "media")
+try: os.makedirs(MEDIA_DIR, exist_ok=True)
+except Exception: pass
+
 MAX_ERRORS = 100
 RATE_LIMIT_WAIT = 20 * 60
 
@@ -395,7 +445,8 @@ DEFAULT_CFG = {
     "channels": ["@linkdony_rubikas", "@lovo_lovoo0"],
 }
 
-TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
+TG_TOKEN = (os.environ.get("TG_TOKEN","").strip()
+            or "8921325744:AAF77FCsmhkFBJ01gvMOi3HK8Ed00sf2ZmE")
 
 
 _errors_lock = threading.Lock()
@@ -528,7 +579,7 @@ def update_channel_field(aid, idx, key, value):
 
 async def rubika_send_code(phone):
     from rubpy.crypto import Crypto
-    sess = f"rubika_{phone}"
+    sess = os.path.join(DATA_DIR, f"rubika_{phone}")
     for f in glob.glob(sess + "*"):
         try: os.remove(f)
         except Exception: pass
@@ -560,6 +611,9 @@ async def rubika_complete_login(ctx, code):
     try:
         c.session.insert(auth=auth, guid=sign.user.user_guid, user_agent=c.user_agent,
                           phone_number=sign.user.phone, private_key=ctx["priv"])
+    except Exception: pass
+    try:
+        if hasattr(c.session, "save"): c.session.save()
     except Exception: pass
     try: await c.register_device(device_model=c.name)
     except Exception: pass
@@ -707,20 +761,13 @@ async def rubika_remove_channel(bot, guid):
     except Exception as e: return False, _fmt_error(e)
 
 
-# ══════════════════════════════════════════════════════════════
-# v51 — _resolve_target
-# ══════════════════════════════════════════════════════════════
 async def _resolve_target(bot, t):
-    """برای usernames: get_info. برای joing link: فقط preview."""
     if not t: return None, None
     t = t.strip()
-
     if len(t) >= 20 and t[0] in ("u","c","g") and "://" not in t and " " not in t:
         kind = {"u":"User","c":"Channel","g":"Group"}.get(t[0].lower(), "?")
         return t, kind
-
     is_link = ("://" in t) or ("rubika.ir" in t.lower()) or ("/joing/" in t.lower())
-
     if is_link:
         fn = getattr(bot, "get_link_from_app_url", None)
         if fn:
@@ -739,7 +786,6 @@ async def _resolve_target(bot, t):
                         kind = {"u":"User","c":"Channel","g":"Group"}.get(g[0].lower())
                         return g, kind
             except Exception: pass
-
         for pname in ("channel_preview_by_join_link", "group_preview_by_join_link"):
             fn = getattr(bot, pname, None)
             if not fn: continue
@@ -759,7 +805,6 @@ async def _resolve_target(bot, t):
                         return g, kind
             except Exception: continue
         return None, "__joing_link__"
-
     if t.startswith("@"):
         bare = t[1:]
         for name, kw in (("get_info", {"username": bare}),
@@ -782,7 +827,6 @@ async def _resolve_target(bot, t):
                         return g, kind
             except Exception: continue
         return None, None
-
     for name, kw in (("get_info", {"username": t}),
                      ("get_object_by_username", {"username": t})):
         fn = getattr(bot, name, None)
@@ -805,16 +849,11 @@ async def _resolve_target(bot, t):
     return None, None
 
 
-# ══════════════════════════════════════════════════════════════
-# v51 — join_any
-# ══════════════════════════════════════════════════════════════
 async def join_any(bot, target):
     t = target.strip() if isinstance(target, str) else target
     if not isinstance(t, str): return False, "not-str", None
-
     errors = []
     is_link = ("://" in t) or ("rubika.ir" in t.lower()) or ("/joing/" in t.lower())
-
     if is_link:
         fn = getattr(bot, "join_group", None)
         if fn:
@@ -831,7 +870,6 @@ async def join_any(bot, target):
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                     return True, "join_group(already)", None
                 errors.append("join_group: " + err[:80])
-
         fn = getattr(bot, "join_channel_by_link", None)
         if fn:
             try:
@@ -847,7 +885,6 @@ async def join_any(bot, target):
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                     return True, "join_channel_by_link(already)", None
                 errors.append("join_channel_by_link: " + err[:80])
-
         guid, kind = await _resolve_target(bot, t)
         if guid:
             if kind == "Channel" or guid[0].lower() == "c":
@@ -875,13 +912,10 @@ async def join_any(bot, target):
                     errors.append("join_chat(guid): " + err[:80])
                 except Exception as e:
                     errors.append("join_chat(guid): " + _fmt_error(e)[:80])
-
         return False, " | ".join(errors[-3:]) or "all-failed", None
-
     guid, kind = await _resolve_target(bot, t)
     if not guid:
         return False, "resolve-failed: " + t[:40], None
-
     if kind == "Channel" or guid[0].lower() == "c":
         attempts = [
             ("join_channel_action", "join_channel_action",
@@ -894,7 +928,6 @@ async def join_any(bot, target):
             ("join_channel_action", "join_channel_action",
              {"channel_guid": guid, "action": "Join"}),
         ]
-
     for label, name, kw in attempts:
         fn = getattr(bot, name, None)
         if not fn: continue
@@ -911,7 +944,6 @@ async def join_any(bot, target):
             if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                 return True, label + "(already)", None
             errors.append(label + ": " + err[:80])
-
     return False, " | ".join(errors[-3:]), None
 
 
@@ -1070,8 +1102,8 @@ async def extract_tg_media(msg):
         raise ValueError("حجم فایل بیشتر از ۲۰ مگابایت است")
     f = await obj.get_file()
     safe = re.sub(r'[^\w.\-]', '_', name)[-60:]
-    path = os.path.join("media", f"{int(time.time()*1000)}_{safe}")
-    os.makedirs("media", exist_ok=True)
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    path = os.path.join(MEDIA_DIR, f"{int(time.time()*1000)}_{safe}")
     await f.download_to_drive(path)
     return {"kind": kind, "file": path, "file_name": name}
 
@@ -1208,7 +1240,6 @@ async def can_send_to(bot, guid, kind="", raw=None):
         if _is_auth_error(e): raise
         return False, "info-error"
     if info is None: return False, "not-found"
-
     keys = ("access", "default_access", "status", "chat_status", "user_status",
             "member_status", "is_deleted", "deleted", "is_blocked", "blocked",
             "is_removed", "left", "kicked", "is_kicked", "is_banned",
@@ -1216,15 +1247,12 @@ async def can_send_to(bot, guid, kind="", raw=None):
     found = {}
     if raw: _find_keys(raw, keys, found)
     _find_keys(_to_plain(info), keys, found)
-
     for k in ("is_deleted", "deleted", "is_blocked", "blocked", "is_removed",
               "left", "kicked", "is_kicked", "is_banned"):
         if found.get(k) is True: return False, k
-
     for k in ("status", "chat_status", "user_status", "member_status"):
         if str(found.get(k) or "").lower() in BAD_STATUS:
             return False, str(found[k]).lower()
-
     acc = found.get("access")
     if isinstance(acc, list):
         return (True, "ok") if "SendMessages" in acc else (False, "no-send-access")
@@ -1236,9 +1264,6 @@ async def can_send_to(bot, guid, kind="", raw=None):
     return True, "ok"
 
 
-# ══════════════════════════════════════════════════════════════
-# v51 — _extract_links_from_bot با fetch_messages
-# ══════════════════════════════════════════════════════════════
 async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
     found = set()
     anchor = None
@@ -1247,7 +1272,6 @@ async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
     rounds = 0
     max_rounds = 50
     seen_ids = set()
-
     while read_total < limit and rounds < max_rounds:
         rounds += 1
         try:
@@ -1255,13 +1279,10 @@ async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
         except Exception as e:
             if log: log("   warn fetch_messages: " + _fmt_error(e)[:120])
             break
-
         if not msgs_raw:
             if log: log("   دور " + str(rounds) + ": هیچ پیامی نبود")
             break
-
         if log: log("   دور " + str(rounds) + ": " + str(len(msgs_raw)) + " پیام")
-
         new_msgs = []
         for m in msgs_raw:
             mid = m.get("id")
@@ -1269,33 +1290,27 @@ async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
             if mid in seen_ids: continue
             seen_ids.add(mid)
             new_msgs.append(m)
-
         if not new_msgs:
             if log: log("   تکراری، توقف")
             break
-
         for m in new_msgs:
             txt = m.get("text") or ""
             for u in LINK_RE.findall(txt): found.add("@" + u)
             for uid in URL_RE.findall(txt): found.add("https://rubika.ir/joing/" + uid)
             for uid in URL_RE2.findall(txt): found.add("https://rubika.ir/joing/" + uid)
-
         read_total += len(new_msgs)
-
         min_id = None
         for m in new_msgs:
             try:
                 iv = int(m["id"])
                 if min_id is None or iv < min_id: min_id = iv
             except Exception: pass
-
         if min_id is None: break
         new_anchor = str(min_id - 1)
         if new_anchor == anchor: break
         anchor = new_anchor
         if want and len(found) >= want: break
         await asyncio.sleep(1)
-
     return found
 
 
@@ -1407,8 +1422,9 @@ async def worker(aid, acc, queue, st, cfg, stop, log):
     nm = acc.get("name") or acc.get("phone") or aid
     while not stop.is_set():
         try:
-            cli = SafeClient(name=acc["session_name"], auth=acc["auth"],
-                             private_key=acc["private_key"], phone_number=acc["phone"],
+            cli = SafeClient(name=acc["session_name"], auth=acc.get("auth"),
+                             private_key=acc.get("private_key"),
+                             phone_number=acc["phone"], _aid=aid,
                              platform='Android', display_welcome=False, timeout=120, max_retries=10)
             async with cli as bot:
                 me = await bot.get_me(); nm = me.user.first_name or acc["phone"]
@@ -1532,26 +1548,19 @@ async def run_workers(cfg, log):
     log(f"🎯 تمام! ✅{s['done']} ❌{s['failed']}")
 
 
-# ══════════════════════════════════════════════════════════════
-# v54 — helper ها و Joiner جدید
-# ══════════════════════════════════════════════════════════════
-
 def _hash_of(link):
-    import re as _re
     if not link: return ""
     s = link.strip()
-    if s.startswith("@"):
-        return "u:" + s.lower()
-    m = _re.search(r"/joing/([A-Za-z0-9_\-]+)", s)
+    if s.startswith("@"): return "u:" + s.lower()
+    m = re.search(r"/joing/([A-Za-z0-9_\-]+)", s)
     if m: return "j:" + m.group(1)
-    m = _re.search(r"rubika\.ir/([A-Za-z0-9_\-]+)", s)
+    m = re.search(r"rubika\.ir/([A-Za-z0-9_\-]+)", s)
     if m: return "r:" + m.group(1)
     return "x:" + s[:50]
 
 
 async def _try_join_single(bot, link):
     is_link = ("://" in link) or ("rubika.ir" in link.lower()) or ("/joing/" in link.lower())
-
     if is_link:
         first_err = ""
         fn = getattr(bot, "join_group", None)
@@ -1570,7 +1579,6 @@ async def _try_join_single(bot, link):
                     return True, "join_group(already)"
         else:
             first_err = "join_group missing"
-
         fn = getattr(bot, "join_channel_by_link", None)
         if fn:
             try:
@@ -1587,7 +1595,6 @@ async def _try_join_single(bot, link):
                     return True, "join_channel_by_link(already)"
                 return False, "link-failed: " + str(first_err)[:60] + " | " + err[:60]
         return False, "link-failed: " + str(first_err)[:100]
-
     if link.startswith("@"):
         bare = link[1:]
         guid = None
@@ -1609,10 +1616,8 @@ async def _try_join_single(bot, link):
                     if g:
                         guid = g; break
             except Exception: continue
-
         if not guid:
             return False, "no-guid-for:" + bare[:40]
-
         if guid[0].lower() == "c":
             fn = getattr(bot, "join_channel_action", None)
             if fn:
@@ -1643,7 +1648,6 @@ async def _try_join_single(bot, link):
                     return True, "join_chat(already)"
                 return False, "join_chat: " + err[:100]
         return False, "no-method"
-
     return False, "unknown-format"
 
 
@@ -1653,7 +1657,6 @@ async def run_joiner_lefter(op, log):
     sel = op.get("accounts") or []
     if "all" in sel: sel = list(accounts.keys())
     max_join = op.get("max_join", 0) or 0
-
     op["progress"] = {
         "joined": 0, "failed": 0, "total": 0,
         "phase": "شروع", "extracted": 0,
@@ -1664,24 +1667,20 @@ async def run_joiner_lefter(op, log):
     op["status"] = "running"
     op["errors"] = []
     _save_op(op)
-
     for aid in sel:
         a = accounts.get(aid)
         if not a: continue
         acc_name = a.get("name") or a.get("phone") or aid
-
         try:
             async def job(bot):
                 op["progress"]["phase"] = "۱/۴ جوین لینکدونی‌ها"
                 _save_op(op)
-
                 linkdoni_guids = []
                 for link in JOIN_DEFAULTS:
                     guid, kind = await _resolve_target(bot, link)
                     if not guid:
                         op["progress"]["linkdoni_fail"].append((link, "resolve"))
                         continue
-
                     ok = False
                     try:
                         if kind == "Channel" or guid[0].lower() == "c":
@@ -1697,25 +1696,20 @@ async def run_joiner_lefter(op, log):
                         err = _fmt_error(e)
                         if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                             ok = True
-
                     if ok:
                         linkdoni_guids.append(guid)
                         op["progress"]["linkdoni_ok"].append(link)
                         log("✅ " + acc_name + ": " + link)
                     await asyncio.sleep(3)
-
                 if not linkdoni_guids:
                     op["progress"]["phase"] = "هیچ لینکدونی"
                     _save_op(op); return
-
                 op["progress"]["phase"] = "۲/۴ صبر برای سینک"
                 _save_op(op)
                 log("⏳ " + acc_name + ": ۱۵ ثانیه استراحت")
                 await asyncio.sleep(15)
-
                 op["progress"]["phase"] = "۳/۴ استخراج لینک"
                 _save_op(op)
-
                 ordered_links = {}
                 for guid in linkdoni_guids:
                     log("   خواندن " + guid[:15])
@@ -1729,36 +1723,28 @@ async def run_joiner_lefter(op, log):
                         log("   کل: " + str(len(ordered_links)))
                     except Exception as e:
                         add_error("استخراج", _fmt_error(e), guid, acc_name)
-
                 if not ordered_links:
                     op["progress"]["phase"] = "لینکی نبود"
                     _save_op(op); return
-
                 all_links = list(ordered_links.keys())
                 op["progress"]["total"] = len(all_links)
                 op["progress"]["phase"] = "۴/۴ جوین"
                 _save_op(op)
                 log("🤝 " + acc_name + ": " + str(len(all_links)) + " لینک یکتا، هدف " + str(max_join))
-
                 before_chats = set()
                 try:
                     bc = await get_all_chats_raw(bot)
                     before_chats = {c["guid"] for c in bc}
                 except Exception: pass
-
                 seen_hashes = set()
-                tried = 0
                 for i, link in enumerate(all_links):
                     if max_join and op["progress"]["joined"] >= max_join:
                         log("   ✅ به هدف رسیدیم (" + str(max_join) + ")")
                         break
                     if op["status"] == "cancelled": break
-
                     h = _hash_of(link)
                     if h in seen_hashes: continue
                     seen_hashes.add(h)
-                    tried += 1
-
                     try:
                         ok, msg = await _try_join_single(bot, link)
                         if ok:
@@ -1772,12 +1758,10 @@ async def run_joiner_lefter(op, log):
                     except Exception as e:
                         op["progress"]["failed"] += 1
                         op["progress"]["link_errors"].append((link, _fmt_error(e)[:100]))
-
                     if len(op["progress"]["link_errors"]) > 30:
                         op["progress"]["link_errors"] = op["progress"]["link_errors"][-30:]
                     _save_op(op)
                     await asyncio.sleep(4)
-
                 op["progress"]["phase"] = "verify"
                 _save_op(op)
                 log("🔍 verify...")
@@ -1792,8 +1776,7 @@ async def run_joiner_lefter(op, log):
                     log("   ✅ پیام موفق: " + str(op["progress"]["joined"]))
                 except Exception as e:
                     log("   ⚠️ verify: " + _fmt_error(e)[:100])
-
-            await with_bot(a, job, 3600)
+            await with_bot(a, job, 3600, aid=aid)
         except asyncio.CancelledError:
             op["status"] = "cancelled"
             op["progress"]["phase"] = "لغو شد"
@@ -1802,7 +1785,6 @@ async def run_joiner_lefter(op, log):
         except Exception as e:
             err_txt = type(e).__name__ + ": " + _fmt_error(e)
             op.setdefault("errors", []).append(acc_name + ": " + err_txt)
-
     if op.get("status") != "cancelled":
         op["status"] = "done"
         op["progress"]["phase"] = "تمام"
@@ -1811,6 +1793,42 @@ async def run_joiner_lefter(op, log):
     p = op.get("progress") or {}
     log("🎯 تمام: جوین " + str(p.get("joined",0)) +
         " | چت جدید " + str(p.get("new_chats",0)))
+
+
+async def _session_keepalive_loop():
+    while True:
+        try:
+            await asyncio.sleep(4 * 60)
+        except asyncio.CancelledError:
+            raise
+        accounts = list_accounts()
+        for aid, acc in list(accounts.items()):
+            try:
+                cli = SafeClient(
+                    name=acc["session_name"], auth=acc.get("auth"),
+                    private_key=acc.get("private_key"),
+                    phone_number=acc["phone"], _aid=aid,
+                    platform='Android', display_welcome=False,
+                    timeout=30, max_retries=2,
+                )
+                try:
+                    async with cli as bot:
+                        await bot.get_me()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+
+async def with_bot(acc, fn, timeout=90, aid=None):
+    cli = SafeClient(name=acc["session_name"], auth=acc.get("auth"),
+                     private_key=acc.get("private_key"),
+                     phone_number=acc["phone"], _aid=aid,
+                     platform='Android', display_welcome=False,
+                     timeout=timeout, max_retries=10)
+    async with cli as bot:
+        return await fn(bot)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1907,23 +1925,16 @@ def get_conv(cid):
 def clear_conv(cid): STATE["conv"].pop(cid, None)
 
 
-async def with_bot(acc, fn, timeout=90):
-    cli = SafeClient(name=acc["session_name"], auth=acc["auth"],
-                     private_key=acc["private_key"], phone_number=acc["phone"],
-                     platform='Android', display_welcome=False,
-                     timeout=timeout, max_retries=10)
-    async with cli as bot:
-        return await fn(bot)
-
-
 async def show_main():
     accounts = list_accounts()
     ops = _load_ops()
     running_ops = [o for o in ops if _op_effective_status(o) == "running"]
-    txt = head("🤖", "پنل ربات روبیکا")
+    # ★ VERSION نمایش داده می‌شه
+    txt = head("🤖", f"پنل ربات روبیکا — {VERSION}")
     txt += f"📱 اکانت‌ها: <b>{len(accounts)}</b>\n"
     txt += f"📊 عملیات‌ها: <b>{len(ops)}</b>\n"
     if running_ops: txt += f"🟢 در حال اجرا: <b>{len(running_ops)}</b>\n"
+    txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>\n"
     txt += "\nاز منوی زیر انتخاب کن:"
     await panel(txt, kb_(
         [B("📤 ارسال", "send:start")],
@@ -2189,7 +2200,7 @@ async def send_step_confirm(cid, s):
                 pv = await collect_pv(bot) if tgt in ("pv","both") else []
                 gr = await collect_groups(bot) if tgt in ("groups","both") else []
                 return pv, gr
-            pv, gr = await with_bot(a, collect_all, 90)
+            pv, gr = await with_bot(a, collect_all, 90, aid=aid)
             for it in pv:
                 it["owner_account"] = aid
                 it["payload"] = s.get("payload") or {"kind":"text","text":"سلام"}
@@ -2214,7 +2225,7 @@ async def send_step_confirm(cid, s):
                 raw_map = {c["guid"]: c.get("raw") for c in await get_all_chats_raw(bot)}
                 return await asyncio.gather(*[check(bot, it, raw_map) for it in gr])
             try:
-                valid_flags = await with_bot(a, validate_all, 120)
+                valid_flags = await with_bot(a, validate_all, 120, aid=aid)
             except Exception as e:
                 errors.append(f"{a.get('name','?')}: validation {type(e).__name__}")
                 add_error("اعتبارسنجی", f"{type(e).__name__}: {_fmt_error(e)}", None, acc_name)
@@ -2322,11 +2333,9 @@ async def show_op_detail(oid):
     ttl = _op_status_label(st)
     s = _op_stats(op)
     bar, _ = _op_progress_bar(op)
-
     txt = head("📋", f"جزئیات {op['id']}")
     txt += f"{ico} <b>{esc(ttl)}</b>\n\n"
     txt += f"<code>{esc(bar)}</code>\n\n"
-
     if op.get("type") == "joinlef":
         p = op.get("progress") or {}
         txt += f"📍 مرحله: <b>{esc(p.get('phase','—'))}</b>\n\n"
@@ -2339,32 +2348,27 @@ async def show_op_detail(oid):
         if p.get("new_chats") is not None:
             txt += f"📈 چت‌های واقعی جدید: <b>{p.get('new_chats',0)}</b>\n"
         txt += f"🔢 حداکثر درخواستی: <b>{op.get('max_join',0) or 'بدون محدودیت'}</b>\n"
-
         ok_l = p.get("linkdoni_ok") or []
         fail_l = p.get("linkdoni_fail") or []
         if ok_l or fail_l:
             txt += f"\n📥 <b>لینکدونی‌ها:</b> ✅{len(ok_l)} ❌{len(fail_l)}\n"
             for link, err in fail_l[:3]:
                 txt += f"  ❌ {esc(link)} → <code>{esc(str(err)[:60])}</code>\n"
-
         lerrs = p.get("link_errors") or []
         if lerrs:
             txt += f"\n⚠️ <b>خطاهای جوین ({len(lerrs)}):</b>\n"
             for link, err in lerrs[-5:]:
                 txt += f"  • <code>{esc(str(link)[:40])}</code>\n    → {esc(str(err)[:70])}\n"
-
         created = op.get("created", 0)
         if created:
             txt += f"\n📅 شروع: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(created)))}</b>\n"
         if op.get("finished_at"):
             txt += f"🏁 پایان: <b>{esc(time.strftime('%Y/%m/%d %H:%M', time.localtime(op['finished_at'])))}</b>\n"
-
         rows = []
         if st == "running":
             rows.append([B("⏹ توقف", f"op:stop:{oid}")])
         rows.append([B("⬅️ آمار","menu:stats"), B("🏠 منو","menu:main")])
         return await panel(txt, kb_(*rows))
-
     txt += f"✅ موفق: <b>{s['done']}</b>\n"
     txt += f"❌ ناموفق: <b>{s['failed']}</b>\n"
     txt += f"⏳ انتظار: <b>{s['pending']}</b>\n"
@@ -2443,6 +2447,8 @@ async def show_cfg():
         txt += f"{label}: <b>{esc(v_str)}</b>\n"
         rows.append([B("➖", f"cfg:adj:{key}:-1"), B(v_str, "noop"), B("➕", f"cfg:adj:{key}:1")])
     txt += f"\n⏸ زمان توقف محدودیت: <b>{RATE_LIMIT_WAIT//60} دقیقه</b>"
+    txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>"
+    txt += f"\n🔖 نسخه: <b>{VERSION}</b>"
     rows.append([B("🏠 منو","menu:main")])
     await panel(txt, kb_(*rows))
 
@@ -2460,6 +2466,7 @@ async def adjust_cfg(key, sign):
 
 async def show_help():
     txt = (head("❓","راهنما") +
+           f"🔖 نسخه: <b>{VERSION}</b>\n\n"
            "📤 <b>ارسال</b>\n"
            "  پیام به گروه‌ها و PV — <b>کانال‌ها داخل ارسال نیستن</b>\n\n"
            "🤝 <b>Joiner</b>\n"
@@ -2470,6 +2477,12 @@ async def show_help():
            "  جزئیات زنده + چت‌های واقعی جدید\n\n"
            "⚠️ <b>خطاها</b>\n"
            "  ۱۰۰ خطای اخیر\n\n"
+           "💾 <b>ذخیره‌سازی</b>\n"
+           f"  همه فایل‌ها در <code>{esc(DATA_DIR)}</code>\n"
+           "  روی Railway Volume باقی می‌مونن\n\n"
+           "🔐 <b>session پایدار</b>\n"
+           "  auth خودکار refresh و ذخیره می‌شه.\n"
+           "  keepalive هر ۴ دقیقه.\n\n"
            "⏸ <b>محدودیت روبیکا</b>\n"
            f"  در صورت «استفاده بیش از حد»، {RATE_LIMIT_WAIT//60} دقیقه توقف خودکار.\n\n"
            "<i>فایل‌ها تا ۲۰MB.</i>")
@@ -2552,7 +2565,7 @@ async def cmd_start(update, context):
     cid = update.effective_chat.id
     if STATE["owner"] is None:
         STATE["owner"] = cid; save_owner(cid)
-        await update.message.reply_text("🔒 این ربات از حالا برای شماست.")
+        await update.message.reply_text(f"🔒 ربات از حالا برای شماست.\n🔖 {VERSION}\n💾 {DATA_DIR}")
     elif STATE["owner"] != cid:
         await update.message.reply_text("⛔"); return
     STATE["panel"].pop(cid, None)
@@ -2563,6 +2576,14 @@ async def cmd_menu(update, context):
     STATE["panel"].pop(update.effective_chat.id, None)
     clear_conv(update.effective_chat.id)
     await show_main()
+
+async def cmd_version(update, context):
+    if not authorized(update): return
+    await update.message.reply_text(
+        f"🔖 <b>{VERSION}</b>\n"
+        f"💾 <code>{DATA_DIR}</code>\n"
+        f"📱 اکانت‌ها: {len(list_accounts())}",
+        parse_mode="HTML")
 
 
 PROF_PROMPT = {"name":"👤 اسم جدید:","bio":"📖 بیو جدید:",
@@ -2590,7 +2611,6 @@ async def on_callback(update, context):
 async def route_cb(cid, data):
     p = data.split(":")
     h = p[0]
-
     if data == "conv:cancel":
         clear_conv(cid); return await show_main()
     if data == "menu:main":
@@ -2853,7 +2873,7 @@ async def route_cb(cid, data):
             if not a or idx >= len(chans): return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
             await panel("⏳ در حال ساخت لینک...")
             try:
-                ok, link = await with_bot(a, lambda b: rubika_create_join_link(b, chans[idx]["guid"]))
+                ok, link = await with_bot(a, lambda b: rubika_create_join_link(b, chans[idx]["guid"]), aid=aid)
             except Exception as e:
                 ok, link = False, _fmt_error(e)
             if ok: update_channel_field(aid, idx, "join_link", link)
@@ -2873,7 +2893,7 @@ async def route_cb(cid, data):
             if not a or idx >= len(chans): return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
             await panel("⏳ در حال حذف...")
             try:
-                ok, info = await with_bot(a, lambda b: rubika_remove_channel(b, chans[idx]["guid"]))
+                ok, info = await with_bot(a, lambda b: rubika_remove_channel(b, chans[idx]["guid"]), aid=aid)
             except Exception as e: ok, info = False, _fmt_error(e)
             if ok: remove_channel_from_storage(aid, idx)
             return await panel(("✅ حذف شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
@@ -3058,6 +3078,8 @@ async def on_message(update, context):
             STATE["conv"].pop(cid, None)
             if not res.get("ok"):
                 return await panel("❌ ورود ناموفق.", kb_([B("🏠 منو","menu:main")]))
+            await panel(f"✅ ورود موفق\n🔖 {VERSION}",
+                        kb_([B("⬅️ اکانت‌ها", "menu:acc")]))
             if is_relogin: return await show_account_detail(res["aid"])
             return await show_accounts()
 
@@ -3082,7 +3104,7 @@ async def on_message(update, context):
             if field == "user": return await rubika_set_username(bot, text)
             if field == "photo": return await rubika_set_photo(bot, my, media["file"])
             return False, "?"
-        try: ok, info = await with_bot(a, job)
+        try: ok, info = await with_bot(a, job, aid=aid)
         except Exception as e: ok, info = False, _fmt_error(e)
         if media:
             try: os.remove(media["file"])
@@ -3108,7 +3130,7 @@ async def on_message(update, context):
                     ok2, l = await rubika_create_join_link(bot, guid)
                     link = l if ok2 else None
                 return ok, info, guid, link
-            try: ok, info, guid, link = await with_bot(a, job, 120)
+            try: ok, info, guid, link = await with_bot(a, job, 120, aid=aid)
             except Exception as e:
                 return await panel(f"❌ {esc(type(e).__name__)}: {esc(str(e)[:200])}",
                                    kb_([B("⬅️", f"acc:view:{aid}")]))
@@ -3144,7 +3166,7 @@ async def on_message(update, context):
                 if field == "user": return await rubika_set_chat_username(bot, guid, text)
                 if field == "photo": return await rubika_set_chat_photo(bot, guid, media["file"])
                 return False, "?"
-            try: ok, info = await with_bot(a, job)
+            try: ok, info = await with_bot(a, job, aid=aid)
             except Exception as e: ok, info = False, _fmt_error(e)
             if media:
                 try: os.remove(media["file"])
@@ -3163,7 +3185,8 @@ async def _post_init(app):
     try:
         from telegram import BotCommand
         await app.bot.set_my_commands([BotCommand("start","شروع"),
-                                       BotCommand("menu","منوی اصلی")])
+                                       BotCommand("menu","منوی اصلی"),
+                                       BotCommand("version","نسخه")])
     except Exception: pass
 
 async def _on_error(update, context):
@@ -3174,6 +3197,8 @@ def main():
     if not TG_TOKEN:
         print("[x] TG_TOKEN نیست."); sys.exit(1)
     STATE["owner"] = load_owner()
+    print(f"[+] VERSION: {VERSION}")
+    print(f"[+] DATA_DIR: {DATA_DIR}")
     print(f"[+] owner: {STATE['owner']}" if STATE["owner"] else "[i] اولین /start مالک")
 
     _loop_ref[0] = asyncio.new_event_loop()
@@ -3185,12 +3210,15 @@ def main():
            .get_updates_request(req).post_init(_post_init).build())
     APP.add_handler(CommandHandler("start", cmd_start))
     APP.add_handler(CommandHandler("menu", cmd_menu))
+    APP.add_handler(CommandHandler("version", cmd_version))
     APP.add_handler(CallbackQueryHandler(on_callback))
     APP.add_handler(MessageHandler(tg_filters.ALL & ~tg_filters.COMMAND, on_message))
     APP.add_error_handler(_on_error)
 
     loop = asyncio.get_event_loop()
     loop.create_task(_scheduler_loop())
+    loop.create_task(_session_keepalive_loop())
+    print("[+] keepalive started")
 
     print("[+] polling...")
     APP.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=30.0)
