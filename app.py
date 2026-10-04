@@ -1,10 +1,10 @@
-# app.py — v62 (login با pyrubi — session پایدار)
+# app.py — v64 (auto-refresh session every 5 min, auto-read OTP from Rubika)
 # pip install "python-telegram-bot>=21" rubpy rulog requests certifi pycryptodome httpx pyrubi pyrogram tgcrypto
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
 
-VERSION = "v62"
+VERSION = "v64"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -94,7 +94,6 @@ from rubpy import Client as _C
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 
-# ★ pyrubi — فقط برای login
 from pyrubi.client.client import Client as R_clienet
 from pyrubi.methods.methods import Methods
 from pyrubi.crypto.crypto import Cryption
@@ -107,9 +106,6 @@ def _import_rsa(pk):
     return pkcs1_15.new(RSA.import_key(pk.encode()))
 
 
-# ══════════════════════════════════════════════════════════════
-# per-account locks
-# ══════════════════════════════════════════════════════════════
 _ACCOUNT_LOCKS = {}
 _ACCOUNT_LOCKS_GUARD = threading.Lock()
 
@@ -125,12 +121,10 @@ _AUTH_SAVE_LOCK = threading.Lock()
 
 
 def _save_auth_now(aid, bot):
-    """★ ذخیره auth و private_key جدید بعد از هر اتصال موفق"""
     if not aid: return False
     try:
         new_auth = getattr(bot, "auth", None)
         if not new_auth: return False
-
         new_private = None
         imp = getattr(bot, "import_key", None)
         if imp is not None and hasattr(imp, "export_key"):
@@ -141,7 +135,6 @@ def _save_auth_now(aid, bot):
                 pass
         if not new_private:
             new_private = getattr(bot, "private_key", None)
-
         with _AUTH_SAVE_LOCK:
             accounts = list_accounts()
             if aid not in accounts: return False
@@ -463,6 +456,10 @@ DEFAULT_CFG = {
 
 TG_TOKEN = os.environ.get("TG_TOKEN","").strip()
 
+# ★ تمدید خودکار سشن
+PENDING_REFRESH = {}
+SESSION_REFRESH_INTERVAL = 5 * 60
+
 _errors_lock = threading.Lock()
 
 def _load_errors():
@@ -595,10 +592,9 @@ def update_account_field(aid, key, value):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ login/session با pyrubi — با apiVersion=6
+# login/session با pyrubi
 # ══════════════════════════════════════════════════════════════
 async def rubika_send_code(phone):
-    """Login با pyrubi — send code"""
     loop = asyncio.get_event_loop()
 
     def _sync_send_code():
@@ -631,7 +627,6 @@ async def rubika_send_code(phone):
 
 
 async def rubika_send_passkey(ctx, pass_key):
-    """ثبت رمز دومرحله‌ای"""
     loop = asyncio.get_event_loop()
     methods = ctx["methods"]
     phone = ctx["phone"]
@@ -647,7 +642,6 @@ async def rubika_send_passkey(ctx, pass_key):
 
 
 async def rubika_complete_login(ctx, code):
-    """Sign-in با pyrubi — دقیقاً مثل کدِ کارکننده"""
     loop = asyncio.get_event_loop()
     methods = ctx["methods"]
     phone = ctx["phone"]
@@ -720,7 +714,7 @@ async def rubika_complete_login(ctx, code):
 
 
 # ══════════════════════════════════════════════════════════════
-# بقیه توابع کمکی
+# توابع کمکی
 # ══════════════════════════════════════════════════════════════
 async def rubika_set_name(bot, first_name, last_name=None):
     variants = [dict(first_name=first_name, last_name=last_name or ""), dict(first_name=first_name)]
@@ -1129,37 +1123,6 @@ def _op_progress_bar(op):
 
 JOIN_DEFAULTS = ["@linkdony_rubikas", "@lovo_lovoo0",
                  "@CBkJCCFE1IZHOEMRXTHDONBZMQLEJJGK"]
-
-
-async def can_send_to(bot, guid, kind="", raw=None):
-    if not kind or kind == "pv": return True, "pv"
-    kind = kind.lower()
-    try:
-        if kind == "group":
-            names = ("get_group_info", "get_chat_info", "get_info")
-            kwargs_list = ({"group_guid": guid}, {"object_guid": guid}, {"chat_guid": guid})
-        else:
-            names = ("get_channel_info", "get_chat_info", "get_info")
-            kwargs_list = ({"channel_guid": guid}, {"object_guid": guid}, {"chat_guid": guid})
-        info = None
-        for name in names:
-            fn = getattr(bot, name, None)
-            if not fn: continue
-            for kw in kwargs_list:
-                try:
-                    r = fn(**kw)
-                    if asyncio.iscoroutine(r): r = await r
-                    if r: info = r; break
-                except TypeError: continue
-                except Exception as e:
-                    if _is_auth_error(e): raise
-                    info = None; break
-            if info: break
-    except Exception as e:
-        if _is_auth_error(e): raise
-        return False, "info-error"
-    if info is None: return False, "not-found"
-    return True, "ok"
 
 
 async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
@@ -1576,6 +1539,137 @@ async def with_bot(acc, fn, timeout=90, aid=None):
 
 
 # ══════════════════════════════════════════════════════════════
+# ★ AUTO-REFRESH با خواندن خودکار OTP از پیام‌های روبیکا
+# ══════════════════════════════════════════════════════════════
+OTP_RE = re.compile(r'(?<!\d)(\d{4,7})(?!\d)')
+
+async def _read_otp_from_messages(bot, timeout=60):
+    """پیام‌های روبیکا رو می‌خونه و کد OTP رو پیدا می‌کنه"""
+    start = time.time()
+    tried = set()
+    while time.time() - start < timeout:
+        try:
+            chats = await get_all_chats_raw(bot)
+            for c in chats:
+                try:
+                    msgs = await fetch_messages(bot, c["guid"], limit=15)
+                    for m in msgs:
+                        mid = m.get("id")
+                        if mid in tried: continue
+                        txt = m.get("text") or ""
+                        if not txt: continue
+                        low = txt.lower()
+                        is_otp_msg = (
+                            "کد" in txt or "code" in low or
+                            "روبیکا" in txt or "rubika" in low or
+                            "ورود" in txt
+                        )
+                        if not is_otp_msg:
+                            continue
+                        for code in OTP_RE.findall(txt):
+                            if 4 <= len(code) <= 7:
+                                print(f"[otp-read] found code in chat {c['guid']}: {code}")
+                                return code
+                        tried.add(mid)
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[otp-read] {type(e).__name__}: {e}")
+        await asyncio.sleep(4)
+    return None
+
+
+async def auto_refresh_one(aid, acc):
+    """تمدید یک اکانت: sendCode → خواندن خودکار OTP → signIn"""
+    phone = acc.get("phone")
+    name = acc.get("name") or phone
+    if not phone:
+        return False
+
+    # ۱. sendCode
+    try:
+        ctx = await rubika_send_code(phone)
+    except Exception as e:
+        print(f"[refresh] sendCode {aid}: {e}")
+        return False
+
+    if ctx.get("status") == "SendPassKey":
+        PENDING_REFRESH[aid] = {
+            "ctx": ctx, "step": "passkey", "created": time.time(),
+        }
+        await tg_send(
+            f"🔄 <b>{esc(name)}</b>\n"
+            f"🔐 2FA لازمه:\n<code>/pass {aid} XXXXXX</code>"
+        )
+        return False
+
+    # ۲. سشن فعلی رو باز کن و پیام‌ها رو بخون
+    try:
+        cli = SafeClient(
+            name=acc.get("session_name") or "",
+            auth=acc.get("auth"),
+            private_key=acc.get("private_key"),
+            phone_number=phone,
+            _aid=aid,
+            platform='Android',
+            display_welcome=False,
+            timeout=30,
+            max_retries=3,
+        )
+        async with cli as bot:
+            print(f"[refresh] {aid}: connected, reading OTP...")
+            code = await _read_otp_from_messages(bot, timeout=60)
+            if code:
+                print(f"[refresh] {aid}: got code {code}, signing in...")
+                res = await rubika_complete_login(ctx, code)
+                if res.get("ok"):
+                    PENDING_REFRESH.pop(aid, None)
+                    print(f"[refresh] {aid}: auto-refreshed OK ✅")
+                    return True
+                else:
+                    print(f"[refresh] {aid}: signIn failed: {res.get('status')}")
+    except Exception as e:
+        print(f"[refresh] {aid}: session read failed: {type(e).__name__}: {e}")
+
+    # ۳. fallback — دستی بپرس
+    PENDING_REFRESH[aid] = {
+        "ctx": ctx, "step": "code", "created": time.time(),
+    }
+    await tg_send(
+        f"🔄 <b>{esc(name)}</b>\n"
+        f"⚠️ خودکار نشد، دستی بفرست:\n<code>/code {aid} XXXXXX</code>"
+    )
+    return False
+
+
+async def session_watchdog():
+    """هر ۵ دقیقه همه اکانت‌ها رو تمدید می‌کنه — کاملاً خودکار"""
+    print(f"[watchdog] started (interval={SESSION_REFRESH_INTERVAL}s)")
+    await asyncio.sleep(30)  # اجازه بده ربات بالا بیاد
+    while True:
+        try:
+            accounts = list_accounts()
+            if accounts:
+                print(f"[watchdog] refreshing {len(accounts)} accounts...")
+                tasks = []
+                for aid, acc in accounts.items():
+                    # اگه از قبل pending هست و منقضی نشده، رد کن
+                    if aid in PENDING_REFRESH:
+                        age = time.time() - PENDING_REFRESH[aid].get("created", 0)
+                        if age < 240:
+                            continue
+                        PENDING_REFRESH.pop(aid, None)
+                    tasks.append(auto_refresh_one(aid, acc))
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    ok = sum(1 for r in results if r is True)
+                    print(f"[watchdog] done: {ok}/{len(tasks)} refreshed")
+        except Exception as e:
+            print(f"[watchdog] {type(e).__name__}: {e}")
+        await asyncio.sleep(SESSION_REFRESH_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════════
 # Telegram UI
 # ══════════════════════════════════════════════════════════════
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1618,7 +1712,7 @@ async def tg_send(text, markup=None, parse_mode=None):
     for attempt in range(3):
         try:
             await APP.bot.send_message(chat_id=STATE["owner"], text=text,
-                                       reply_markup=markup, parse_mode=parse_mode)
+                                       reply_markup=markup, parse_mode=parse_mode or "HTML")
             return True
         except Exception as e:
             if "parse entities" in str(e) and parse_mode: parse_mode = None; continue
@@ -1676,8 +1770,8 @@ async def show_main():
     txt += f"📱 اکانت‌ها: <b>{len(accounts)}</b>\n"
     txt += f"📊 عملیات‌ها: <b>{len(ops)}</b>\n"
     if running_ops: txt += f"🟢 در حال اجرا: <b>{len(running_ops)}</b>\n"
+    txt += f"🔄 تمدید خودکار: هر <b>{SESSION_REFRESH_INTERVAL//60} دقیقه</b>\n"
     txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>\n"
-    txt += "\nاز منوی زیر انتخاب کن:"
     await panel(txt, kb_(
         [B("📤 ارسال", "send:start")],
         [B("🤝 Joiner", "send:jl")],
@@ -1922,7 +2016,6 @@ async def send_step_confirm(cid, s):
     for aid in sel:
         a = accounts.get(aid)
         if not a: continue
-        acc_name = a.get("name") or a.get("phone") or aid
         try:
             async def collect_all(bot):
                 pv = await collect_pv(bot) if tgt in ("pv","both") else []
@@ -2059,6 +2152,7 @@ async def show_cfg():
         txt += f"{label}: <b>{esc(v_str)}</b>\n"
         rows.append([B("➖", f"cfg:adj:{key}:-1"), B(v_str, "noop"), B("➕", f"cfg:adj:{key}:1")])
     txt += f"\n🔖 نسخه: <b>{VERSION}</b>"
+    txt += f"\n🔄 تمدید خودکار: هر <b>{SESSION_REFRESH_INTERVAL//60} دقیقه</b>"
     rows.append([B("🏠 منو","menu:main")])
     await panel(txt, kb_(*rows))
 
@@ -2081,8 +2175,13 @@ async def show_help():
            "🤝 Joiner — جوین در لینکدونی‌ها\n"
            "📊 آمار — جزئیات زنده\n"
            "⚠️ خطاها — ۱۰۰ خطای اخیر\n\n"
-           "🔐 login با pyrubi (session پایدار)\n"
-           "💾 auth + private_key در accounts.json")
+           "🔄 <b>تمدید خودکار سشن</b>:\n"
+           "هر ۵ دقیقه ربات کد رو از پیام‌های\n"
+           "خودِ روبیکا می‌خونه و خودکار وارد می‌شه.\n\n"
+           "اگه خودکار نشد:\n"
+           "<code>/code AID 123456</code>\n"
+           "<code>/pass AID رمز</code>\n"
+           "<code>/refresh</code> — تمدید دستی همه")
     await panel(txt, kb_([B("🏠 منو","menu:main")]))
 
 
@@ -2107,6 +2206,26 @@ async def cmd_version(update, context):
     accounts = list_accounts()
     txt = f"🔖 <b>{VERSION}</b>\n💾 <code>{DATA_DIR}</code>\n📱 اکانت‌ها: {len(accounts)}"
     await update.message.reply_text(txt, parse_mode="HTML")
+
+
+async def cmd_refresh(update, context):
+    """دستور /refresh — تمدید دستی همه اکانت‌ها"""
+    if not authorized(update): return
+    accounts = list_accounts()
+    if not accounts:
+        await update.message.reply_text("⚠️ اکانتی نیست")
+        return
+    await update.message.reply_text(f"⏳ در حال تمدید {len(accounts)} اکانت...")
+    for aid, acc in accounts.items():
+        try:
+            ok = await auto_refresh_one(aid, acc)
+            name = acc.get("name") or acc.get("phone")
+            if ok:
+                await update.message.reply_text(f"✅ {name} — تمدید شد")
+            else:
+                await update.message.reply_text(f"⚠️ {name} — خودکار نشد")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {aid}: {str(e)[:120]}")
 
 
 PROF_PROMPT = {"name":"👤 اسم جدید:","bio":"📖 بیو جدید:",
@@ -2472,7 +2591,7 @@ async def _scheduler_loop():
 
 
 # ══════════════════════════════════════════════════════════════
-# on_message — با login pyrubi
+# on_message — /code /pass
 # ══════════════════════════════════════════════════════════════
 async def on_message(update, context):
     if not authorized(update): return
@@ -2481,6 +2600,46 @@ async def on_message(update, context):
     cid = update.effective_chat.id
     conv = STATE["conv"].get(cid) or {}
     text = (msg.text or "").strip()
+
+    if text.startswith("/code ") or text.startswith("/pass "):
+        parts = text.split()
+        if len(parts) < 3:
+            await update.message.reply_text("فرمت: /code AID 123456")
+            return
+        cmd, aid, value = parts[0], parts[1], parts[2]
+        info = PENDING_REFRESH.get(aid)
+        if not info:
+            await update.message.reply_text("❌ اکانت پیدا نشد یا منقضی شده")
+            return
+
+        if cmd == "/pass":
+            res, err = await rubika_send_passkey(info["ctx"], value)
+            if err:
+                await update.message.reply_text(f"❌ {err}")
+                return
+            if res.get("status") == "InvalidPassKey":
+                await update.message.reply_text("🔐 رمز اشتباه — دوباره بفرست")
+                return
+            info["ctx"]["sendCodeData"] = res
+            info["step"] = "code"
+            await update.message.reply_text(
+                f"📩 کد پیامک رو بفرست:\n<code>/code {aid} XXXXXX</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        if cmd == "/code":
+            res = await rubika_complete_login(info["ctx"], value)
+            if res.get("ok"):
+                PENDING_REFRESH.pop(aid, None)
+                await update.message.reply_text(
+                    f"✅ سشن {aid} تمدید شد\n🔖 {VERSION}"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ خطا: {res.get('status','?')}"
+                )
+            return
 
     if "jl_wait" in conv:
         wait = conv.pop("jl_wait")
@@ -2669,9 +2828,12 @@ async def on_message(update, context):
 async def _post_init(app):
     try:
         from telegram import BotCommand
-        await app.bot.set_my_commands([BotCommand("start","شروع"),
-                                       BotCommand("menu","منوی اصلی"),
-                                       BotCommand("version","نسخه")])
+        await app.bot.set_my_commands([
+            BotCommand("start","شروع"),
+            BotCommand("menu","منوی اصلی"),
+            BotCommand("version","نسخه"),
+            BotCommand("refresh","تمدید سشن همه اکانت‌ها"),
+        ])
     except Exception: pass
 
 async def _on_error(update, context):
@@ -2696,12 +2858,16 @@ def main():
     APP.add_handler(CommandHandler("start", cmd_start))
     APP.add_handler(CommandHandler("menu", cmd_menu))
     APP.add_handler(CommandHandler("version", cmd_version))
+    APP.add_handler(CommandHandler("refresh", cmd_refresh))
     APP.add_handler(CallbackQueryHandler(on_callback))
+    # /code و /pass به on_message برن (چون خودشون handler مخصوص دارن)
+    APP.add_handler(MessageHandler(tg_filters.Regex(r"^/(code|pass)\s+"), on_message))
     APP.add_handler(MessageHandler(tg_filters.ALL & ~tg_filters.COMMAND, on_message))
     APP.add_error_handler(_on_error)
 
     loop = asyncio.get_event_loop()
     loop.create_task(_scheduler_loop())
+    loop.create_task(session_watchdog())
 
     print("[+] polling...")
     APP.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=2.0, timeout=30.0)
