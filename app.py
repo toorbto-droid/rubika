@@ -1,9 +1,9 @@
-# app.py — v67tg (auto-relogin listener-handoff + private channel مثل webapp)
+# app.py — v68tg (channel send + auto-relogin listener-handoff)
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
 
-VERSION = "v67tg"
+VERSION = "v68tg"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -505,7 +505,6 @@ async def report_new_message(acc_name, chat_title, chat_guid, chat_type, msg):
     text_raw = (msg.get("text") or "").strip()
     title_s = (chat_title or "")
 
-    # ★ اول handoff — قبل از فیلتر، چون باید همیشه کدها گرفته بشن
     try:
         if try_fill_code_from_service(text_raw, title_s):
             print(f"[report] code captured for refresh")
@@ -955,10 +954,9 @@ async def rubika_set_chat_photo(bot, guid, image_path):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ CREATE CHANNEL — دقیقاً مثل webapp.py (add → edit Private → join_link)
+# ★ CREATE CHANNEL
 # ══════════════════════════════════════════════════════════════
 async def rubika_create_channel(bot, title, description="", channel_type="private"):
-    # ۱. ساخت کانال
     try:
         r = bot.add_channel(title=title, description=description or None)
         if asyncio.iscoroutine(r): r = await r
@@ -966,7 +964,6 @@ async def rubika_create_channel(bot, title, description="", channel_type="privat
     except Exception as e:
         return False, _fmt_error(e), None, None
 
-    # ۲. اگه guid نداد، از لیست چت پیدا کن
     if not guid:
         for _ in range(3):
             await asyncio.sleep(1.5)
@@ -984,7 +981,6 @@ async def rubika_create_channel(bot, title, description="", channel_type="privat
     ctype = (channel_type or "private").lower()
     warnings = []
 
-    # ۳. اگه private: تبدیل به Private — دقیقاً مثل webapp
     if ctype == "private":
         await asyncio.sleep(1.5)
         converted = False
@@ -1000,12 +996,9 @@ async def rubika_create_channel(bot, title, description="", channel_type="privat
                 warnings.append(f"private: {_fmt_error(e)}")
         await asyncio.sleep(1.5)
 
-    # ۴. اگه public: یوزرنیم + Public
     if ctype == "public":
-        # بعداً کاربر از دکمه «یوزرنیم» ست می‌کنه
         pass
 
-    # ۵. اگه private: لینک عضویت با ۳ retry
     join_link = None
     if ctype == "private":
         for attempt in range(3):
@@ -1024,7 +1017,6 @@ async def rubika_create_channel(bot, title, description="", channel_type="privat
 
 
 async def rubika_create_join_link(bot, guid, attempts=3):
-    """لینک عضویت — دقیقاً مثل webapp"""
     last_err = None
     for attempt in range(attempts):
         variants = [
@@ -1238,6 +1230,31 @@ async def send_media(bot, target, payload):
                 errors.append(f"{name}: {_fmt_error(e)}")
                 if _is_rate_limit(e): raise
     raise RuntimeError(" | ".join(errors[-3:]) or "متد ارسال فایل پیدا نشد")
+
+async def send_text_only(bot, target, text):
+    """ارسال متن خالص — مناسب کانال/گروه/PV"""
+    errors = []
+    for mname in ("send_message","sendMessage"):
+        fn = getattr(bot, mname, None)
+        if not fn: continue
+        for kw in ({"object_guid": target, "text": text},
+                   {"chat_id": target, "text": text},
+                   {"object_guid": target, "message": text}):
+            try:
+                kw2 = _filter_kwargs(fn, kw)
+                if not kw2: continue
+                r = fn(**kw2)
+                if asyncio.iscoroutine(r): r = await r
+                return True
+            except Exception as e:
+                errors.append(_fmt_error(e))
+        try:
+            r = fn(target, text)
+            if asyncio.iscoroutine(r): r = await r
+            return True
+        except Exception as e:
+            errors.append(_fmt_error(e))
+    raise RuntimeError(" | ".join(errors[-3:]) or "send_message پیدا نشد")
 
 async def extract_tg_media(msg):
     obj = kind = name = None
@@ -1742,14 +1759,12 @@ async def with_bot(acc, fn, timeout=90, aid=None):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ AUTO-REFRESH — sendCode بزن، listener کد رو بگیره، watcher لاگین کنه
+# ★ AUTO-REFRESH
 # ══════════════════════════════════════════════════════════════
 async def auto_refresh_one(aid, acc):
-    """sendCode می‌زنه و می‌ره تو PENDING_REFRESH. listener کد رو می‌گیره و watcher لاگین می‌کنه."""
     phone = acc.get("phone"); name = acc.get("name") or phone
     if not phone: return False
 
-    # اگه از قبل pending سالم هست، رد کن
     if aid in PENDING_REFRESH:
         old = PENDING_REFRESH[aid]
         if time.time() - old.get("started_at", 0) < CODE_WAIT_TIMEOUT:
@@ -1792,7 +1807,6 @@ async def auto_refresh_one(aid, acc):
 
 
 async def auto_login_watcher():
-    """هر ۲ ثانیه PENDING_REFRESH رو چک می‌کنه — اگه کد اومد login می‌زنه."""
     print("[watcher] started")
     while True:
         try:
@@ -2102,6 +2116,7 @@ async def show_channel_view(aid, idx):
     txt = (head("⚙️", ch.get("title","—")) +
            f"{'🌐 عمومی' if ch.get('is_public') else '🔒 خصوصی'}\n🔗 {esc(link)}")
     await panel(txt, kb_(
+        [B("📤 ارسال پیام به کانال", f"chan:send:{aid}:{idx}")],
         [B("✏️ اسم", f"chan:edit:title:{aid}:{idx}"), B("📖 بیو", f"chan:edit:desc:{aid}:{idx}")],
         [B("🔗 یوزرنیم", f"chan:edit:user:{aid}:{idx}"), B("🖼 عکس", f"chan:edit:photo:{aid}:{idx}")],
         [B("🔁 لینک جدید", f"chan:mklink:{aid}:{idx}"), B("🗑 حذف", f"chan:del:{aid}:{idx}")],
@@ -2395,13 +2410,10 @@ async def adjust_cfg(key, sign):
 async def show_help():
     txt = (head("❓","راهنما") + f"🔖 نسخه: <b>{VERSION}</b>\n\n"
            "📤 ارسال — پیام به گروه‌ها و PV\n"
+           "📢 کانال‌ها — ساخت + ارسال پیام/عکس/فایل در کانال\n"
            "🤝 Joiner — جوین در لینکدونی‌ها\n"
            "👂 لیسنر — پیام‌های سرویس (کد ورود)\n"
-           "🔄 تمدید خودکار — هر ۷ دقیقه سشن تازه:\n"
-           "   ۱. ربات sendCode می‌زنه\n"
-           "   ۲. لیسنر کد رو از پیام سرویس می‌گیره\n"
-           "   ۳. خودکار signIn می‌کنه\n"
-           "   ۴. لیسنر ری‌استارت می‌شه\n\n"
+           "🔄 تمدید خودکار — هر ۷ دقیقه سشن تازه\n\n"
            "📊 آمار — جزئیات زنده\n"
            "⚠️ خطاها — ۱۰۰ خطای اخیر\n\n"
            "اگه خودکار نشد:\n"
@@ -2698,6 +2710,51 @@ async def route_cb(cid, data):
             if ok: remove_channel_from_storage(aid, idx)
             return await panel(("✅ حذف شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
                                kb_([B("⬅️", f"chan:list:{aid}")]))
+        # ══ جدید: ارسال به کانال ══
+        if sub == "send":
+            aid, idx = p[2], int(p[3])
+            a = get_account(aid); chans = (a or {}).get("channels",[])
+            if not a or idx >= len(chans): return await panel("⚠️", kb_([B("🏠 منو","menu:main")]))
+            get_conv(cid)["chan_send"] = {"aid": aid, "idx": idx, "step": "compose", "payload": None}
+            return await ask("📤 پیام را بفرستید:\n• متن\n• عکس\n• فایل\n\nبرای لغو /menu")
+        if sub == "sendgo":
+            cs = get_conv(cid).get("chan_send")
+            if not cs: return await show_main()
+            aid = cs["aid"]; idx = cs["idx"]; payload = cs["payload"]
+            a = get_account(aid); chans = (a or {}).get("channels",[])
+            if not a or idx >= len(chans):
+                STATE["conv"].pop(cid, None)
+                return await panel("⚠️", kb_([B("🏠 منو","menu:main")]))
+            ch = chans[idx]
+            guid = ch.get("guid")
+            await panel("⏳ در حال ارسال...")
+            try:
+                if payload.get("file") and os.path.exists(payload["file"]):
+                    await with_bot(a, lambda b: send_media(b, guid, payload), 120, aid=aid)
+                else:
+                    await with_bot(a, lambda b: send_text_only(b, guid, payload.get("text") or "—"), 60, aid=aid)
+                ok = True; err = None
+            except Exception as e:
+                ok = False; err = _fmt_error(e)
+            if payload and payload.get("file"):
+                try: os.remove(payload["file"])
+                except Exception: pass
+            STATE["conv"].pop(cid, None)
+            if ok:
+                return await panel(f"✅ پیام به <b>{esc(ch.get('title','?'))}</b> ارسال شد",
+                                   kb_([B("📤 ارسال دیگر", f"chan:send:{aid}:{idx}")],
+                                       [B("⬅️", f"chan:view:{aid}:{idx}")]))
+            return await panel(f"❌ {esc(str(err)[:250])}",
+                               kb_([B("🔁 تلاش دوباره", f"chan:send:{aid}:{idx}")],
+                                   [B("⬅️", f"chan:view:{aid}:{idx}")]))
+        if sub == "sendredo":
+            cs = get_conv(cid).get("chan_send")
+            if not cs: return await show_main()
+            if cs.get("payload") and cs["payload"].get("file"):
+                try: os.remove(cs["payload"]["file"])
+                except Exception: pass
+            cs["step"] = "compose"; cs["payload"] = None
+            return await ask("📤 پیام جدید را بفرستید:")
 
     if h == "jl":
         c = get_conv(cid)
@@ -2863,7 +2920,6 @@ async def on_message(update, context):
             await update.message.reply_text(f"📩 /code {aid} XXXXXX", parse_mode="HTML")
             return
         if cmd == "/code":
-            # بذار تو pending و watcher خودش لاگین کنه
             info["code"] = value
             CODE_FILLED.set()
             await update.message.reply_text(f"✅ کد {aid} ثبت شد، watcher لاگین می‌کنه...")
@@ -2967,6 +3023,40 @@ async def on_message(update, context):
         return await panel(("✅ انجام شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
                            kb_([B("⬅️", f"prof:menu:{aid}")]))
 
+    # ══ جدید: ارسال به کانال ══
+    if "chan_send" in conv:
+        cs = conv["chan_send"]
+        STATE["panel"].pop(cid, None)
+        if cs.get("step") == "compose":
+            try: media = await extract_tg_media(msg)
+            except Exception as e:
+                return await ask("📤 دوباره بفرست:", note=str(e)[:150])
+            cap = (msg.caption or msg.text or "").strip()
+            if not media and not cap:
+                return await ask("📤 یک متن یا فایل بفرست:")
+            payload = ({**media, "text": cap} if media
+                       else {"kind":"text","text":cap,"file":None})
+            cs["payload"] = payload
+            cs["step"] = "confirm"
+            aid = cs["aid"]; idx = cs["idx"]
+            a = get_account(aid); chans = (a or {}).get("channels",[])
+            if not a or idx >= len(chans):
+                STATE["conv"].pop(cid, None)
+                return await panel("⚠️ کانال پیدا نشد.", kb_([B("🏠 منو","menu:main")]))
+            ch = chans[idx]
+            txt = head("📤", "تایید ارسال به کانال")
+            txt += f"📢 کانال: <b>{esc(ch.get('title','?'))}</b>\n"
+            txt += f"🆔 <code>{esc(ch.get('guid',''))[:30]}</code>\n\n"
+            if media:
+                txt += f"📎 نوع: <b>{esc(KIND_ICON.get(payload.get('kind'),'📎'))} {esc(payload.get('kind','?'))}</b>\n"
+                txt += f"📄 نام: <code>{esc(payload.get('file_name','file'))}</code>\n"
+            if cap:
+                txt += f"\n💬 متن:\n<code>{esc(cap[:800])}</code>\n"
+            return await panel(txt, kb_(
+                [B("✅ ارسال", "chan:sendgo")],
+                [B("✏️ تغییر پیام", "chan:sendredo")],
+                [B("❌ لغو", f"chan:view:{aid}:{idx}")]))
+
     if "chan" in conv:
         ch = conv["chan"]; step = ch.get("step")
         STATE["panel"].pop(cid, None)
@@ -3000,6 +3090,7 @@ async def on_message(update, context):
             elif not public:
                 txt += "\n⚠️ لینک ساخته نشد"
             return await panel(txt, kb_([B("⚙️", f"chan:view:{aid}:{idx}")],
+                                         [B("📤 ارسال پیام", f"chan:send:{aid}:{idx}")],
                                          [B("⬅️", f"chan:list:{aid}")]))
         if step == "edit":
             aid = ch.get("aid"); idx = ch.get("idx"); field = ch.get("field")
