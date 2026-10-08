@@ -1,9 +1,9 @@
-# app.py — v68tg (channel send + auto-relogin listener-handoff)
+# app.py — v69tg (channel-send + ultra-fast joiner + auto-msg + parallel accounts)
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets
 import logging, traceback, concurrent.futures, tempfile, inspect
 import html as _html
 
-VERSION = "v68tg"
+VERSION = "v69tg"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -412,10 +412,29 @@ RATE_LIMIT_WAIT = 20 * 60
 ANCHORS = {}
 JL_JOBS = {}
 
+# ══════════════════════════════════════════════════════════════
+# ★ JOINER — فوق سریع + همزمان
+# ══════════════════════════════════════════════════════════════
 JOINER_CONFIG = {
-    "extract_max_rounds": 20, "join_per_batch": 5, "batch_pause": 30,
-    "rate_limit_pause": 20 * 60, "max_join_per_hour": 30, "join_delay": 8,
+    "extract_max_rounds": 20, "join_per_batch": 100, "batch_pause": 2,
+    "rate_limit_pause": 20 * 60, "max_join_per_hour": 500, "join_delay": 0.5,
 }
+
+# حالت‌های سرعت
+JL_SPEEDS = [
+    ("ultra", "🚀 فوق‌سریع", 0.3),
+    ("fast", "⚡ سریع", 1.0),
+    ("normal", "🐢 عادی", 3.0),
+    ("slow", "🛡 امن", 8.0),
+]
+
+# قفل روی op برای همزمانی امن
+_OP_LOCKS = {}
+def _get_op_lock(oid):
+    if oid not in _OP_LOCKS:
+        _OP_LOCKS[oid] = asyncio.Lock()
+    return _OP_LOCKS[oid]
+
 
 DEFAULT_CFG = {
     "delay": 8.0, "cooldown": 180, "max_parallel": 2,
@@ -435,7 +454,7 @@ CODE_WAIT_TIMEOUT = 180
 CODE_FILLED = threading.Event()
 
 # ══════════════════════════════════════════════════════════════
-# 👂 LISTENER — پیام‌های سرویس رو به تلگرام می‌فرسته
+# 👂 LISTENER
 # ══════════════════════════════════════════════════════════════
 LISTENER_SEEN = {}
 LISTENER_SEEN_LOCK = threading.Lock()
@@ -480,11 +499,7 @@ def _listener_cfg_service_only():
     except Exception: return True
 
 
-# ══════════════════════════════════════════════════════════════
-# ★ HANDOFF: listener → PENDING_REFRESH
-# ══════════════════════════════════════════════════════════════
 def try_fill_code_from_service(text, chat_title):
-    """پیام سرویس که کد توش هست رو بگیر و به pending بچسبون."""
     if not is_login_service_message(chat_title, text): return False
     code = extract_login_code(text)
     if not code: return False
@@ -803,7 +818,7 @@ def update_channel_field(aid, idx, key, value):
 
 
 # ══════════════════════════════════════════════════════════════
-# login/session با pyrubi
+# login/session
 # ══════════════════════════════════════════════════════════════
 async def rubika_send_code(phone):
     loop = asyncio.get_event_loop()
@@ -879,7 +894,7 @@ async def rubika_complete_login(ctx, code):
 
 
 # ══════════════════════════════════════════════════════════════
-# توابع کمکی پروفایل/کانال
+# پروفایل/کانال
 # ══════════════════════════════════════════════════════════════
 async def rubika_set_name(bot, first_name, last_name=None):
     variants = [dict(first_name=first_name, last_name=last_name or ""), dict(first_name=first_name)]
@@ -953,9 +968,6 @@ async def rubika_set_chat_photo(bot, guid, image_path):
     return (True, info) if ok else (False, err)
 
 
-# ══════════════════════════════════════════════════════════════
-# ★ CREATE CHANNEL
-# ══════════════════════════════════════════════════════════════
 async def rubika_create_channel(bot, title, description="", channel_type="private"):
     try:
         r = bot.add_channel(title=title, description=description or None)
@@ -1232,7 +1244,6 @@ async def send_media(bot, target, payload):
     raise RuntimeError(" | ".join(errors[-3:]) or "متد ارسال فایل پیدا نشد")
 
 async def send_text_only(bot, target, text):
-    """ارسال متن خالص — مناسب کانال/گروه/PV"""
     errors = []
     for mname in ("send_message","sendMessage"):
         fn = getattr(bot, mname, None)
@@ -1626,7 +1637,11 @@ def _hash_of(link):
     return "x:" + s[:50]
 
 
+# ══════════════════════════════════════════════════════════════
+# ★ JOINER — فوق سریع
+# ══════════════════════════════════════════════════════════════
 async def _try_join_single(bot, link):
+    """Join via link/username → (ok, guid_or_err, tag)"""
     is_link = ("://" in link) or ("rubika.ir" in link.lower()) or ("/joing/" in link.lower())
     if is_link:
         fn = getattr(bot, "join_group", None)
@@ -1634,118 +1649,238 @@ async def _try_join_single(bot, link):
             try:
                 r = fn(link=link)
                 if asyncio.iscoroutine(r): r = await r
-                if _is_ok_response(r): return True, "join_group"
+                if _is_ok_response(r):
+                    guid = extract_chat_guid(r)
+                    if not guid:
+                        d = _to_plain(r) or {}
+                        found = {}
+                        _find_keys(d, ("object_guid","chat_guid","group_guid",
+                                       "channel_guid","guid"), found)
+                        guid = (found.get("object_guid") or found.get("chat_guid") or
+                                found.get("group_guid") or found.get("channel_guid") or
+                                found.get("guid"))
+                    return True, guid, "join_group"
                 err = _fmt_error(r)
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
-                    return True, "join_group(already)"
+                    return True, None, "already"
+                return False, err, "join-failed"
             except Exception as e:
                 err = _fmt_error(e)
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
-                    return True, "join_group(already)"
-        return False, "join-failed"
-    return False, "unknown-format"
+                    return True, None, "already"
+                return False, err, "join-failed"
+        return False, "no-method", "join-failed"
+
+    # @username → resolve first
+    guid, kind = await _resolve_target(bot, link)
+    if not guid:
+        return False, "resolve-failed", "resolve"
+    try:
+        if kind == "Channel" or (guid and guid[0].lower() == "c"):
+            r = bot.join_channel_action(channel_guid=guid, action="Join")
+        else:
+            r = bot.join_chat(chat=guid)
+        if asyncio.iscoroutine(r): r = await r
+        if _is_ok_response(r):
+            return True, guid, "join"
+        err = _fmt_error(r)
+        if "ALREADY" in err.upper() or "MEMBER" in err.upper():
+            return True, guid, "already"
+        return False, err, "join-failed"
+    except Exception as e:
+        err = _fmt_error(e)
+        if "ALREADY" in err.upper() or "MEMBER" in err.upper():
+            return True, guid, "already"
+        return False, err, "join-failed"
+
+
+async def _joiner_worker_for_account(aid, acc, op_id, join_delay,
+                                      max_join, auto_msg_text, log):
+    """جوین فوق‌سریع یک اکانت — با پیام خودکار پس از جوین"""
+    acc_name = acc.get("name") or acc.get("phone") or aid
+    lock = _get_op_lock(op_id)
+
+    async def job(bot):
+        # ── ۱. جوین لینکدونی‌ها ──
+        async with lock:
+            op = _get_op(op_id)
+            if not op: return
+            op["progress"]["phase"] = f"۱/۴ لینکدونی ({acc_name[:15]})"
+            _save_op(op)
+
+        linkdoni_guids = []
+        for link in JOIN_DEFAULTS:
+            guid, kind = await _resolve_target(bot, link)
+            if not guid: continue
+            try:
+                if kind == "Channel" or (guid and guid[0].lower() == "c"):
+                    r = bot.join_channel_action(channel_guid=guid, action="Join")
+                else:
+                    r = bot.join_chat(chat=guid)
+                if asyncio.iscoroutine(r): r = await r
+                if _is_ok_response(r):
+                    linkdoni_guids.append(guid)
+                    async with lock:
+                        op = _get_op(op_id)
+                        if op:
+                            op["progress"].setdefault("linkdoni_ok", []).append(link)
+                            _save_op(op)
+            except Exception: pass
+            await asyncio.sleep(0.5)
+
+        if not linkdoni_guids: return
+
+        # ── ۲. استخراج لینک‌ها ──
+        async with lock:
+            op = _get_op(op_id)
+            if op:
+                op["progress"]["phase"] = f"۲/۴ استخراج ({acc_name[:15]})"
+                _save_op(op)
+
+        ordered = {}
+        for guid in linkdoni_guids:
+            try:
+                found = await _extract_links_from_bot(bot, guid, limit=1000, log=log)
+                for l in found:
+                    if l not in ordered: ordered[l] = True
+                async with lock:
+                    op = _get_op(op_id)
+                    if op:
+                        op["progress"]["extracted"] = len(ordered)
+                        _save_op(op)
+            except Exception as e:
+                add_error("استخراج", _fmt_error(e), guid, acc_name)
+
+        if not ordered: return
+        all_links = list(ordered.keys())
+
+        async with lock:
+            op = _get_op(op_id)
+            if op:
+                op["progress"]["total"] = op["progress"].get("total", 0) + len(all_links)
+                _save_op(op)
+
+        # ── ۳. جوین فوق‌سریع + پیام خودکار ──
+        async with lock:
+            op = _get_op(op_id)
+            if op:
+                op["progress"]["phase"] = f"۳/۴ جوین ({acc_name[:15]})"
+                _save_op(op)
+
+        seen = set(); joined = 0
+        for link in all_links:
+            if max_join and joined >= max_join: break
+
+            async with lock:
+                op = _get_op(op_id)
+                if not op or op.get("status") == "cancelled": return
+
+            h = _hash_of(link)
+            if h in seen: continue
+            seen.add(h)
+
+            try:
+                ok, res, tag = await _try_join_single(bot, link)
+                if ok:
+                    joined += 1
+                    async with lock:
+                        op = _get_op(op_id)
+                        if op:
+                            op["progress"]["joined"] = op["progress"].get("joined", 0) + 1
+                            _save_op(op)
+
+                    # ✉️ پیام خودکار پس از جوین
+                    if auto_msg_text and res and isinstance(res, str) and len(res) > 5:
+                        try:
+                            await send_text_only(bot, res, auto_msg_text)
+                            async with lock:
+                                op = _get_op(op_id)
+                                if op:
+                                    op["progress"]["msg_sent"] = op["progress"].get("msg_sent", 0) + 1
+                                    _save_op(op)
+                        except Exception as e:
+                            add_error("msg-after-join", _fmt_error(e), res, acc_name)
+                            async with lock:
+                                op = _get_op(op_id)
+                                if op:
+                                    op["progress"]["msg_fail"] = op["progress"].get("msg_fail", 0) + 1
+                                    _save_op(op)
+                else:
+                    async with lock:
+                        op = _get_op(op_id)
+                        if op:
+                            op["progress"]["failed"] = op["progress"].get("failed", 0) + 1
+                            errs = op["progress"].setdefault("link_errors", [])
+                            errs.append((link, str(res)[:100]))
+                            if len(errs) > 40: op["progress"]["link_errors"] = errs[-40:]
+                            _save_op(op)
+            except Exception as e:
+                async with lock:
+                    op = _get_op(op_id)
+                    if op:
+                        op["progress"]["failed"] = op["progress"].get("failed", 0) + 1
+                        _save_op(op)
+
+            # تاخیر پویا
+            if join_delay > 0:
+                await asyncio.sleep(join_delay)
+
+    try:
+        await with_bot(acc, job, 3600, aid=aid)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        async with lock:
+            op = _get_op(op_id)
+            if op:
+                op["errors"] = op.get("errors") or []
+                op["errors"].append(f"{acc_name}: {type(e).__name__}")
+                _save_op(op)
 
 
 async def run_joiner_lefter(op, log):
     accounts = list_accounts()
     sel = op.get("accounts") or []
     if "all" in sel: sel = list(accounts.keys())
+
     max_join = op.get("max_join", 0) or 0
-    op["progress"] = {"joined": 0, "failed": 0, "total": 0,
-        "phase": "شروع", "extracted": 0, "verified": 0, "new_chats": 0,
-        "linkdoni_ok": [], "linkdoni_fail": [], "link_errors": []}
+    join_delay = float(op.get("join_delay", 0.5))
+    auto_msg_text = (op.get("auto_msg") or "").strip()
+
+    op["progress"] = {
+        "joined": 0, "failed": 0, "total": 0,
+        "phase": "شروع", "extracted": 0,
+        "msg_sent": 0, "msg_fail": 0,
+        "linkdoni_ok": [], "linkdoni_fail": [], "link_errors": []
+    }
     op["status"] = "running"; op["errors"] = []
     _save_op(op)
+
+    # همه اکانت‌ها همزمان
+    tasks = []
     for aid in sel:
         a = accounts.get(aid)
         if not a: continue
-        acc_name = a.get("name") or a.get("phone") or aid
-        try:
-            async def job(bot):
-                op["progress"]["phase"] = "۱/۴ جوین لینکدونی‌ها"
-                _save_op(op)
-                linkdoni_guids = []
-                for link in JOIN_DEFAULTS:
-                    guid, kind = await _resolve_target(bot, link)
-                    if not guid:
-                        op["progress"]["linkdoni_fail"].append((link, "resolve"))
-                        continue
-                    ok = False
-                    try:
-                        if kind == "Channel" or (guid and guid[0].lower() == "c"):
-                            r = bot.join_channel_action(channel_guid=guid, action="Join")
-                        else:
-                            r = bot.join_chat(chat=guid)
-                        if asyncio.iscoroutine(r): r = await r
-                        ok = _is_ok_response(r)
-                    except Exception: pass
-                    if ok:
-                        linkdoni_guids.append(guid)
-                        op["progress"]["linkdoni_ok"].append(link)
-                    await asyncio.sleep(3)
-                if not linkdoni_guids:
-                    op["progress"]["phase"] = "هیچ لینکدونی"
-                    _save_op(op); return
-                op["progress"]["phase"] = "۳/۴ استخراج لینک"
-                _save_op(op)
-                ordered_links = {}
-                for guid in linkdoni_guids:
-                    try:
-                        found = await _extract_links_from_bot(bot, guid, limit=500, want=None, log=log)
-                        for l in found:
-                            if l not in ordered_links: ordered_links[l] = True
-                        op["progress"]["extracted"] = len(ordered_links)
-                        _save_op(op)
-                    except Exception as e:
-                        add_error("استخراج", _fmt_error(e), guid, acc_name)
-                if not ordered_links:
-                    op["progress"]["phase"] = "لینکی نبود"; _save_op(op); return
-                all_links = list(ordered_links.keys())
-                op["progress"]["total"] = len(all_links)
-                op["progress"]["phase"] = "۴/۴ جوین"
-                _save_op(op)
-                seen_hashes = set(); joined_count = 0
-                hour_start = time.time(); hour_joined = 0
-                for i, link in enumerate(all_links):
-                    if max_join and op["progress"]["joined"] >= max_join: break
-                    if op["status"] == "cancelled": break
-                    if joined_count > 0 and joined_count % JOINER_CONFIG["join_per_batch"] == 0:
-                        await asyncio.sleep(JOINER_CONFIG["batch_pause"])
-                    if time.time() - hour_start >= 3600:
-                        hour_start = time.time(); hour_joined = 0
-                    if hour_joined >= JOINER_CONFIG["max_join_per_hour"]:
-                        pause = 3600 - (time.time() - hour_start)
-                        if pause > 0: await asyncio.sleep(min(pause, 600))
-                    h = _hash_of(link)
-                    if h in seen_hashes: continue
-                    seen_hashes.add(h)
-                    try:
-                        ok, msg = await _try_join_single(bot, link)
-                        if ok:
-                            op["progress"]["joined"] += 1
-                            joined_count += 1; hour_joined += 1
-                        else:
-                            op["progress"]["failed"] += 1
-                            op["progress"]["link_errors"].append((link, str(msg)[:100]))
-                    except Exception as e:
-                        op["progress"]["failed"] += 1
-                        op["progress"]["link_errors"].append((link, _fmt_error(e)[:100]))
-                    if len(op["progress"]["link_errors"]) > 30:
-                        op["progress"]["link_errors"] = op["progress"]["link_errors"][-30:]
-                    _save_op(op)
-                    await asyncio.sleep(JOINER_CONFIG["join_delay"])
-            await with_bot(a, job, 3600, aid=aid)
-        except asyncio.CancelledError:
-            op["status"] = "cancelled"
-            op["progress"]["phase"] = "لغو شد"
-            _save_op(op); raise
-        except Exception as e:
-            op["errors"] = op.get("errors") or []
-            op["errors"].append(acc_name + ": " + type(e).__name__)
-    if op.get("status") != "cancelled":
-        op["status"] = "done"; op["progress"]["phase"] = "تمام"
-    op["finished_at"] = int(time.time())
-    _save_op(op)
+        t = asyncio.create_task(
+            _joiner_worker_for_account(
+                aid, a, op["id"], join_delay,
+                max_join, auto_msg_text, log
+            )
+        )
+        tasks.append(t)
+
+    if tasks:
+        try: log(f"🚀 Joiner فوق‌سریع: {len(tasks)} اکانت همزمان (delay={join_delay}s)")
+        except Exception: pass
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    op2 = _get_op(op["id"])
+    if op2 and op2.get("status") != "cancelled":
+        op2["status"] = "done"
+        op2["progress"]["phase"] = "تمام"
+        op2["finished_at"] = int(time.time())
+        _save_op(op2)
+    _OP_LOCKS.pop(op["id"], None)
 
 
 async def with_bot(acc, fn, timeout=90, aid=None):
@@ -1759,7 +1894,7 @@ async def with_bot(acc, fn, timeout=90, aid=None):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ AUTO-REFRESH
+# AUTO-REFRESH
 # ══════════════════════════════════════════════════════════════
 async def auto_refresh_one(aid, acc):
     phone = acc.get("phone"); name = acc.get("name") or phone
@@ -1993,7 +2128,7 @@ async def show_main():
     txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>\n"
     await panel(txt, kb_(
         [B("📤 ارسال", "send:start")],
-        [B("🤝 Joiner", "send:jl")],
+        [B("🤝 Joiner فوق‌سریع", "send:jl")],
         [B("📱 اکانت‌ها", "menu:acc"), B("📊 آمار", "menu:stats")],
         [B("👂 لیسنر", "menu:listen")],
         [B("⚙️ تنظیمات", "menu:cfg"), B("❓ راهنما", "menu:help")]))
@@ -2355,6 +2490,13 @@ async def show_op_detail(oid):
         p = op.get("progress") or {}
         txt += f"📍 مرحله: <b>{esc(p.get('phase','—'))}</b>\n"
         txt += f"✅ جوین: <b>{s['done']}</b> · ❌ <b>{s['failed']}</b>\n"
+        ms = p.get("msg_sent", 0); mf = p.get("msg_fail", 0)
+        if ms or mf:
+            txt += f"✉️ پیام ارسالی: <b>{ms}</b> · ❌ <b>{mf}</b>\n"
+        spd = op.get("speed")
+        if spd:
+            spd_lbl = next((label for k, label, _ in JL_SPEEDS if k == spd), spd)
+            txt += f"🚀 سرعت: <b>{spd_lbl}</b>\n"
         rows = []
         if st == "running": rows.append([B("⏹ توقف", f"op:stop:{oid}")])
         rows.append([B("⬅️ آمار","menu:stats"), B("🏠 منو","menu:main")])
@@ -2411,7 +2553,8 @@ async def show_help():
     txt = (head("❓","راهنما") + f"🔖 نسخه: <b>{VERSION}</b>\n\n"
            "📤 ارسال — پیام به گروه‌ها و PV\n"
            "📢 کانال‌ها — ساخت + ارسال پیام/عکس/فایل در کانال\n"
-           "🤝 Joiner — جوین در لینکدونی‌ها\n"
+           "🤝 Joiner فوق‌سریع — جوین همزمان + پیام خودکار\n"
+           "   🚀 فوق‌سریع = 0.3s · ⚡ سریع = 1s\n"
            "👂 لیسنر — پیام‌های سرویس (کد ورود)\n"
            "🔄 تمدید خودکار — هر ۷ دقیقه سشن تازه\n\n"
            "📊 آمار — جزئیات زنده\n"
@@ -2534,7 +2677,9 @@ async def route_cb(cid, data):
             s["step"] = "accounts"; s["accounts"] = s.get("accounts") or []
             return await show_send_step(cid)
         if sub == "jl":
-            c = get_conv(cid); c["jl"] = {"step":"account","accounts":[],"max_join":0}
+            c = get_conv(cid)
+            c["jl"] = {"step":"account","accounts":[],"max_join":0,
+                       "speed":"fast","auto_msg":""}
             return await jl_step_account(cid, c["jl"])
         if sub == "acc" and len(p) >= 3:
             aid = p[2]; sel = s.setdefault("accounts", [])
@@ -2710,7 +2855,7 @@ async def route_cb(cid, data):
             if ok: remove_channel_from_storage(aid, idx)
             return await panel(("✅ حذف شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
                                kb_([B("⬅️", f"chan:list:{aid}")]))
-        # ══ جدید: ارسال به کانال ══
+        # ارسال به کانال
         if sub == "send":
             aid, idx = p[2], int(p[3])
             a = get_account(aid); chans = (a or {}).get("channels",[])
@@ -2758,21 +2903,43 @@ async def route_cb(cid, data):
 
     if h == "jl":
         c = get_conv(cid)
-        s = c.get("jl") or {"step":"account","accounts":[],"max_join":0}
+        s = c.get("jl") or {"step":"account","accounts":[],"max_join":0,
+                            "speed":"fast","auto_msg":""}
         c["jl"] = s
         sub = p[1] if len(p) > 1 else ""
+
         if sub == "acc" and len(p) >= 3:
             aid = p[2]; sel = s.setdefault("accounts", [])
             if aid in sel: sel.remove(aid)
             else: sel.append(aid)
             return await jl_step_account(cid, s)
+
+        if sub == "speed" and len(p) >= 3:
+            s["speed"] = p[2]
+            return await jl_step_settings(cid, s)
+
+        if sub == "setauto":
+            get_conv(cid)["jl_wait"] = "auto_msg"
+            return await ask("✉️ متن پیامی که پس از جوین فرستاده بشه:")
+
+        if sub == "clrauto":
+            s["auto_msg"] = ""
+            return await jl_step_settings(cid, s)
+
         if sub == "next":
-            if s["step"] == "account": s["step"] = "max"; return await jl_step_max(cid, s)
-            elif s["step"] == "max": s["step"] = "confirm"; return await jl_step_confirm(cid, s)
+            if s["step"] == "account":
+                s["step"] = "settings"; return await jl_step_settings(cid, s)
+            elif s["step"] == "settings":
+                s["step"] = "max"; return await jl_step_max(cid, s)
+            elif s["step"] == "max":
+                s["step"] = "confirm"; return await jl_step_confirm(cid, s)
+
         if sub == "back":
-            if s["step"] == "max": s["step"] = "account"
+            if s["step"] == "settings": s["step"] = "account"
+            elif s["step"] == "max": s["step"] = "settings"
             elif s["step"] == "confirm": s["step"] = "max"
             return await show_jl_step(cid)
+
         if sub == "max" and len(p) >= 3:
             v = p[2]
             if v == "custom":
@@ -2781,14 +2948,30 @@ async def route_cb(cid, data):
             try: s["max_join"] = int(v)
             except: pass
             return await jl_step_max(cid, s)
-        if sub == "cancel": c.pop("jl", None); return await show_main()
+
+        if sub == "cancel":
+            c.pop("jl", None); return await show_main()
+
         if sub == "go":
-            op = {"id": "jl_" + secrets.token_hex(5), "created": int(time.time()),
-                  "type": "joinlef", "accounts": s.get("accounts") or [],
-                  "max_join": s.get("max_join",0) or 0, "status": "running",
-                  "progress": {"joined":0,"failed":0,"total":0,"phase":"شروع",
-                               "linkdoni_ok":[], "linkdoni_fail":[], "link_errors":[]},
-                  "errors": []}
+            speed_map = {"ultra": 0.3, "fast": 1.0, "normal": 3.0, "slow": 8.0}
+            spd = s.get("speed", "fast")
+            op = {
+                "id": "jl_" + secrets.token_hex(5),
+                "created": int(time.time()),
+                "type": "joinlef",
+                "accounts": s.get("accounts") or [],
+                "max_join": s.get("max_join", 0) or 0,
+                "status": "running",
+                "speed": spd,
+                "join_delay": speed_map.get(spd, 1.0),
+                "auto_msg": (s.get("auto_msg") or "").strip(),
+                "progress": {
+                    "joined":0, "failed":0, "total":0, "phase":"شروع",
+                    "extracted":0, "msg_sent":0, "msg_fail":0,
+                    "linkdoni_ok":[], "linkdoni_fail":[], "link_errors":[]
+                },
+                "errors": []
+            }
             _save_op(op); c.pop("jl", None)
             task = asyncio.create_task(run_joiner_lefter(op, log_cb))
             JL_JOBS[op["id"]] = task
@@ -2808,14 +2991,17 @@ async def route_cb(cid, data):
 
 def _jl_conv(cid):
     c = get_conv(cid)
-    if "jl" not in c: c["jl"] = {"step":"account","accounts":[],"max_join":0}
+    if "jl" not in c:
+        c["jl"] = {"step":"account","accounts":[],"max_join":0,
+                   "speed":"fast","auto_msg":""}
     return c["jl"]
 
 async def show_jl_step(cid):
     s = _jl_conv(cid)
-    if s["step"] == "account": return await jl_step_account(cid, s)
-    if s["step"] == "max":     return await jl_step_max(cid, s)
-    if s["step"] == "confirm": return await jl_step_confirm(cid, s)
+    if s["step"] == "account":  return await jl_step_account(cid, s)
+    if s["step"] == "settings": return await jl_step_settings(cid, s)
+    if s["step"] == "max":      return await jl_step_max(cid, s)
+    if s["step"] == "confirm":  return await jl_step_confirm(cid, s)
 
 async def jl_step_account(cid, s):
     accounts = list_accounts()
@@ -2830,7 +3016,32 @@ async def jl_step_account(cid, s):
                        f"jl:acc:{aid}")])
     rows.append([B("▶️ مرحله بعد", "jl:next")])
     rows.append([B("🏠 منو","menu:main")])
-    await panel(head("🤝","Joiner") + "کدوم اکانت(ها)؟", kb_(*rows))
+    await panel(head("🤝","Joiner فوق‌سریع") + "کدوم اکانت(ها)؟ (همه همزمان اجرا میشن)", kb_(*rows))
+
+async def jl_step_settings(cid, s):
+    speed = s.get("speed", "fast")
+    speed_label = next((label for k, label, _ in JL_SPEEDS if k == speed), "—")
+    auto = (s.get("auto_msg") or "").strip()
+    txt = head("⚙️", "تنظیمات Joiner فوق‌سریع")
+    txt += f"🚀 سرعت: <b>{speed_label}</b>\n"
+    txt += f"✉️ پیام پس از جوین: <b>{'🟢 فعال' if auto else '🔴 خاموش'}</b>\n"
+    if auto:
+        txt += f"\n💬 <code>{esc(auto[:300])}</code>\n"
+    txt += "\n<i>سرعت بالا = احتمال ریسک محدودیت بیشتر</i>"
+    rows = []
+    row = []
+    for k, label, _ in JL_SPEEDS:
+        row.append(B(("✅ " if speed == k else "") + label, f"jl:speed:{k}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([B("✏️ " + ("تغییر پیام" if auto else "پیام پس از جوین"), "jl:setauto")])
+    if auto:
+        rows.append([B("🗑 حذف پیام", "jl:clrauto")])
+    rows.append([B("▶️ ادامه", "jl:next")])
+    rows.append([B("⬅️ اکانت‌ها", "jl:back")])
+    rows.append([B("🏠 منو", "menu:main")])
+    await panel(txt, kb_(*rows))
 
 async def jl_step_max(cid, s):
     mx = s.get("max_join",0); rows = []
@@ -2842,7 +3053,7 @@ async def jl_step_max(cid, s):
     rows.append([B("✏️ عدد دلخواه", "jl:max:custom")])
     rows.append([B("▶️ مرحله بعد", "jl:next")])
     rows.append([B("⬅️", "jl:back")])
-    await panel(head("🤝","Joiner — حداکثر"), kb_(*rows))
+    await panel(head("🤝","Joiner — حداکثر هر اکانت"), kb_(*rows))
 
 async def jl_step_confirm(cid, s):
     accounts = list_accounts(); sel = s.get("accounts") or []
@@ -2850,10 +3061,20 @@ async def jl_step_confirm(cid, s):
     if not sel:
         s["step"] = "account"
         return await panel("⚠️ اکانت انتخاب نشده.", kb_([B("🏠 منو","menu:main")]))
-    txt = head("🤝","تایید Joiner")
-    txt += f"👤 {len(sel)} اکانت\n🔢 حداکثر: <b>{'بدون' if not s.get('max_join') else s['max_join']}</b>"
-    await panel(txt, kb_([B("✅ شروع", "jl:go")], [B("✏️ ویرایش", "jl:back")],
-                          [B("❌ لغو", "jl:cancel")]))
+    speed = s.get("speed", "fast")
+    speed_label = next((label for k, label, _ in JL_SPEEDS if k == speed), "—")
+    auto = (s.get("auto_msg") or "").strip()
+    txt = head("🤝", "تایید Joiner")
+    txt += f"👤 اکانت‌ها: <b>{len(sel)}</b> (همزمان)\n"
+    txt += f"🚀 سرعت: <b>{speed_label}</b>\n"
+    txt += f"🔢 حداکثر هر اکانت: <b>{'بدون' if not s.get('max_join') else s['max_join']}</b>\n"
+    txt += f"✉️ پیام پس از جوین: <b>{'🟢 فعال' if auto else '🔴 خاموش'}</b>\n"
+    if auto:
+        txt += f"\n💬 <code>{esc(auto[:300])}</code>"
+    await panel(txt, kb_(
+        [B("🚀 شروع فوق‌سریع", "jl:go")],
+        [B("✏️ ویرایش", "jl:back")],
+        [B("❌ لغو", "jl:cancel")]))
 
 
 async def op_start_now(op):
@@ -2926,12 +3147,19 @@ async def on_message(update, context):
             return
 
     if "jl_wait" in conv:
-        conv.pop("jl_wait")
+        wait_kind = conv.pop("jl_wait")
         jl = get_conv(cid).get("jl") or {}
-        try: jl["max_join"] = max(0, int(text))
-        except Exception: return await ask("🔢 نامعتبر. دوباره:")
-        get_conv(cid)["jl"] = jl
-        return await jl_step_max(cid, jl)
+        if wait_kind == "max":
+            try: jl["max_join"] = max(0, int(text))
+            except Exception:
+                get_conv(cid)["jl_wait"] = "max"
+                return await ask("🔢 نامعتبر. دوباره:")
+            get_conv(cid)["jl"] = jl
+            return await jl_step_max(cid, jl)
+        elif wait_kind == "auto_msg":
+            jl["auto_msg"] = text[:500]
+            get_conv(cid)["jl"] = jl
+            return await jl_step_settings(cid, jl)
 
     if "send_wait" in conv:
         conv.pop("send_wait")
@@ -3023,7 +3251,6 @@ async def on_message(update, context):
         return await panel(("✅ انجام شد" if ok else f"⚠️ {esc(str(info)[:200])}"),
                            kb_([B("⬅️", f"prof:menu:{aid}")]))
 
-    # ══ جدید: ارسال به کانال ══
     if "chan_send" in conv:
         cs = conv["chan_send"]
         STATE["panel"].pop(cid, None)
