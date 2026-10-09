@@ -31,7 +31,7 @@ try:
 except Exception:
     pass
 
-import json, time, secrets, asyncio, importlib.util, tempfile, threading, runpy, re
+import json, time, secrets, asyncio, importlib.util, tempfile, threading, runpy, re, shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -42,7 +42,23 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 HERE = Path(__file__).parent.resolve()
-LOG_FILE = HERE / "bot_runtime.log"
+
+def _panel_data_dir():
+    candidates = [
+        os.environ.get("DATA_DIR", "").strip(),
+        os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip(),
+    ]
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        candidates.extend(["/data", "/app/data"])
+
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return Path(candidate).resolve()
+
+    return HERE
+
+DATA_DIR = _panel_data_dir()
+LOG_FILE = DATA_DIR / "bot_runtime.log"
 log = logging.getLogger("web")   # دیگه چیزی چاپ نمی‌کنه
 
 PORT = int(os.environ.get("PORT", 8080))
@@ -57,7 +73,7 @@ def pyd_dict(obj, exclude_none=True):
 # ══════════════════════════════════════════════════════════════
 # ★ پیدا کردن فایل ربات — هم app.py هم rubika_tg_bot.py
 # ══════════════════════════════════════════════════════════════
-BOT_FILENAMES = ("app.py", "rubika_tg_bot.py")
+BOT_FILENAMES = ("rubika_tg_bot.py",)
 
 
 def _find_bot():
@@ -130,7 +146,25 @@ if not _TG_TOKEN or ":" not in _TG_TOKEN:
     sys.exit(1)
 TG = TGBot(token=_TG_TOKEN)
 
-SESS_FILE = "web_sessions.json"
+SESS_FILE = str(DATA_DIR / "web_sessions.json")
+
+# مهاجرت محافظه‌کارانه: فایل قدیمی حذف یا بازنویسی نمی‌شود.
+_legacy_sessions = Path(BOT_DIR) / "web_sessions.json"
+_current_sessions = Path(SESS_FILE)
+if (
+    not _current_sessions.exists()
+    and _legacy_sessions.is_file()
+    and _legacy_sessions.resolve() != _current_sessions.resolve()
+):
+    try:
+        shutil.copy2(_legacy_sessions, _current_sessions)
+    except Exception as _migration_error:
+        print(
+            f"[panel] session migration failed: "
+            f"{type(_migration_error).__name__}: {_migration_error}",
+            file=REAL_STDERR,
+            flush=True,
+        )
 LOGIN_CTX: Dict[int, Dict[str, Any]] = {}
 PENDING: Dict[int, Dict[str, Any]] = {}
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -214,6 +248,8 @@ def wlog(msg):
 try: bot.log_cb = wlog
 except: pass
 
+_bot_thread = None
+
 app = FastAPI(title="Rubika Web Panel")
 STATIC = next((c for c in [HERE/"static", HERE.parent/"static",
                             BOT_DIR/"webapp"/"static", BOT_DIR/"static"]
@@ -223,10 +259,18 @@ if STATIC.is_dir(): app.mount("/static", StaticFiles(directory=str(STATIC)), nam
 
 @app.on_event("startup")
 async def _startup():
-    global MAIN_LOOP
+    global MAIN_LOOP, _bot_thread
     MAIN_LOOP = asyncio.get_running_loop()
 
+    if _bot_thread is None or not _bot_thread.is_alive():
+        _bot_thread = threading.Thread(
+            target=_bot_worker,
+            daemon=True,
+            name="telegram-bot",
+        )
+        _bot_thread.start()
 
+    print("[panel] FastAPI started; bot thread launched.", flush=True)
 def _get_token(request: Request) -> Optional[str]:
     tok = request.cookies.get("session")
     if tok: return tok
@@ -2375,73 +2419,37 @@ def _web_worker():
 
 
 def _bot_worker():
-    """ربات رو توی thread جدا با loop اختصاصی اجرا می‌کنه.
-    همه‌ی خروجی ربات (print / logger / traceback) می‌ره تو فایل لاگ."""
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try: _loop_ref[0] = loop
-            except Exception: pass
-            if callable(getattr(bot, "main", None)):
-                bot.main()
-            else:
-                runpy.run_path(str(BOT_PATH), run_name="__main__")
-        except SystemExit:
-            _buf.write("[bot] SystemExit\n")
-        except BaseException as e:
-            _buf.write(f"[bot] {type(e).__name__}: {e}\n")
-            import traceback as _tb
-            _tb.print_exc(file=_buf)
+    """Run the bot in its own thread and expose errors in Railway logs."""
+    print("[bot] Worker starting.", flush=True)
+
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"\n===== bot exit @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            f.write(_buf.getvalue())
-    except Exception:
-        pass
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            _loop_ref[0] = loop
+        except Exception:
+            pass
+
+        if callable(getattr(bot, "main", None)):
+            bot.main()
+        else:
+            runpy.run_path(str(BOT_PATH), run_name="__main__")
+
+    except SystemExit as e:
+        print(f"[bot] SystemExit: {e}", file=REAL_STDERR, flush=True)
+    except BaseException as e:
+        import traceback
+        print(
+            f"[bot] CRASH: {type(e).__name__}: {e}",
+            file=REAL_STDERR,
+            flush=True,
+        )
+        traceback.print_exc(file=REAL_STDERR)
+    finally:
+        print("[bot] Worker stopped.", flush=True)
 
 
 if __name__ == "__main__":
-    # ─── بنر ───
-    print("=" * 56, file=REAL_STDOUT, flush=True)
-    print("   🌐  Rubika Web Panel   +   🤖  Telegram Bot", file=REAL_STDOUT, flush=True)
-    print(f"   فایل ربات: {BOT_PATH}", file=REAL_STDOUT, flush=True)
-    print("=" * 56, file=REAL_STDOUT, flush=True)
-
-    # ─── ۱) پنل وب ───
-    tp = threading.Thread(target=_web_worker, daemon=True, name="panel")
-    tp.start()
-    time.sleep(2.0)
-    panel_ok = tp.is_alive()
-    print(f"   پنل وب     : {'🟢 UP  ' if panel_ok else '🔴 DOWN'}   0.0.0.0:{PORT}",
-          file=REAL_STDOUT, flush=True)
-
-    # ─── ۲) ربات تلگرام ───
-    tb = threading.Thread(target=_bot_worker, daemon=True, name="bot")
-    tb.start()
-    time.sleep(3.0)
-    bot_ok = tb.is_alive()
-    print(f"   ربات تلگرام: {'🟢 UP  ' if bot_ok else '🔴 DOWN'}   polling",
-          file=REAL_STDOUT, flush=True)
-
-    print("-" * 56, file=REAL_STDOUT, flush=True)
-    if panel_ok and bot_ok:
-        print("   ✅  هر دو سرویس در حال اجرا هستن", file=REAL_STDOUT, flush=True)
-    else:
-        print("   ⚠️  یکی از سرویس‌ها بالا نیومد — bot_runtime.log رو چک کن",
-              file=REAL_STDOUT, flush=True)
-    print("-" * 56, file=REAL_STDOUT, flush=True)
-
-    # main thread زنده بمونه
-    try:
-        while True:
-            time.sleep(60)
-            # چک سلامت دوره‌ای (فقط اگه یکی مرد)
-            if not tp.is_alive() or not tb.is_alive():
-                print(f"   ⚠️ healthcheck: panel={'🟢' if tp.is_alive() else '🔴'} "
-                      f"bot={'🟢' if tb.is_alive() else '🔴'}",
-                      file=REAL_STDOUT, flush=True)
-                break
-    except KeyboardInterrupt:
-        print("\n[main] خاموش شد.", file=REAL_STDOUT, flush=True)
+    print("[panel] Starting Uvicorn; FastAPI startup will launch the bot.", flush=True)
+    _web_worker()
