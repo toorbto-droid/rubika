@@ -1,7 +1,7 @@
-"""Rubika Web Panel + Telegram Bot — v15 (Railway-ready, forced owner, compat-shims, error-logger)"""
+"""Rubika Web Panel + Telegram Bot — v16 (Railway, forced owner, compat-shims, debug)"""
 
 # ══════════════════════════════════════════════════════════════
-# ۰) قبل از هر کاری، stdout/stderr واقعی رو قاپ بزن
+# ۰) stdout/stderr واقعی
 # ══════════════════════════════════════════════════════════════
 import sys, os, io, contextlib, logging
 
@@ -164,11 +164,10 @@ except Exception:
 
 
 # ══════════════════════════════════════════════════════════════
-# ۵) Compatibility shims — توابعی که app.py لازم داره ولی ربات نداره
+# ۵) Compatibility shims
 # ══════════════════════════════════════════════════════════════
 import builtins as _bi
 
-# ─── update_account_field ───
 if not hasattr(bot, "update_account_field"):
     def _shim_update_account_field(aid, key, value):
         accounts = bot.list_accounts()
@@ -177,13 +176,11 @@ if not hasattr(bot, "update_account_field"):
             bot.save_accounts(accounts)
     bot.update_account_field = _shim_update_account_field
 
-# ─── send_text → send_text_only ───
 if not hasattr(bot, "send_text"):
     async def _shim_send_text(cli, target, text):
         return await bot.send_text_only(cli, target, text)
     bot.send_text = _shim_send_text
 
-# ─── rubika_get_my_profile ───
 if not hasattr(bot, "rubika_get_my_profile"):
     async def _shim_rubika_get_my_profile(cli):
         out = {"first_name": "", "last_name": "", "bio": "",
@@ -199,7 +196,6 @@ if not hasattr(bot, "rubika_get_my_profile"):
         return out
     bot.rubika_get_my_profile = _shim_rubika_get_my_profile
 
-# ─── get_live_channels ───
 if not hasattr(bot, "get_live_channels"):
     async def _shim_get_live_channels(cli):
         try:
@@ -209,7 +205,6 @@ if not hasattr(bot, "get_live_channels"):
             return []
     bot.get_live_channels = _shim_get_live_channels
 
-# ─── joiner (legacy) ───
 if not hasattr(bot, "joiner"):
     async def _shim_joiner(cli, channels, max_count, log_cb):
         joined = 0
@@ -227,7 +222,6 @@ if not hasattr(bot, "joiner"):
         return joined
     bot.joiner = _shim_joiner
 
-# ─── rubika_send_code + rubika_complete_login ───
 _LOGIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -242,7 +236,6 @@ async def _shim_rubika_send_code(phone: str):
     cli = _CC(name=sess)
 
     res = None
-    used = None
     for meth in ("send_code", "sendCode", "send_login_code"):
         fn = getattr(cli, meth, None)
         if not fn: continue
@@ -251,7 +244,7 @@ async def _shim_rubika_send_code(phone: str):
             try:
                 r = fn(**kwargs)
                 if asyncio.iscoroutine(r): r = await r
-                res = r; used = meth; break
+                res = r; break
             except TypeError:
                 continue
             except Exception:
@@ -262,11 +255,9 @@ async def _shim_rubika_send_code(phone: str):
 
     if res is None:
         _LOGIN_SESSIONS[phone] = {"aid": aid, "sess": sess, "cli": cli, "mode": "start"}
-        return {
-            "client": cli, "phone": phone, "status": "SendCode",
-            "phone_code_hash": None, "hint": None,
-            "_aid": aid, "_mode": "start",
-        }
+        return {"client": cli, "phone": phone, "status": "SendCode",
+                "phone_code_hash": None, "hint": None,
+                "_aid": aid, "_mode": "start"}
 
     def _get(o, *keys, d=None):
         for k in keys:
@@ -284,11 +275,9 @@ async def _shim_rubika_send_code(phone: str):
         "phone_code_hash": phone_code_hash, "mode": "direct",
     }
 
-    return {
-        "client": cli, "phone": phone, "status": status,
-        "phone_code_hash": phone_code_hash, "hint": hint,
-        "_aid": aid, "_mode": "direct",
-    }
+    return {"client": cli, "phone": phone, "status": status,
+            "phone_code_hash": phone_code_hash, "hint": hint,
+            "_aid": aid, "_mode": "direct"}
 
 
 async def _shim_rubika_complete_login(ctx: Dict[str, Any], code: str):
@@ -358,11 +347,9 @@ async def _shim_rubika_complete_login(ctx: Dict[str, Any], code: str):
         guid = None
 
     accounts = bot.list_accounts()
-    accounts[aid] = {
-        "phone": phone, "name": name, "user_guid": guid,
-        "session_name": sess, "created": int(time.time()),
-        "channels": [],
-    }
+    accounts[aid] = {"phone": phone, "name": name, "user_guid": guid,
+                     "session_name": sess, "created": int(time.time()),
+                     "channels": []}
     bot.save_accounts(accounts)
 
     return {"ok": True, "aid": aid, "name": name, "status": "OK"}
@@ -377,7 +364,7 @@ log_print("[shim] compatibility layer installed")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۶) Telegram Bot client (فقط برای ارسال کد ورود پنل)
+# ۶) Telegram Bot
 # ══════════════════════════════════════════════════════════════
 from telegram import Bot as TGBot
 
@@ -437,9 +424,8 @@ if (not _current_sessions.exists()
         and _legacy_sessions.resolve() != _current_sessions.resolve()):
     try:
         shutil.copy2(_legacy_sessions, _current_sessions)
-    except Exception as _migration_error:
-        log_print(f"[panel] session migration failed: "
-                  f"{type(_migration_error).__name__}: {_migration_error}")
+    except Exception as _e:
+        log_print(f"[panel] session migration failed: {type(_e).__name__}: {_e}")
 
 LOGIN_CTX: Dict[int, Dict[str, Any]] = {}
 PENDING: Dict[int, Dict[str, Any]] = {}
@@ -639,9 +625,6 @@ if STATIC.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
-# ══════════════════════════════════════════════════════════════
-# ★ Global 500 handler — خطا رو با traceback کامل لاگ می‌کنه
-# ══════════════════════════════════════════════════════════════
 import traceback as _tb_global
 
 @app.exception_handler(Exception)
@@ -657,14 +640,11 @@ async def _unhandled_handler(request: Request, exc: Exception):
             f.write(tb)
     except Exception:
         pass
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": type(exc).__name__,
-            "message": str(exc)[:500],
-            "path": str(request.url.path),
-        },
-    )
+    return JSONResponse(status_code=500, content={
+        "error": type(exc).__name__,
+        "message": str(exc)[:500],
+        "path": str(request.url.path),
+    })
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1270,6 +1250,7 @@ async def api_chat_msgs(aid: str, guid: str, limit: int = 30,
                         before_id: Optional[str] = None,
                         around: Optional[str] = None,
                         uid: int = Depends(get_uid)):
+    import traceback as _tb
     cli = await get_client(aid)
     my = _MY_GUID.get(aid) or await get_my_guid(aid)
     limit = max(1, min(int(limit), 100))
@@ -1282,62 +1263,143 @@ async def api_chat_msgs(aid: str, guid: str, limit: int = 30,
                     return {"messages": msgs, "has_more": False, "around": True}
             except Exception as e:
                 if _is_dead_session_error(e): invalidate_client(aid)
+                log_print(f"[msgs] around failed: {type(e).__name__}: {e}")
+                log_print(_tb.format_exc())
             try:
                 msgs = await bot.fetch_messages(cli, guid, limit, my)
                 _attach_reply_previews(msgs)
                 return {"messages": msgs, "has_more": True, "around_failed": True}
             except Exception as e2:
                 if _is_dead_session_error(e2): invalidate_client(aid)
-                raise HTTPException(500, bot._fmt_error(e2))
+                log_print(f"[msgs] around-fallback failed: {type(e2).__name__}: {e2}")
+                log_print(_tb.format_exc())
+                raise HTTPException(500, f"{type(e2).__name__}: {str(e2)[:300]}")
         if before_id:
-            try: msgs = await _fetch_before(cli, guid, str(before_id), limit, my)
+            try:
+                msgs = await _fetch_before(cli, guid, str(before_id), limit, my)
             except Exception as e:
                 if _is_dead_session_error(e): invalidate_client(aid)
-                raise HTTPException(500, bot._fmt_error(e))
+                log_print(f"[msgs] before_id failed aid={aid} guid={guid} before={before_id}")
+                log_print(f"[msgs] {type(e).__name__}: {e}")
+                log_print(_tb.format_exc())
+                raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
         else:
-            try: msgs = await bot.fetch_messages(cli, guid, limit, my)
+            try:
+                msgs = await bot.fetch_messages(cli, guid, limit, my)
             except Exception as e:
                 if _is_dead_session_error(e): invalidate_client(aid)
-                raise HTTPException(500, bot._fmt_error(e))
+                log_print(f"[msgs] fetch failed aid={aid} guid={guid} limit={limit}")
+                log_print(f"[msgs] {type(e).__name__}: {e}")
+                log_print(_tb.format_exc())
+                raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
         has_more = len(msgs) >= limit
         _attach_reply_previews(msgs)
         return {"messages": msgs, "has_more": has_more}
     except HTTPException: raise
     except Exception as e:
         if _is_dead_session_error(e): invalidate_client(aid)
-        raise HTTPException(500, bot._fmt_error(e))
+        log_print(f"[msgs] outer failed: {type(e).__name__}: {e}")
+        log_print(_tb.format_exc())
+        raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
 
 
-@app.get("/api/accounts/{aid}/search")
-async def api_search(aid: str, q: str = Query(""), limit: int = 60,
-                     uid: int = Depends(get_uid)):
-    q = q.strip()
-    if not q: return {"results": []}
-    cli = await get_client(aid)
-    my = _MY_GUID.get(aid) or await get_my_guid(aid)
-    try: raw = await bot.get_all_chats_raw(cli)
+# ══════════════════════════════════════════════════════════════
+# ★ DEBUG endpoint — دقیقاً می‌گه کجا می‌شکنه
+# ══════════════════════════════════════════════════════════════
+@app.get("/api/debug/messages/{aid}/{guid}")
+async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
+    import traceback as _tb
+    import inspect as _ins
+    steps = []
+
+    # مرحله ۱: get_client
+    try:
+        cli = await get_client(aid)
+        steps.append({"step": "get_client", "ok": True})
+    except HTTPException as e:
+        return {"failed_at": "get_client", "code": e.status_code,
+                "detail": str(e.detail), "steps": steps}
     except Exception as e:
-        if _is_dead_session_error(e): invalidate_client(aid)
-        raise HTTPException(500, bot._fmt_error(e))
-    sem = asyncio.Semaphore(8); q_low = q.lower(); results = []
+        return {"failed_at": "get_client", "code": 500,
+                "detail": f"{type(e).__name__}: {e}",
+                "traceback": _tb.format_exc()[:2000],
+                "steps": steps}
 
-    async def search(c):
-        async with sem:
-            try:
-                msgs = await bot.fetch_messages(cli, c["guid"], 50, my)
-                for m in msgs:
-                    if q_low in (m.get("text") or "").lower():
-                        results.append({"chat": {"guid": c["guid"], "type": c["type"],
-                                                "title": c["title"] or c["guid"][:20],
-                                                "username": c.get("username") or ""},
-                                        "message": m})
-                        if len(results) >= limit * 2: return
-            except Exception:
-                pass
+    # مرحله ۲: get_me
+    my = None
+    try:
+        me = await cli.get_me()
+        my = me.user.user_guid
+        steps.append({"step": "get_me", "ok": True, "my_guid": my})
+    except Exception as e:
+        steps.append({"step": "get_me", "ok": False,
+                      "error": f"{type(e).__name__}: {str(e)[:300]}"})
 
-    await asyncio.gather(*[search(c) for c in raw])
-    results.sort(key=lambda x: int(x["message"].get("time") or 0), reverse=True)
-    return {"results": results[:limit]}
+    # مرحله ۳: بررسی get_messages
+    has_gm = hasattr(cli, "get_messages") and callable(getattr(cli, "get_messages", None))
+    steps.append({"step": "has_get_messages", "ok": has_gm})
+
+    if not has_gm:
+        candidates = [a for a in dir(cli)
+                      if not a.startswith("_") and "message" in a.lower()]
+        return {"failed_at": "no_get_messages", "code": 500,
+                "detail": "متد get_messages روی rubpy پیدا نشد",
+                "available_methods_with_message": candidates[:50],
+                "steps": steps}
+
+    fn = getattr(cli, "get_messages")
+    try:
+        sig = str(_ins.signature(fn))
+        steps.append({"step": "get_messages_signature", "ok": True, "signature": sig})
+    except Exception as e:
+        steps.append({"step": "get_messages_signature", "ok": False,
+                      "error": str(e)[:200]})
+
+    # مرحله ۴: امتحان ترکیب‌های مختلف
+    combos = [
+        {"desc": "positional (guid, '0', '30', 'FromMax')",
+         "call": lambda: fn(guid, "0", "30", "FromMax")},
+        {"desc": "positional (guid, 0, 30, 'FromMax')",
+         "call": lambda: fn(guid, 0, 30, "FromMax")},
+        {"desc": "kwargs (object_guid, message_id, sort)",
+         "call": lambda: fn(object_guid=guid, message_id="0", sort="FromMax")},
+        {"desc": "kwargs (object_guid, from_max_id)",
+         "call": lambda: fn(object_guid=guid, from_max_id="0")},
+        {"desc": "kwargs (chat_id, message_id, sort)",
+         "call": lambda: fn(chat_id=guid, message_id="0", sort="FromMax")},
+    ]
+
+    combo_results = []
+    for c in combos:
+        try:
+            r = c["call"]()
+            if asyncio.iscoroutine(r): r = await r
+            combo_results.append({"try": c["desc"], "ok": True,
+                                   "type": type(r).__name__,
+                                   "sample_keys": list(r.keys())[:10] if isinstance(r, dict) else None,
+                                   "sample_str": str(r)[:200]})
+            break
+        except TypeError as e:
+            combo_results.append({"try": c["desc"], "ok": False,
+                                   "error": f"TypeError: {str(e)[:200]}"})
+        except Exception as e:
+            combo_results.append({"try": c["desc"], "ok": False,
+                                   "error": f"{type(e).__name__}: {str(e)[:200]}"})
+
+    steps.append({"step": "try_get_messages_combos", "results": combo_results})
+
+    # مرحله ۵: fetch_messages خودمان
+    try:
+        msgs = await bot.fetch_messages(cli, guid, 30, my)
+        steps.append({"step": "fetch_messages", "ok": True,
+                      "count": len(msgs) if msgs else 0,
+                      "first": (msgs[0] if msgs else None)})
+    except Exception as e:
+        steps.append({"step": "fetch_messages", "ok": False,
+                      "error": f"{type(e).__name__}: {str(e)[:300]}",
+                      "traceback": _tb.format_exc()[:1500]})
+
+    return {"ok": True, "steps": steps}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2837,7 +2899,7 @@ async def api_health():
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۹) Local execution
+# ۲۹) Local
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
