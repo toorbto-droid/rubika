@@ -1,22 +1,37 @@
-# app.py — v71 (native-rp-session + no-relogin + keepalive + joiner + channel-send)
+# rubika_tg_bot.py — v72 (Railway-ready · forced owner · native-rp-session · keepalive · joiner · channel-send)
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect
 import html as _html
 import builtins
 
-VERSION = "v71"
+VERSION = "v72"
+
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
     if env and os.path.isdir(env) and os.access(env, os.W_OK): return env
+    rv = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if rv and os.path.isdir(rv) and os.access(rv, os.W_OK): return rv
     if os.environ.get("RAILWAY_ENVIRONMENT"):
         for c in ["/data", "/app/data"]:
             if os.path.isdir(c) and os.access(c, os.W_OK): return c
     return os.path.dirname(os.path.abspath(__file__))
 
+
 DATA_DIR = _detect_data_dir()
 print(f"[+] VERSION: {VERSION}")
 print(f"[+] DATA_DIR: {DATA_DIR}")
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ OWNER ثابت — از env یا مقدار پیش‌فرض
+# ══════════════════════════════════════════════════════════════
+try:
+    FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "8389746549"))
+except Exception:
+    FORCED_OWNER = 8389746549
+print(f"[+] OWNER: {FORCED_OWNER}")
+
 
 try:
     import asyncio.unix_events as _ue
@@ -105,16 +120,9 @@ def _get_account_lock(aid):
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ SafeClient — باریک، فقط lock + no-prompt.
-#   auth و session توسط rubpy در فایل {name}.rp مدیریت میشه.
+# ★ SafeClient — قفل per-account + جلوگیری از input()
 # ══════════════════════════════════════════════════════════════
 class SafeClient(_C):
-    """rubpy Client با قفل per-account + جلوگیری از بلاک شدن روی input().
-
-    فایل session ({name}.rp) هرگز حذف نمیشه — rubpy خودش پس از هر
-    اتصال، auth چرخیده رو داخلش می‌نویسه و بار بعد از همون می‌خونه.
-    """
-
     def __init__(self, *args, **kwargs):
         self._aid = kwargs.pop("_aid", None)
         self._lock = _get_account_lock(self._aid) if self._aid else None
@@ -137,20 +145,14 @@ class SafeClient(_C):
             raise
 
     async def start(self, phone_number=None):
-        # rubpy خودش از فایل {name}.rp می‌خونه. اگر فایل نبود یا auth باطل
-        # بود، rubpy از input() استفاده می‌کنه — ما اون رو بلاک می‌کنیم تا
-        # نخوایم روی سرور بی‌کار بایسته.
         def _no_prompt(prompt=""):
             raise RuntimeError("NO_SESSION: session file missing or expired")
-
         old_input = builtins.input
         builtins.input = _no_prompt
         try:
             await super().start(phone_number=phone_number)
         finally:
             builtins.input = old_input
-
-        # تأیید سلامت اتصال
         try:
             me = await self.get_me()
             self.guid = me.user.user_guid
@@ -361,7 +363,7 @@ RATE_LIMIT_WAIT = 20 * 60
 ANCHORS = {}
 JL_JOBS = {}
 
-KEEPALIVE_SECONDS = 15 * 60   # ★ ۱۵ دقیقه — پینگ سبک برای زنده نگه‌داشتن سشن
+KEEPALIVE_SECONDS = 15 * 60
 
 JOINER_CONFIG = {
     "extract_max_rounds": 20, "join_per_batch": 100, "batch_pause": 2,
@@ -394,7 +396,7 @@ DEFAULT_CFG = {
 TG_TOKEN = os.environ.get("TG_TOKEN","").strip()
 
 # ══════════════════════════════════════════════════════════════
-# LISTENER (بدون code capture — فقط forward)
+# LISTENER
 # ══════════════════════════════════════════════════════════════
 LISTENER_SEEN = {}
 LISTENER_SEEN_LOCK = threading.Lock()
@@ -499,7 +501,6 @@ async def _listener_check(bot, aid, my_guid, nm):
 
 
 async def pv_listener(aid, acc, stop_event):
-    """لیسنر — چک و رها. هر N ثانیه قفل رو می‌گیره، چک می‌کنه، آزاد می‌کنه."""
     nm = acc.get("name") or acc.get("phone") or aid
     sess = acc.get("session_name") or os.path.join(SESSIONS_DIR, aid)
     print(f"[listener] {nm}: task started")
@@ -514,7 +515,6 @@ async def pv_listener(aid, acc, stop_event):
                     try: await _listener_seed(bot, aid, my_guid, nm)
                     except Exception as e: print(f"[listener-seed-err] {nm}: {e}")
                     seeded_once = True
-                # چند چک سریع با فاصله‌ی کوتاه، بعد آزاد کن و برو استراحت
                 for _ in range(12):
                     if stop_event.is_set(): break
                     if not _listener_cfg_enabled():
@@ -537,7 +537,6 @@ async def pv_listener(aid, acc, stop_event):
         except Exception as e:
             print(f"[listener-conn-err] {nm}: {type(e).__name__}")
             await asyncio.sleep(20)
-        # استراحت بین چرخه‌ها تا worker بتونه از قفل استفاده کنه
         await asyncio.sleep(30)
 
 
@@ -602,16 +601,11 @@ async def toggle_service_only_cfg():
 
 
 # ══════════════════════════════════════════════════════════════
-# KEEPALIVE LOOP — ★ قلب ماندگاری سشن
+# KEEPALIVE
 # ══════════════════════════════════════════════════════════════
 async def keepalive_loop():
-    """
-    هر ۱۵ دقیقه یک ping سبک به هر اکانت. این تنها کاری‌ست که سشن روبیکا
-    رو زنده نگه می‌داره — بدون این، سرور بعد از ۳۰-۶۰ دقیقه سشن رو
-    invalidate می‌کنه.
-    """
     print(f"[keepalive] started (interval={KEEPALIVE_SECONDS}s)")
-    await asyncio.sleep(60)  # بذار listenerها اول خودشون وصل بشن
+    await asyncio.sleep(60)
     while True:
         try:
             accounts = list_accounts()
@@ -758,7 +752,6 @@ def get_account(aid): return list_accounts().get(aid)
 
 def remove_account(aid, keep_session=False):
     accounts = list_accounts(); a = accounts.pop(aid, None); save_accounts(accounts)
-    # ★ حذف فایل .rp هم
     if a:
         sess = a.get("session_name") or os.path.join(SESSIONS_DIR, aid)
         for f in glob.glob(sess + "*"):
@@ -799,15 +792,9 @@ def update_channel_field(aid, idx, key, value):
 
 
 # ══════════════════════════════════════════════════════════════
-# LOGIN — ★ کاملاً از rubpy's native start(phone_number=) استفاده می‌کنه
+# LOGIN — از rubpy's native start(phone_number=)
 # ══════════════════════════════════════════════════════════════
 async def interactive_login_via_rubpy(admin_id, phone):
-    """
-    rubpy خودش phone → code → 2FA رو با input() مدیریت می‌کنه.
-    ما input() رو patch می‌کنیم تا promptها به تلگرام رله بشن.
-    نتیجه: فایل sessions/{aid}.rp ساخته میشه و از اون به بعد rubpy
-    همیشه از همین فایل auth رو می‌خونه.
-    """
     loop = asyncio.get_running_loop()
     q = queue.Queue()
     pending[admin_id] = {"step": "login", "q": q}
@@ -818,7 +805,6 @@ async def interactive_login_via_rubpy(admin_id, phone):
             bale_send(admin_id, f"📨 {msg}"), loop)
         return q.get(timeout=300)
 
-    # ساخت aid جدید و session path
     aid = "acc_" + secrets.token_hex(4)
     sess_path = os.path.join(SESSIONS_DIR, aid)
 
@@ -843,9 +829,7 @@ async def interactive_login_via_rubpy(admin_id, phone):
             u = getattr(me, "user", me)
             name = getattr(u, "first_name", None) or phone
             guid = getattr(u, "user_guid", None) or getattr(u, "guid", None)
-            # ثبت اکانت — session_name قطعی
             add_account(aid, phone, name, guid)
-            # اسپاون listener
             _spawn_listener_for(aid)
             await bale_send(admin_id,
                             f"✅ وارد شد: {name}\n🆔 <code>{aid}</code>\n"
@@ -853,7 +837,6 @@ async def interactive_login_via_rubpy(admin_id, phone):
                             main_kb())
         except Exception as e:
             log.exception("login failed")
-            # پاک‌سازی فایل نیم‌کاره
             for f in glob.glob(sess_path + "*"):
                 try: os.remove(f)
                 except Exception: pass
@@ -865,7 +848,7 @@ async def interactive_login_via_rubpy(admin_id, phone):
 
 
 # ══════════════════════════════════════════════════════════════
-# Profile / Channels — دست‌نخورده
+# Profile / Channels
 # ══════════════════════════════════════════════════════════════
 async def rubika_set_name(bot, first_name, last_name=None):
     variants = [dict(first_name=first_name, last_name=last_name or ""), dict(first_name=first_name)]
@@ -1806,7 +1789,7 @@ async def run_joiner_lefter(op, log):
 
 
 # ══════════════════════════════════════════════════════════════
-# Bale bot wrapper (فقط برای login relay + notify)
+# Bale bot wrapper (login relay only)
 # ══════════════════════════════════════════════════════════════
 import aiohttp
 BALE_TOKEN = os.environ.get("BALE_TOKEN", "").strip()
@@ -1848,7 +1831,7 @@ STATE = {"owner": None, "cancel": None, "job": None, "conv": {}, "panel": {},
 APP = None
 _last_log = [0.0]
 _loop_ref = [None]
-pending = {}   # ★ برای login relay
+pending = {}
 
 
 def esc(s): return _html.escape(str(s if s is not None else ""))
@@ -1859,20 +1842,25 @@ def B(l, d): return InlineKeyboardButton(l, callback_data=d)
 def kb_(*rows): return InlineKeyboardMarkup([list(r) for r in rows if r])
 def head(icon, t): return f"<b>{icon} {esc(t)}</b>\n{HR}\n"
 
-_FORCED_OWNER = 8389746549
 
+# ══════════════════════════════════════════════════════════════
+# ★ OWNER — همیشه FORCED_OWNER
+# ══════════════════════════════════════════════════════════════
 def authorized(update):
     try:
-        return update.effective_chat.id == _FORCED_OWNER
+        return update.effective_chat.id == FORCED_OWNER
     except Exception:
         return False
 
+
 def load_owner():
-    return _FORCED_OWNER
+    """همیشه FORCED_OWNER — فایل نادیده گرفته می‌شه."""
+    return FORCED_OWNER
+
 
 def save_owner(cid):
-    _save(OWNER_FILE, {"owner": _FORCED_OWNER})
-
+    """ذخیره می‌کنه ولی موقع خوندن نادیده گرفته می‌شه."""
+    _save(OWNER_FILE, {"owner": FORCED_OWNER})
 
 
 async def tg_send(text, markup=None, parse_mode=None):
@@ -1936,7 +1924,7 @@ def clear_conv(cid): STATE["conv"].pop(cid, None)
 
 
 # ══════════════════════════════════════════════════════════════
-# UI — Main / Accounts
+# UI
 # ══════════════════════════════════════════════════════════════
 def main_kb():
     rows = [[{"text": f"📱 {p}", "callback_data": f"acc:{p}"}] for p in list_accounts().keys()]
@@ -1965,6 +1953,7 @@ async def show_main():
     if running_ops: txt += f"🟢 در حال اجرا: <b>{len(running_ops)}</b>\n"
     txt += f"👂 لیسنر فعال: <b>{listening}</b>\n"
     txt += f"🔄 Keepalive: هر <b>{KEEPALIVE_SECONDS//60} دقیقه</b>\n"
+    txt += f"👤 مالک: <code>{FORCED_OWNER}</code>\n"
     txt += f"\n💾 DATA_DIR: <code>{esc(DATA_DIR)}</code>\n"
     await panel(txt, kb_(
         [B("📤 ارسال", "send:start")],
@@ -2041,9 +2030,6 @@ async def show_account_detail(aid):
         [B("⬅️ اکانت‌ها", "menu:acc"), B("🏠 منو", "menu:main")]))
 
 
-# ══════════════════════════════════════════════════════════════
-# UI — Profile / Channels (unchanged from v70tg)
-# ══════════════════════════════════════════════════════════════
 async def show_profile_menu(aid):
     a = get_account(aid)
     if not a: return await panel("⚠️ پیدا نشد.", kb_([B("🏠 منو", "menu:main")]))
@@ -2096,7 +2082,7 @@ async def show_channel_view(aid, idx):
 
 
 # ══════════════════════════════════════════════════════════════
-# Send flow / Stats / Errors / Op detail / Cfg / Help (unchanged)
+# Send flow / Stats / Errors
 # ══════════════════════════════════════════════════════════════
 SCHEDULE_OPTIONS = [("0", "⚡️ آنی", 0), ("1h", "۱ ساعت بعد", 3600),
                     ("3h", "۳ ساعت بعد", 3*3600), ("12h", "۱۲ ساعت بعد", 12*3600),
@@ -2372,6 +2358,7 @@ async def show_cfg():
     txt += f"🔍 فقط سرویس: <b>{'🟢' if sv else '🔴'}</b>\n"
     rows.append([B("👂 لیسنر", "cfg:toggle_listener"), B("🔍 فقط سرویس", "cfg:toggle_service_only")])
     txt += f"\n🔖 نسخه: <b>{VERSION}</b>"
+    txt += f"\n👤 مالک: <code>{FORCED_OWNER}</code>"
     txt += f"\n🔄 Keepalive: <b>{KEEPALIVE_SECONDS//60} دقیقه</b>"
     rows.append([B("🏠 منو","menu:main")])
     await panel(txt, kb_(*rows))
@@ -2394,6 +2381,7 @@ async def show_help():
            "🤝 Joiner — جوین همزمان + پیام خودکار\n"
            "👂 لیسنر — پیام‌های سرویس\n"
            f"🔄 Keepalive — هر {KEEPALIVE_SECONDS//60} دقیقه ping\n\n"
+           f"👤 مالک ثابت: <code>{FORCED_OWNER}</code>\n\n"
            "📊 آمار — جزئیات زنده\n"
            "⚠️ خطاها — ۱۰۰ خطای اخیر\n\n"
            "🔑 <b>سشن ماندگار</b>:\n"
@@ -2407,16 +2395,17 @@ async def show_help():
 # ══════════════════════════════════════════════════════════════
 async def cmd_start(update, context):
     cid = update.effective_chat.id
-    if cid != _FORCED_OWNER:
-        if update.effective_message:
-            await update.effective_message.reply_text("⛔ این ربات خصوصی است.")
+    # ★ مالک همیشه ثابت — غریبه رد می‌شه
+    if cid != FORCED_OWNER:
+        try:
+            await update.message.reply_text("⛔ این ربات خصوصی است.")
+        except Exception: pass
         return
-
-    STATE["owner"] = _FORCED_OWNER
+    STATE["owner"] = FORCED_OWNER
+    try:
+        _save(OWNER_FILE, {"owner": FORCED_OWNER})
+    except Exception: pass
     STATE["panel"].pop(cid, None)
-    await update.effective_message.reply_text(
-        f"🔒 خوش آمدی مالک.\n🔖 {VERSION}\n💾 {DATA_DIR}"
-    )
     await show_main()
 
 async def cmd_menu(update, context):
@@ -2428,7 +2417,7 @@ async def cmd_menu(update, context):
 async def cmd_version(update, context):
     if not authorized(update): return
     accounts = list_accounts()
-    txt = f"🔖 <b>{VERSION}</b>\n💾 <code>{DATA_DIR}</code>\n📱 {len(accounts)}"
+    txt = f"🔖 <b>{VERSION}</b>\n💾 <code>{DATA_DIR}</code>\n📱 {len(accounts)}\n👤 مالک: <code>{FORCED_OWNER}</code>"
     await update.message.reply_text(txt, parse_mode="HTML")
 
 async def cmd_keepalive(update, context):
@@ -2446,7 +2435,7 @@ async def cmd_keepalive(update, context):
 
 
 # ══════════════════════════════════════════════════════════════
-# on_message (interactive login relay only — no /code /pass)
+# on_message
 # ══════════════════════════════════════════════════════════════
 async def on_message(update, context):
     if not authorized(update): return
@@ -2456,7 +2445,6 @@ async def on_message(update, context):
     conv = STATE["conv"].get(cid) or {}
     text = (msg.text or "").strip()
 
-    # ★ رله پاسخ‌های مرحله لاگین rubpy
     if "acc" in conv and conv["acc"].get("step") == "login_pending":
         q = pending.get(cid, {}).get("q")
         if q:
@@ -2507,7 +2495,6 @@ async def on_message(update, context):
             if not ph.isdigit() or len(ph) < 10: return await ask("📞 نامعتبر:")
             await panel("⏳ در حال لاگین...\nکد رو که روبیکا فرستاد، همینجا بفرست.")
             a["step"] = "login_pending"
-            # ★ شروع لاگین interactive rubpy
             asyncio.create_task(interactive_login_via_rubpy(cid, ph))
             return
 
@@ -2651,7 +2638,7 @@ CHAN_PROMPT = {"title":"✏️ اسم جدید:","desc":"📖 توضیح جدی�
 
 
 # ══════════════════════════════════════════════════════════════
-# Callback router (adapted — no relogin, no refresh-all)
+# Callback router
 # ══════════════════════════════════════════════════════════════
 async def on_callback(update, context):
     q = update.callback_query
@@ -3144,13 +3131,17 @@ def main():
     global APP
     if not TG_TOKEN:
         print("[x] TG_TOKEN توی env نیست."); sys.exit(1)
-    STATE["owner"] = load_owner()
+
+    # ★ مالک اجباری، فایل هم بازنویسی می‌شه
+    STATE["owner"] = FORCED_OWNER
     try:
-        _save(OWNER_FILE, {"owner": _FORCED_OWNER})
-    except Exception as e:
-        print(f"[owner] Could not save owner file: {e}", flush=True)
+        _save(OWNER_FILE, {"owner": FORCED_OWNER})
+    except Exception:
+        pass
+
     print(f"[+] VERSION: {VERSION}")
     print(f"[+] DATA_DIR: {DATA_DIR}")
+    print(f"[+] OWNER: {FORCED_OWNER}")
 
     _loop_ref[0] = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop_ref[0])
