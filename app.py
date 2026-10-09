@@ -1,4 +1,4 @@
-"""Rubika Web Panel + Telegram Bot — v14 (Railway-ready, forced owner, lifespan-managed)"""
+"""Rubika Web Panel + Telegram Bot — v15 (Railway-ready, forced owner, compat-shims, error-logger)"""
 
 # ══════════════════════════════════════════════════════════════
 # ۰) قبل از هر کاری، stdout/stderr واقعی رو قاپ بزن
@@ -10,7 +10,6 @@ REAL_STDERR = sys.stderr
 
 
 def log_print(msg: str = ""):
-    """چاپ فوری روی stdout اصلی — برای لاگ‌های مهم پنل."""
     try:
         print(msg, file=REAL_STDOUT, flush=True)
     except Exception:
@@ -18,7 +17,7 @@ def log_print(msg: str = ""):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱) همه لاگرهای پرحرف رو خفه کن — قبل از import کتابخانه‌ها
+# ۱) خفه کردن لاگرها
 # ══════════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.CRITICAL, stream=io.StringIO())
 for _name in ("", "uvicorn", "uvicorn.error", "uvicorn.access",
@@ -30,8 +29,6 @@ for _name in ("", "uvicorn", "uvicorn.error", "uvicorn.access",
     _lg.propagate = False
     _lg.handlers = [logging.NullHandler()]
 
-
-# ── patch signal handler (روی Railway بعضی سیگنال‌ها در thread کار نمی‌کنن) ──
 try:
     import asyncio.unix_events as _ue
     _orig_add_signal = _ue._UnixSelectorEventLoop.add_signal_handler
@@ -54,7 +51,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import (FastAPI, Response, HTTPException, WebSocket, WebSocketDisconnect,
                      UploadFile, File, Cookie, Depends, Query, Request, Form)
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -69,7 +66,7 @@ def pyd_dict(obj, exclude_none=True):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲) DATA_DIR — Volume واقعی Railway یا مسیر پروژه
+# ۲) DATA_DIR
 # ══════════════════════════════════════════════════════════════
 def _panel_data_dir() -> Path:
     candidates = []
@@ -91,11 +88,11 @@ def _panel_data_dir() -> Path:
 
 DATA_DIR = _panel_data_dir()
 LOG_FILE = DATA_DIR / "bot_runtime.log"
-log = logging.getLogger("web")   # دیگه چیزی چاپ نمی‌کنه
+log = logging.getLogger("web")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۳) پیدا کردن ربات — فقط rubika_tg_bot.py
+# ۳) پیدا کردن ربات
 # ══════════════════════════════════════════════════════════════
 BOT_FILENAME = "rubika_tg_bot.py"
 
@@ -106,7 +103,6 @@ def _find_bot():
         base = Path(env).expanduser().resolve()
         p = base / BOT_FILENAME
         if p.is_file(): return p.parent, p
-
     candidates = [
         HERE / BOT_FILENAME,
         HERE.parent / BOT_FILENAME,
@@ -120,14 +116,15 @@ def _find_bot():
     for c in candidates:
         try:
             if c.is_file(): return c.parent.resolve(), c.resolve()
-        except Exception: continue
-
+        except Exception:
+            continue
     for base in (Path.cwd(), HERE):
         for parent in [base] + list(base.parents):
             c = parent / BOT_FILENAME
             try:
                 if c.is_file(): return c.parent.resolve(), c.resolve()
-            except Exception: continue
+            except Exception:
+                continue
     return None, None
 
 
@@ -139,7 +136,7 @@ os.chdir(BOT_DIR)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۴) import کردن ربات با گرفتن output
+# ۴) import ربات
 # ══════════════════════════════════════════════════════════════
 _import_buf = io.StringIO()
 try:
@@ -166,17 +163,233 @@ except Exception:
     pass
 
 
+# ══════════════════════════════════════════════════════════════
+# ۵) Compatibility shims — توابعی که app.py لازم داره ولی ربات نداره
+# ══════════════════════════════════════════════════════════════
+import builtins as _bi
+
+# ─── update_account_field ───
+if not hasattr(bot, "update_account_field"):
+    def _shim_update_account_field(aid, key, value):
+        accounts = bot.list_accounts()
+        if aid in accounts:
+            accounts[aid][key] = value
+            bot.save_accounts(accounts)
+    bot.update_account_field = _shim_update_account_field
+
+# ─── send_text → send_text_only ───
+if not hasattr(bot, "send_text"):
+    async def _shim_send_text(cli, target, text):
+        return await bot.send_text_only(cli, target, text)
+    bot.send_text = _shim_send_text
+
+# ─── rubika_get_my_profile ───
+if not hasattr(bot, "rubika_get_my_profile"):
+    async def _shim_rubika_get_my_profile(cli):
+        out = {"first_name": "", "last_name": "", "bio": "",
+               "username": "", "phone": "", "user_guid": ""}
+        try:
+            me = await cli.get_me()
+            u = getattr(me, "user", me)
+            for k in ("first_name", "last_name", "bio", "username", "phone", "user_guid"):
+                v = getattr(u, k, None)
+                if v is not None: out[k] = v
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return out
+    bot.rubika_get_my_profile = _shim_rubika_get_my_profile
+
+# ─── get_live_channels ───
+if not hasattr(bot, "get_live_channels"):
+    async def _shim_get_live_channels(cli):
+        try:
+            chats = await bot.get_all_chats_raw(cli)
+            return [c for c in chats if (c.get("type") or "") == "Channel"]
+        except Exception:
+            return []
+    bot.get_live_channels = _shim_get_live_channels
+
+# ─── joiner (legacy) ───
+if not hasattr(bot, "joiner"):
+    async def _shim_joiner(cli, channels, max_count, log_cb):
+        joined = 0
+        for ch in channels:
+            try:
+                ok, res, tag = await bot._try_join_single(cli, ch)
+                if ok:
+                    joined += 1
+                    try: log_cb(f"✅ join {str(ch)[:30]}")
+                    except Exception: pass
+                if max_count and joined >= max_count: break
+            except Exception as e:
+                try: log_cb(f"⚠️ {str(ch)[:30]}: {type(e).__name__}")
+                except Exception: pass
+        return joined
+    bot.joiner = _shim_joiner
+
+# ─── rubika_send_code + rubika_complete_login ───
+_LOGIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+
+async def _shim_rubika_send_code(phone: str):
+    aid = "acc_" + secrets.token_hex(4)
+    sess = os.path.join(getattr(bot, "SESSIONS_DIR", "/tmp"), aid)
+    try:
+        os.makedirs(os.path.dirname(sess), exist_ok=True)
+    except Exception:
+        pass
+    from rubpy import Client as _CC
+    cli = _CC(name=sess)
+
+    res = None
+    used = None
+    for meth in ("send_code", "sendCode", "send_login_code"):
+        fn = getattr(cli, meth, None)
+        if not fn: continue
+        for kwargs in ({"phone_number": phone},
+                       {"phone_number": phone, "pass_key": None}):
+            try:
+                r = fn(**kwargs)
+                if asyncio.iscoroutine(r): r = await r
+                res = r; used = meth; break
+            except TypeError:
+                continue
+            except Exception:
+                res = None
+                continue
+        if res is not None:
+            break
+
+    if res is None:
+        _LOGIN_SESSIONS[phone] = {"aid": aid, "sess": sess, "cli": cli, "mode": "start"}
+        return {
+            "client": cli, "phone": phone, "status": "SendCode",
+            "phone_code_hash": None, "hint": None,
+            "_aid": aid, "_mode": "start",
+        }
+
+    def _get(o, *keys, d=None):
+        for k in keys:
+            if isinstance(o, dict) and k in o: return o[k]
+            v = getattr(o, k, None)
+            if v is not None: return v
+        return d
+
+    status = str(_get(res, "status", "status_det", d="SendCode"))
+    phone_code_hash = _get(res, "phone_code_hash", "phoneCodeHash")
+    hint = _get(res, "hint", "client_show_message")
+
+    _LOGIN_SESSIONS[phone] = {
+        "aid": aid, "sess": sess, "cli": cli,
+        "phone_code_hash": phone_code_hash, "mode": "direct",
+    }
+
+    return {
+        "client": cli, "phone": phone, "status": status,
+        "phone_code_hash": phone_code_hash, "hint": hint,
+        "_aid": aid, "_mode": "direct",
+    }
+
+
+async def _shim_rubika_complete_login(ctx: Dict[str, Any], code: str):
+    cli = ctx["client"]
+    phone = ctx["phone"]
+    hash_ = ctx.get("phone_code_hash")
+    mode = ctx.get("_mode", "direct")
+    aid = ctx.get("_aid") or _LOGIN_SESSIONS.get(phone, {}).get("aid")
+    sess = _LOGIN_SESSIONS.get(phone, {}).get("sess") or \
+           os.path.join(getattr(bot, "SESSIONS_DIR", "/tmp"), aid)
+
+    res = None
+    errors = []
+
+    if mode == "direct":
+        for meth in ("sign_in", "signIn", "login", "authorize", "signin"):
+            fn = getattr(cli, meth, None)
+            if not fn: continue
+            variants = [
+                {"phone_number": phone, "phone_code": code, "phone_code_hash": hash_},
+                {"phone_number": phone, "code": code, "phone_code_hash": hash_},
+                {"phone_number": phone, "phone_code": code},
+                {"phone_code": code, "phone_code_hash": hash_},
+            ]
+            for kw in variants:
+                try:
+                    r = fn(**kw)
+                    if asyncio.iscoroutine(r): r = await r
+                    res = r; break
+                except TypeError:
+                    errors.append(f"{meth}:TypeError"); continue
+                except Exception as e:
+                    errors.append(f"{meth}:{type(e).__name__}")
+                    continue
+            if res is not None: break
+
+    if res is None:
+        def _fake_input(prompt=""):
+            p = str(prompt).lower()
+            if "code" in p or "کد" in p:
+                return code
+            if "password" in p or "رمز" in p or "passkey" in p:
+                raise RuntimeError("2FA_REQUIRED")
+            return code
+
+        old = _bi.input
+        _bi.input = _fake_input
+        try:
+            r = cli.start(phone_number=phone)
+            if asyncio.iscoroutine(r): r = await r
+            res = r
+        except Exception as e:
+            errors.append(f"start:{type(e).__name__}:{str(e)[:80]}")
+        finally:
+            _bi.input = old
+
+    if res is None:
+        return {"ok": False, "status": " | ".join(errors[-4:]) or "unknown"}
+
+    try:
+        me = await cli.get_me()
+        u = getattr(me, "user", me)
+        name = getattr(u, "first_name", None) or phone
+        guid = getattr(u, "user_guid", None)
+    except Exception:
+        name = phone
+        guid = None
+
+    accounts = bot.list_accounts()
+    accounts[aid] = {
+        "phone": phone, "name": name, "user_guid": guid,
+        "session_name": sess, "created": int(time.time()),
+        "channels": [],
+    }
+    bot.save_accounts(accounts)
+
+    return {"ok": True, "aid": aid, "name": name, "status": "OK"}
+
+
+if not hasattr(bot, "rubika_send_code"):
+    bot.rubika_send_code = _shim_rubika_send_code
+if not hasattr(bot, "rubika_complete_login"):
+    bot.rubika_complete_login = _shim_rubika_complete_login
+
+log_print("[shim] compatibility layer installed")
+
+
+# ══════════════════════════════════════════════════════════════
+# ۶) Telegram Bot client (فقط برای ارسال کد ورود پنل)
+# ══════════════════════════════════════════════════════════════
 from telegram import Bot as TGBot
 
 _TG_TOKEN = getattr(bot, "TG_TOKEN", None) or os.environ.get("TG_TOKEN", "")
 if not _TG_TOKEN or ":" not in _TG_TOKEN:
-    log_print("❌  TG_TOKEN پیدا نشد. مقدارش رو در env Railway ست کن.")
+    log_print("❌  TG_TOKEN پیدا نشد.")
     sys.exit(1)
 TG = TGBot(token=_TG_TOKEN)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۵) OWNER — اجبار به 8389746549 (env-overridable)
+# ۷) OWNER
 # ══════════════════════════════════════════════════════════════
 try:
     FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "8389746549"))
@@ -187,13 +400,10 @@ OWNER_FILE = DATA_DIR / "tg_owner.json"
 
 
 def get_owner():
-    """همیشه FORCED_OWNER رو برمی‌گردونه."""
     return FORCED_OWNER
 
 
 def _ensure_owner_file():
-    """فایل tg_owner.json رو در DATA_DIR با مقدار FORCED_OWNER می‌نویسه.
-    ربات هم همون رو می‌خونه."""
     try:
         if OWNER_FILE.exists():
             try:
@@ -211,14 +421,12 @@ def _ensure_owner_file():
         log_print(f"[panel] ensure_owner_file failed: {type(e).__name__}: {e}")
 
 
-# فایل مالک رو همون اول import بنویس (قبل از اجرای ربات)
 _ensure_owner_file()
-# env رو هم پاس بده به ربات
 os.environ["TG_OWNER_ID"] = str(FORCED_OWNER)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۶) Sessions / state
+# ۸) Sessions / state
 # ══════════════════════════════════════════════════════════════
 SESS_FILE = str(DATA_DIR / "web_sessions.json")
 
@@ -254,7 +462,7 @@ def gen_code():
 
 
 # ══════════════════════════════════════════════════════════════
-# ۷) WebSocket hub
+# ۹) WebSocket hub
 # ══════════════════════════════════════════════════════════════
 class Conn:
     def __init__(self, ws: WebSocket, uid: int):
@@ -325,7 +533,7 @@ except: pass
 
 
 # ══════════════════════════════════════════════════════════════
-# ۸) Static files
+# ۱۰) Static
 # ══════════════════════════════════════════════════════════════
 STATIC = next((c for c in [HERE / "static", HERE.parent / "static",
                             BOT_DIR / "webapp" / "static", BOT_DIR / "static"]
@@ -333,7 +541,7 @@ STATIC = next((c for c in [HERE / "static", HERE.parent / "static",
 
 
 # ══════════════════════════════════════════════════════════════
-# ۹) Bot worker — thread جدا با event loop اختصاصی
+# ۱۱) Bot worker thread
 # ══════════════════════════════════════════════════════════════
 _bot_thread: Optional[threading.Thread] = None
 
@@ -345,7 +553,6 @@ def _bot_worker():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            # ★ ست کردن _loop_ref ربات (اگه وجود داره)
             try:
                 _lr = getattr(bot, "_loop_ref", None)
                 if isinstance(_lr, list) and _lr:
@@ -354,15 +561,10 @@ def _bot_worker():
                     bot._loop_ref = [loop]
             except Exception:
                 pass
-            # ★ پاس دادن owner اجباری به ربات
-            try:
-                bot.FORCED_OWNER = FORCED_OWNER
-            except Exception:
-                pass
-            try:
-                bot.STATE["owner"] = FORCED_OWNER
-            except Exception:
-                pass
+            try: bot.FORCED_OWNER = FORCED_OWNER
+            except Exception: pass
+            try: bot.STATE["owner"] = FORCED_OWNER
+            except Exception: pass
 
             if callable(getattr(bot, "main", None)):
                 bot.main()
@@ -394,14 +596,12 @@ def start_bot_thread() -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۰) FastAPI lifespan — اینجاست که ربات راه می‌افته
+# ۱۲) FastAPI lifespan
 # ══════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
-
-    # ★ دوباره اطمینان از owner
     _ensure_owner_file()
 
     log_print("=" * 56)
@@ -431,7 +631,7 @@ async def lifespan(_app: FastAPI):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۱) FastAPI app
+# ۱۳) FastAPI app
 # ══════════════════════════════════════════════════════════════
 app = FastAPI(title="Rubika Web Panel", lifespan=lifespan)
 
@@ -440,7 +640,35 @@ if STATIC.is_dir():
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۲) Auth helpers
+# ★ Global 500 handler — خطا رو با traceback کامل لاگ می‌کنه
+# ══════════════════════════════════════════════════════════════
+import traceback as _tb_global
+
+@app.exception_handler(Exception)
+async def _unhandled_handler(request: Request, exc: Exception):
+    tb = _tb_global.format_exc()
+    log_print(f"\n❌ [500] {request.method} {request.url.path}")
+    log_print(f"   {type(exc).__name__}: {str(exc)[:300]}")
+    log_print(tb)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n===== 500 @ {request.method} {request.url.path} =====\n")
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            f.write(tb)
+    except Exception:
+        pass
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": str(exc)[:500],
+            "path": str(request.url.path),
+        },
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# ۱۴) Auth helpers
 # ══════════════════════════════════════════════════════════════
 def _get_token(request: Request) -> Optional[str]:
     tok = request.cookies.get("session")
@@ -476,7 +704,7 @@ def _require(req, page):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۳) HTML Pages
+# ۱۵) HTML Pages
 # ══════════════════════════════════════════════════════════════
 @app.get("/")
 async def root(req: Request):
@@ -528,7 +756,7 @@ async def p_logs(request: Request): return _require(request, "logs.html")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۴) Auth API
+# ۱۶) Auth API
 # ══════════════════════════════════════════════════════════════
 class LoginReq(BaseModel): telegram_id: int
 class VerifyReq(BaseModel): telegram_id: int; code: str
@@ -536,7 +764,6 @@ class VerifyReq(BaseModel): telegram_id: int; code: str
 
 @app.post("/api/auth/request")
 async def auth_request(req: LoginReq):
-    # ★ مالک اجباری — دیگه از get_owner() هم استقلال داره
     if req.telegram_id != FORCED_OWNER:
         raise HTTPException(403, "فقط مالک")
     code = gen_code()
@@ -586,7 +813,7 @@ async def me(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۵) Rubika client manager
+# ۱۷) Rubika client manager
 # ══════════════════════════════════════════════════════════════
 CLIENTS: Dict[str, Dict[str, Any]] = {}
 _LOCKS: Dict[str, asyncio.Lock] = {}
@@ -742,7 +969,7 @@ def _account_ids_cached():
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۶) Accounts API
+# ۱۸) Accounts API
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/accounts")
 async def api_accounts(uid: int = Depends(get_uid)):
@@ -962,7 +1189,7 @@ async def api_chat_info(aid: str, guid: str, uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۷) Messages
+# ۱۹) Messages
 # ══════════════════════════════════════════════════════════════
 async def _bot_fetch(cli, guid, limit, my, **kw):
     try: return await bot.fetch_messages(cli, guid, limit, my, **kw)
@@ -1114,7 +1341,7 @@ async def api_search(aid: str, q: str = Query(""), limit: int = 60,
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۸) Send / Edit / Delete / Forward
+# ۲۰) Send / Edit / Delete / Forward
 # ══════════════════════════════════════════════════════════════
 class SendReq(BaseModel): target: str; text: str
 
@@ -1362,7 +1589,7 @@ async def api_chat_remove(aid: str, guid: str, req: ChatOpReq,
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۹) Channels basic
+# ۲۱) Channels basic
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/accounts/{aid}/channels")
 async def api_channels(aid: str, uid: int = Depends(get_uid)):
@@ -1384,7 +1611,7 @@ async def api_collect(aid: str, kind: str, uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۰) Settings / Queue / Reports / Job
+# ۲۲) Settings / Queue / Reports / Job
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/settings")
 async def api_cfg(uid: int = Depends(get_uid)):
@@ -1480,7 +1707,7 @@ async def api_logs(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۱) Extract
+# ۲۳) Extract
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/extract/channels")
 async def api_extract_channels(uid: int = Depends(get_uid)):
@@ -1536,7 +1763,7 @@ async def api_extract_stop(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۲) Chat feed
+# ۲۴) Chat feed
 # ══════════════════════════════════════════════════════════════
 class ChatFeed:
     def __init__(self, aid, guid):
@@ -1735,7 +1962,7 @@ async def ws_ep(ws: WebSocket, token: str = Query("")):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۳) Avatar
+# ۲۵) Avatar
 # ══════════════════════════════════════════════════════════════
 from fastapi.responses import Response as _AvResp
 import os as _av_os
@@ -2005,7 +2232,7 @@ async def p_account(request: Request, aid: str):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۴) Batch system
+# ۲۶) Batch system
 # ══════════════════════════════════════════════════════════════
 BATCHES_FILE = "batches.json"
 
@@ -2112,7 +2339,7 @@ async def api_batches_job_status(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۵) Channel management
+# ۲۷) Channel management
 # ══════════════════════════════════════════════════════════════
 def _ch_friendly_err(e):
     s = str(e); s_low = s.lower()
@@ -2561,7 +2788,7 @@ async def p_channel(request: Request, aid: str, guid: str):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۶) Diagnostics
+# ۲۸) Diagnostics
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/accounts/{aid}/diag")
 async def api_diag(aid: str, uid: int = Depends(get_uid)):
@@ -2598,8 +2825,19 @@ async def api_diag(aid: str, uid: int = Depends(get_uid)):
     return out
 
 
+@app.get("/api/health")
+async def api_health():
+    return {
+        "ok": True,
+        "owner": FORCED_OWNER,
+        "bot_alive": bool(_bot_thread and _bot_thread.is_alive()),
+        "data_dir": str(DATA_DIR),
+        "bot_path": str(BOT_PATH),
+    }
+
+
 # ══════════════════════════════════════════════════════════════
-# ۲۷) Direct execution (local)
+# ۲۹) Local execution
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
