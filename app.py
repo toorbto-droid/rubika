@@ -1,4 +1,4 @@
-"""Rubika Web Panel + Telegram Bot — v16 (Railway, forced owner, compat-shims, debug)"""
+"""Rubika Web Panel + Telegram Bot — v17 (fix: _make_client без auth)"""
 
 # ══════════════════════════════════════════════════════════════
 # ۰) stdout/stderr واقعی
@@ -830,15 +830,23 @@ def _is_dead_session_error(e) -> bool:
     ))
 
 
+# ★★★ v17: fix KeyError 'auth' — rubpy v7 only needs name (reads .rp)
 async def _make_client(aid: str):
     acc = bot.get_account(aid)
-    if not acc: raise HTTPException(404, "اکانت نیست")
-    cli = bot.SafeClient(
-        name=acc["session_name"], auth=acc["auth"],
-        private_key=acc["private_key"], phone_number=acc["phone"],
-        platform='Android', display_welcome=False,
-        timeout=30, max_retries=3,
-    )
+    if not acc:
+        raise HTTPException(404, "اکانت نیست")
+
+    sess = acc.get("session_name")
+    if not sess:
+        raise HTTPException(400, f"session_name روی اکانت {aid} ست نشده")
+
+    # rubpy v7+ همه چیز (auth, private_key, ...) رو از فایل {name}.rp می‌خونه
+    # پس فقط name کافیه. اگه SafeClient _aid رو قبول نکرد، بدون اون بساز.
+    try:
+        cli = bot.SafeClient(name=sess, _aid=aid)
+    except TypeError:
+        cli = bot.SafeClient(name=sess)
+
     try:
         await cli.__aenter__()
     except RuntimeError as er:
@@ -1304,7 +1312,7 @@ async def api_chat_msgs(aid: str, guid: str, limit: int = 30,
 
 
 # ══════════════════════════════════════════════════════════════
-# ★ DEBUG endpoint — دقیقاً می‌گه کجا می‌شکنه
+# ★ DEBUG endpoint
 # ══════════════════════════════════════════════════════════════
 @app.get("/api/debug/messages/{aid}/{guid}")
 async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
@@ -1312,7 +1320,6 @@ async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
     import inspect as _ins
     steps = []
 
-    # مرحله ۱: get_client
     try:
         cli = await get_client(aid)
         steps.append({"step": "get_client", "ok": True})
@@ -1325,7 +1332,6 @@ async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
                 "traceback": _tb.format_exc()[:2000],
                 "steps": steps}
 
-    # مرحله ۲: get_me
     my = None
     try:
         me = await cli.get_me()
@@ -1335,7 +1341,6 @@ async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
         steps.append({"step": "get_me", "ok": False,
                       "error": f"{type(e).__name__}: {str(e)[:300]}"})
 
-    # مرحله ۳: بررسی get_messages
     has_gm = hasattr(cli, "get_messages") and callable(getattr(cli, "get_messages", None))
     steps.append({"step": "has_get_messages", "ok": has_gm})
 
@@ -1355,7 +1360,6 @@ async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
         steps.append({"step": "get_messages_signature", "ok": False,
                       "error": str(e)[:200]})
 
-    # مرحله ۴: امتحان ترکیب‌های مختلف
     combos = [
         {"desc": "positional (guid, '0', '30', 'FromMax')",
          "call": lambda: fn(guid, "0", "30", "FromMax")},
@@ -1388,7 +1392,6 @@ async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
 
     steps.append({"step": "try_get_messages_combos", "results": combo_results})
 
-    # مرحله ۵: fetch_messages خودمان
     try:
         msgs = await bot.fetch_messages(cli, guid, 30, my)
         steps.append({"step": "fetch_messages", "ok": True,
