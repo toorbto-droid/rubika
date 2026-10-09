@@ -21,3 +21,12 @@ batches.json
 media/
 Rubika Images/
 Rubika Video/
+
+# Private account data and sessions
+accounts.json
+tg_owner.json
+web_sessions.json
+*.rp
+.env
+__pycache__/
+*.pyc
