@@ -1,7 +1,7 @@
-"""Rubika Web Panel + Telegram Bot — v17 (fix: _make_client без auth)"""
+"""Rubika + Soroosh Web Panel — v20 (Railway production + TG_TOKEN env only)"""
 
 # ══════════════════════════════════════════════════════════════
-# ۰) stdout/stderr واقعی
+# ۰) قاپ زدن stdout/stderr واقعی
 # ══════════════════════════════════════════════════════════════
 import sys, os, io, contextlib, logging
 
@@ -9,11 +9,9 @@ REAL_STDOUT = sys.stdout
 REAL_STDERR = sys.stderr
 
 
-def log_print(msg: str = ""):
-    try:
-        print(msg, file=REAL_STDOUT, flush=True)
-    except Exception:
-        pass
+def log_print(msg=""):
+    try: print(msg, file=REAL_STDOUT, flush=True)
+    except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -23,7 +21,8 @@ logging.basicConfig(level=logging.CRITICAL, stream=io.StringIO())
 for _name in ("", "uvicorn", "uvicorn.error", "uvicorn.access",
               "httpx", "httpcore", "telegram", "telegram.ext",
               "urllib3", "aiohttp", "asyncio", "fastapi",
-              "multipart", "rubpy", "requests", "web", "rubika_bot"):
+              "multipart", "rubpy", "splusthon", "requests", "web",
+              "rubika_bot", "soroosh_bot"):
     _lg = logging.getLogger(_name)
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
@@ -32,16 +31,12 @@ for _name in ("", "uvicorn", "uvicorn.error", "uvicorn.access",
 try:
     import asyncio.unix_events as _ue
     _orig_add_signal = _ue._UnixSelectorEventLoop.add_signal_handler
-
     def _safe_add_signal(self, sig, callback, *args):
-        try:
-            return _orig_add_signal(self, sig, callback, *args)
+        try: return _orig_add_signal(self, sig, callback, *args)
         except (RuntimeError, ValueError, NotImplementedError, AttributeError):
             return None
-
     _ue._UnixSelectorEventLoop.add_signal_handler = _safe_add_signal
-except Exception:
-    pass
+except Exception: pass
 
 
 import json, time, secrets, asyncio, importlib.util, tempfile, threading, runpy, re, shutil
@@ -50,19 +45,44 @@ from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 from fastapi import (FastAPI, Response, HTTPException, WebSocket, WebSocketDisconnect,
-                     UploadFile, File, Cookie, Depends, Query, Request, Form)
+                     UploadFile, File, Depends, Query, Request, Form)
 from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 HERE = Path(__file__).parent.resolve()
-PORT = int(os.environ.get("PORT", 8080))
-HOST = "0.0.0.0"
 
 
-def pyd_dict(obj, exclude_none=True):
-    if hasattr(obj, "model_dump"): return obj.model_dump(exclude_none=exclude_none)
-    return obj.dict(exclude_none=exclude_none)
+# ══════════════════════════════════════════════════════════════
+# ★★★  توکن‌ها و owner — فقط از ENV  ★★★
+# ══════════════════════════════════════════════════════════════
+TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
+if not TG_TOKEN or ":" not in TG_TOKEN:
+    log_print("❌  TG_TOKEN در متغیرهای محیطی ست نشده.")
+    log_print("    در Railway: Variables → TG_TOKEN = <bot_token>")
+    sys.exit(1)
+
+try:
+    FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "").strip() or "8389746549")
+except Exception:
+    FORCED_OWNER = 8389746549
+
+
+# ══════════════════════════════════════════════════════════════
+# HOST / PORT / PUBLIC_URL — برای Railway
+# ══════════════════════════════════════════════════════════════
+# روی Railway باید روی 0.0.0.0 گوش بده
+HOST = os.environ.get("PANEL_HOST", "0.0.0.0").strip()
+PORT = int(os.environ.get("PORT", "8080"))
+
+# URL عمومی که تو لاگ‌ها و لینک‌ها نمایش داده می‌شه
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://rubika-production.up.railway.app").strip().rstrip("/")
+
+# آیا پشت پروکسی (Railway) هستیم؟
+IS_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or
+                  os.environ.get("RAILWAY_STATIC_URL") or
+                  os.environ.get("RAILWAY_PROJECT_ID"))
+IS_HTTPS = PUBLIC_URL.startswith("https://")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -70,10 +90,10 @@ def pyd_dict(obj, exclude_none=True):
 # ══════════════════════════════════════════════════════════════
 def _panel_data_dir() -> Path:
     candidates = []
-    env_dir = os.environ.get("DATA_DIR", "").strip()
-    if env_dir: candidates.append(env_dir)
-    rv_path = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    if rv_path: candidates.append(rv_path)
+    e = os.environ.get("DATA_DIR", "").strip()
+    if e: candidates.append(e)
+    e = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if e: candidates.append(e)
     if os.environ.get("RAILWAY_ENVIRONMENT"):
         candidates.extend(["/data", "/app/data"])
     for c in candidates:
@@ -81,353 +101,201 @@ def _panel_data_dir() -> Path:
             p = Path(c)
             if p.is_dir() and os.access(p, os.W_OK):
                 return p.resolve()
-        except Exception:
-            continue
+        except Exception: pass
     return HERE
 
 
 DATA_DIR = _panel_data_dir()
 LOG_FILE = DATA_DIR / "bot_runtime.log"
-log = logging.getLogger("web")
+os.environ["DATA_DIR"] = str(DATA_DIR)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۳) پیدا کردن ربات
+# ۳) پیدا کردن ربات‌ها
 # ══════════════════════════════════════════════════════════════
-BOT_FILENAME = "rubika_tg_bot.py"
+RB_FILENAME = "rubika_tg_bot.py"
+SR_FILENAME = "Soroosh_tg_bot.py"
 
 
-def _find_bot():
+def _find_bot(filename):
     env = os.environ.get("RUBIKA_BOT_DIR")
     if env:
-        base = Path(env).expanduser().resolve()
-        p = base / BOT_FILENAME
+        p = Path(env).expanduser().resolve() / filename
         if p.is_file(): return p.parent, p
-    candidates = [
-        HERE / BOT_FILENAME,
-        HERE.parent / BOT_FILENAME,
-        DATA_DIR / BOT_FILENAME,
-        Path("/app") / BOT_FILENAME,
-        Path("/home/container") / BOT_FILENAME,
-        Path("/storage/emulated/0/rubika") / BOT_FILENAME,
-        Path("/storage/emulated/0") / BOT_FILENAME,
-        Path("/sdcard/rubika") / BOT_FILENAME,
-    ]
-    for c in candidates:
+    for c in [HERE / filename, HERE.parent / filename,
+              Path("/app") / filename, Path("/home/container") / filename]:
         try:
             if c.is_file(): return c.parent.resolve(), c.resolve()
-        except Exception:
-            continue
+        except Exception: pass
     for base in (Path.cwd(), HERE):
         for parent in [base] + list(base.parents):
-            c = parent / BOT_FILENAME
+            c = parent / filename
             try:
                 if c.is_file(): return c.parent.resolve(), c.resolve()
-            except Exception:
-                continue
+            except Exception: pass
     return None, None
 
 
-BOT_DIR, BOT_PATH = _find_bot()
-if not BOT_PATH:
-    log_print(f"❌  {BOT_FILENAME} پیدا نشد.")
-    sys.exit(1)
-os.chdir(BOT_DIR)
+RB_DIR, RB_PATH = _find_bot(RB_FILENAME)
+SR_DIR, SR_PATH = _find_bot(SR_FILENAME)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۴) import ربات
+# ۴) ENV pass-through
 # ══════════════════════════════════════════════════════════════
-_import_buf = io.StringIO()
-try:
-    with contextlib.redirect_stdout(_import_buf), contextlib.redirect_stderr(_import_buf):
-        spec = importlib.util.spec_from_file_location("rubika_bot", str(BOT_PATH))
-        bot = importlib.util.module_from_spec(spec)
-        sys.modules["rubika_bot"] = bot
-        spec.loader.exec_module(bot)
-except Exception as _imp_err:
-    log_print(f"❌  import {BOT_FILENAME} شکست خورد: {type(_imp_err).__name__}: {_imp_err}")
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"\n===== import FAIL @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            f.write(_import_buf.getvalue())
-    except Exception:
-        pass
-    sys.exit(1)
-
-try:
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n===== import OK @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-        f.write(_import_buf.getvalue())
-except Exception:
-    pass
-
-
-# ══════════════════════════════════════════════════════════════
-# ۵) Compatibility shims
-# ══════════════════════════════════════════════════════════════
-import builtins as _bi
-
-if not hasattr(bot, "update_account_field"):
-    def _shim_update_account_field(aid, key, value):
-        accounts = bot.list_accounts()
-        if aid in accounts:
-            accounts[aid][key] = value
-            bot.save_accounts(accounts)
-    bot.update_account_field = _shim_update_account_field
-
-if not hasattr(bot, "send_text"):
-    async def _shim_send_text(cli, target, text):
-        return await bot.send_text_only(cli, target, text)
-    bot.send_text = _shim_send_text
-
-if not hasattr(bot, "rubika_get_my_profile"):
-    async def _shim_rubika_get_my_profile(cli):
-        out = {"first_name": "", "last_name": "", "bio": "",
-               "username": "", "phone": "", "user_guid": ""}
-        try:
-            me = await cli.get_me()
-            u = getattr(me, "user", me)
-            for k in ("first_name", "last_name", "bio", "username", "phone", "user_guid"):
-                v = getattr(u, k, None)
-                if v is not None: out[k] = v
-        except Exception as e:
-            out["error"] = str(e)[:200]
-        return out
-    bot.rubika_get_my_profile = _shim_rubika_get_my_profile
-
-if not hasattr(bot, "get_live_channels"):
-    async def _shim_get_live_channels(cli):
-        try:
-            chats = await bot.get_all_chats_raw(cli)
-            return [c for c in chats if (c.get("type") or "") == "Channel"]
-        except Exception:
-            return []
-    bot.get_live_channels = _shim_get_live_channels
-
-if not hasattr(bot, "joiner"):
-    async def _shim_joiner(cli, channels, max_count, log_cb):
-        joined = 0
-        for ch in channels:
-            try:
-                ok, res, tag = await bot._try_join_single(cli, ch)
-                if ok:
-                    joined += 1
-                    try: log_cb(f"✅ join {str(ch)[:30]}")
-                    except Exception: pass
-                if max_count and joined >= max_count: break
-            except Exception as e:
-                try: log_cb(f"⚠️ {str(ch)[:30]}: {type(e).__name__}")
-                except Exception: pass
-        return joined
-    bot.joiner = _shim_joiner
-
-_LOGIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-
-async def _shim_rubika_send_code(phone: str):
-    aid = "acc_" + secrets.token_hex(4)
-    sess = os.path.join(getattr(bot, "SESSIONS_DIR", "/tmp"), aid)
-    try:
-        os.makedirs(os.path.dirname(sess), exist_ok=True)
-    except Exception:
-        pass
-    from rubpy import Client as _CC
-    cli = _CC(name=sess)
-
-    res = None
-    for meth in ("send_code", "sendCode", "send_login_code"):
-        fn = getattr(cli, meth, None)
-        if not fn: continue
-        for kwargs in ({"phone_number": phone},
-                       {"phone_number": phone, "pass_key": None}):
-            try:
-                r = fn(**kwargs)
-                if asyncio.iscoroutine(r): r = await r
-                res = r; break
-            except TypeError:
-                continue
-            except Exception:
-                res = None
-                continue
-        if res is not None:
-            break
-
-    if res is None:
-        _LOGIN_SESSIONS[phone] = {"aid": aid, "sess": sess, "cli": cli, "mode": "start"}
-        return {"client": cli, "phone": phone, "status": "SendCode",
-                "phone_code_hash": None, "hint": None,
-                "_aid": aid, "_mode": "start"}
-
-    def _get(o, *keys, d=None):
-        for k in keys:
-            if isinstance(o, dict) and k in o: return o[k]
-            v = getattr(o, k, None)
-            if v is not None: return v
-        return d
-
-    status = str(_get(res, "status", "status_det", d="SendCode"))
-    phone_code_hash = _get(res, "phone_code_hash", "phoneCodeHash")
-    hint = _get(res, "hint", "client_show_message")
-
-    _LOGIN_SESSIONS[phone] = {
-        "aid": aid, "sess": sess, "cli": cli,
-        "phone_code_hash": phone_code_hash, "mode": "direct",
-    }
-
-    return {"client": cli, "phone": phone, "status": status,
-            "phone_code_hash": phone_code_hash, "hint": hint,
-            "_aid": aid, "_mode": "direct"}
-
-
-async def _shim_rubika_complete_login(ctx: Dict[str, Any], code: str):
-    cli = ctx["client"]
-    phone = ctx["phone"]
-    hash_ = ctx.get("phone_code_hash")
-    mode = ctx.get("_mode", "direct")
-    aid = ctx.get("_aid") or _LOGIN_SESSIONS.get(phone, {}).get("aid")
-    sess = _LOGIN_SESSIONS.get(phone, {}).get("sess") or \
-           os.path.join(getattr(bot, "SESSIONS_DIR", "/tmp"), aid)
-
-    res = None
-    errors = []
-
-    if mode == "direct":
-        for meth in ("sign_in", "signIn", "login", "authorize", "signin"):
-            fn = getattr(cli, meth, None)
-            if not fn: continue
-            variants = [
-                {"phone_number": phone, "phone_code": code, "phone_code_hash": hash_},
-                {"phone_number": phone, "code": code, "phone_code_hash": hash_},
-                {"phone_number": phone, "phone_code": code},
-                {"phone_code": code, "phone_code_hash": hash_},
-            ]
-            for kw in variants:
-                try:
-                    r = fn(**kw)
-                    if asyncio.iscoroutine(r): r = await r
-                    res = r; break
-                except TypeError:
-                    errors.append(f"{meth}:TypeError"); continue
-                except Exception as e:
-                    errors.append(f"{meth}:{type(e).__name__}")
-                    continue
-            if res is not None: break
-
-    if res is None:
-        def _fake_input(prompt=""):
-            p = str(prompt).lower()
-            if "code" in p or "کد" in p:
-                return code
-            if "password" in p or "رمز" in p or "passkey" in p:
-                raise RuntimeError("2FA_REQUIRED")
-            return code
-
-        old = _bi.input
-        _bi.input = _fake_input
-        try:
-            r = cli.start(phone_number=phone)
-            if asyncio.iscoroutine(r): r = await r
-            res = r
-        except Exception as e:
-            errors.append(f"start:{type(e).__name__}:{str(e)[:80]}")
-        finally:
-            _bi.input = old
-
-    if res is None:
-        return {"ok": False, "status": " | ".join(errors[-4:]) or "unknown"}
-
-    try:
-        me = await cli.get_me()
-        u = getattr(me, "user", me)
-        name = getattr(u, "first_name", None) or phone
-        guid = getattr(u, "user_guid", None)
-    except Exception:
-        name = phone
-        guid = None
-
-    accounts = bot.list_accounts()
-    accounts[aid] = {"phone": phone, "name": name, "user_guid": guid,
-                     "session_name": sess, "created": int(time.time()),
-                     "channels": []}
-    bot.save_accounts(accounts)
-
-    return {"ok": True, "aid": aid, "name": name, "status": "OK"}
-
-
-if not hasattr(bot, "rubika_send_code"):
-    bot.rubika_send_code = _shim_rubika_send_code
-if not hasattr(bot, "rubika_complete_login"):
-    bot.rubika_complete_login = _shim_rubika_complete_login
-
-log_print("[shim] compatibility layer installed")
-
-
-# ══════════════════════════════════════════════════════════════
-# ۶) Telegram Bot
-# ══════════════════════════════════════════════════════════════
-from telegram import Bot as TGBot
-
-_TG_TOKEN = getattr(bot, "TG_TOKEN", None) or os.environ.get("TG_TOKEN", "")
-if not _TG_TOKEN or ":" not in _TG_TOKEN:
-    log_print("❌  TG_TOKEN پیدا نشد.")
-    sys.exit(1)
-TG = TGBot(token=_TG_TOKEN)
-
-
-# ══════════════════════════════════════════════════════════════
-# ۷) OWNER
-# ══════════════════════════════════════════════════════════════
-try:
-    FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "8389746549"))
-except Exception:
-    FORCED_OWNER = 8389746549
-
-OWNER_FILE = DATA_DIR / "tg_owner.json"
-
-
-def get_owner():
-    return FORCED_OWNER
-
-
-def _ensure_owner_file():
-    try:
-        if OWNER_FILE.exists():
-            try:
-                current = json.loads(OWNER_FILE.read_text(encoding="utf-8"))
-                if current.get("owner") == FORCED_OWNER:
-                    return
-            except Exception:
-                pass
-        tmp = str(OWNER_FILE) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"owner": FORCED_OWNER}, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, str(OWNER_FILE))
-        log_print(f"[panel] owner forced to {FORCED_OWNER} → {OWNER_FILE}")
-    except Exception as e:
-        log_print(f"[panel] ensure_owner_file failed: {type(e).__name__}: {e}")
-
-
-_ensure_owner_file()
+os.environ["TG_TOKEN"] = TG_TOKEN
 os.environ["TG_OWNER_ID"] = str(FORCED_OWNER)
 
 
 # ══════════════════════════════════════════════════════════════
-# ۸) Sessions / state
+# ۵) import ربات روبیکا
+# ══════════════════════════════════════════════════════════════
+rb = None
+if RB_PATH:
+    _buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
+            spec = importlib.util.spec_from_file_location("rubika_bot", str(RB_PATH))
+            rb = importlib.util.module_from_spec(spec)
+            sys.modules["rubika_bot"] = rb
+            spec.loader.exec_module(rb)
+    except Exception as e:
+        log_print(f"❌ import {RB_FILENAME}: {type(e).__name__}: {e}")
+        rb = None
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n===== rubika import @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(_buf.getvalue())
+    except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════
+# ۶) import ربات سروش
+# ══════════════════════════════════════════════════════════════
+sr = None
+if SR_PATH:
+    _buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
+            spec = importlib.util.spec_from_file_location("soroosh_bot", str(SR_PATH))
+            sr = importlib.util.module_from_spec(spec)
+            sys.modules["soroosh_bot"] = sr
+            spec.loader.exec_module(sr)
+    except Exception as e:
+        log_print(f"⚠️  import {SR_FILENAME}: {type(e).__name__}: {e}")
+        sr = None
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n===== soroosh import @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(_buf.getvalue())
+    except Exception: pass
+
+
+if rb is None and sr is None:
+    log_print("❌ هیچ رباتی import نشد."); sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════
+# ۷) SET GLOBALS روی هر دو
+# ══════════════════════════════════════════════════════════════
+if rb is not None:
+    rb.FORCED_OWNER = FORCED_OWNER
+    rb.TG_TOKEN = TG_TOKEN
+    try: rb.STATE["owner"] = FORCED_OWNER
+    except Exception: pass
+    if not hasattr(rb, "_loop_ref"):
+        rb._loop_ref = [None]
+
+
+if sr is not None:
+    sr.FORCED_OWNER = FORCED_OWNER
+    sr.TG_TOKEN = TG_TOKEN
+    try: sr.STATE["owner"] = FORCED_OWNER
+    except Exception: pass
+    if not hasattr(sr, "_loop_ref"):
+        sr._loop_ref = [None]
+
+
+# ══════════════════════════════════════════════════════════════
+# ۸) RUBIKA — compatibility shims
+# ══════════════════════════════════════════════════════════════
+if rb is not None:
+    if not hasattr(rb, "update_account_field"):
+        def _shim_update_account_field(aid, key, value):
+            accounts = rb.list_accounts()
+            if aid in accounts:
+                accounts[aid][key] = value
+                rb.save_accounts(accounts)
+        rb.update_account_field = _shim_update_account_field
+
+    if not hasattr(rb, "send_text"):
+        async def _shim_send_text(cli, target, text):
+            return await rb.send_text_only(cli, target, text)
+        rb.send_text = _shim_send_text
+
+    if not hasattr(rb, "rubika_get_my_profile"):
+        async def _shim_get_profile(cli):
+            out = {"first_name": "", "last_name": "", "bio": "",
+                   "username": "", "phone": "", "user_guid": ""}
+            try:
+                me = await cli.get_me()
+                u = getattr(me, "user", me)
+                for k in ("first_name", "last_name", "bio", "username",
+                          "phone", "user_guid"):
+                    v = getattr(u, k, None)
+                    if v is not None: out[k] = v
+            except Exception as e:
+                out["error"] = str(e)[:200]
+            return out
+        rb.rubika_get_my_profile = _shim_get_profile
+
+    if not hasattr(rb, "get_live_channels"):
+        async def _shim_live_channels(cli):
+            try:
+                chats = await rb.get_all_chats_raw(cli)
+                return [c for c in chats if (c.get("type") or "") == "Channel"]
+            except Exception: return []
+        rb.get_live_channels = _shim_live_channels
+
+    if not hasattr(rb, "joiner"):
+        async def _shim_joiner(cli, channels, max_count, log_cb):
+            joined = 0
+            for ch in channels:
+                try:
+                    ok, _r, _t = await rb._try_join_single(cli, ch)
+                    if ok:
+                        joined += 1
+                        try: log_cb(f"✅ join {str(ch)[:30]}")
+                        except Exception: pass
+                    if max_count and joined >= max_count: break
+                except Exception: continue
+            return joined
+        rb.joiner = _shim_joiner
+
+
+# ══════════════════════════════════════════════════════════════
+# ۹) OWNER FILE
+# ══════════════════════════════════════════════════════════════
+OWNER_FILE = DATA_DIR / "tg_owner.json"
+
+
+def _ensure_owner_file():
+    try:
+        tmp = str(OWNER_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"owner": FORCED_OWNER}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(OWNER_FILE))
+    except Exception as e:
+        log_print(f"[panel] owner file: {type(e).__name__}: {e}")
+
+
+_ensure_owner_file()
+
+
+# ══════════════════════════════════════════════════════════════
+# ۱۰) SESSIONS / STATE
 # ══════════════════════════════════════════════════════════════
 SESS_FILE = str(DATA_DIR / "web_sessions.json")
-
-_legacy_sessions = Path(BOT_DIR) / "web_sessions.json"
-_current_sessions = Path(SESS_FILE)
-if (not _current_sessions.exists()
-        and _legacy_sessions.is_file()
-        and _legacy_sessions.resolve() != _current_sessions.resolve()):
-    try:
-        shutil.copy2(_legacy_sessions, _current_sessions)
-    except Exception as _e:
-        log_print(f"[panel] session migration failed: {type(_e).__name__}: {_e}")
-
-LOGIN_CTX: Dict[int, Dict[str, Any]] = {}
 PENDING: Dict[int, Dict[str, Any]] = {}
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 if os.path.exists(SESS_FILE):
@@ -435,6 +303,7 @@ if os.path.exists(SESS_FILE):
     except: SESSIONS = {}
 LOGS: List[dict] = []
 MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+USER_MODE: Dict[int, str] = {}
 
 
 def save_sessions():
@@ -448,50 +317,38 @@ def gen_code():
 
 
 # ══════════════════════════════════════════════════════════════
-# ۹) WebSocket hub
+# ۱۱) WebSocket hub
 # ══════════════════════════════════════════════════════════════
 class Conn:
-    def __init__(self, ws: WebSocket, uid: int):
+    def __init__(self, ws, uid):
         self.ws = ws; self.uid = uid
         self.q: asyncio.Queue = asyncio.Queue(maxsize=500)
-        self.subs: set = set(); self.alive = True
-        self.writer: Optional[asyncio.Task] = None
-
+        self.alive = True; self.writer = None
     def push(self, msg) -> bool:
         if not self.alive: return False
-        try:
-            self.q.put_nowait(msg); return True
-        except asyncio.QueueFull:
-            self.alive = False; return False
-
+        try: self.q.put_nowait(msg); return True
+        except asyncio.QueueFull: self.alive = False; return False
     async def _write(self):
         try:
             while True:
                 msg = await self.q.get()
                 if isinstance(msg, str): await self.ws.send_text(msg)
                 else: await self.ws.send_json(msg)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        finally:
-            self.alive = False
+        except asyncio.CancelledError: raise
+        except Exception: pass
+        finally: self.alive = False
 
 
 class Hub:
     def __init__(self): self.conns: set = set()
-
     async def connect(self, ws, uid):
         await ws.accept()
         c = Conn(ws, uid)
         c.writer = asyncio.create_task(c._write())
-        self.conns.add(c)
-        return c
-
+        self.conns.add(c); return c
     def disconnect(self, c):
         c.alive = False; self.conns.discard(c)
         if c.writer: c.writer.cancel()
-
     async def broadcast(self, msg, uid=None):
         for c in list(self.conns):
             if uid and c.uid != uid: continue
@@ -510,122 +367,429 @@ def wlog(msg):
             asyncio.run_coroutine_threadsafe(
                 HUB.broadcast({"type": "log", "text": entry["text"], "ts": entry["ts"]}),
                 MAIN_LOOP)
-    except Exception:
-        pass
+    except Exception: pass
 
 
-try: bot.log_cb = wlog
-except: pass
+if rb is not None:
+    try: rb.log_cb = wlog
+    except Exception: pass
+if sr is not None:
+    try: sr.log_cb = wlog
+    except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۰) Static
+# ۱۲) STATIC
 # ══════════════════════════════════════════════════════════════
-STATIC = next((c for c in [HERE / "static", HERE.parent / "static",
-                            BOT_DIR / "webapp" / "static", BOT_DIR / "static"]
+STATIC = next((c for c in [HERE / "static", HERE.parent / "static"]
                if c.is_dir() and (c / "login.html").exists()), HERE / "static")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۱) Bot worker thread
+# ۱۳) TELEGRAM Application — یک ربات واحد
+# ══════════════════════════════════════════════════════════════
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                     BotCommand)
+from telegram.constants import ParseMode
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, ApplicationHandlerStop,
+                          filters as tg_filters)
+from telegram.request import HTTPXRequest
+
+TG_APP: Optional[Application] = None
+
+
+def esc(s):
+    return str(s if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def B(label, data): return InlineKeyboardButton(label, callback_data=data)
+def kb_(*rows): return InlineKeyboardMarkup([list(r) for r in rows if r])
+
+
+def authorized(update):
+    try: return update.effective_chat.id == FORCED_OWNER
+    except Exception: return False
+
+
+def mode_selector_kb():
+    return kb_(
+        [B("📱  پنل روبیکا", "mode:rubika")],
+        [B("🌀  پنل سروش",  "mode:soroosh")],
+    )
+
+
+async def _render_mode_selector(cid: int, edit_mid: Optional[int] = None) -> Optional[int]:
+    txt = (
+        "🏠 <b>پنل مدیریت</b>\n"
+        "━━━━━━━━━━━━\n\n"
+        "یک پنل رو انتخاب کن:\n\n"
+        "📱 <b>روبیکا</b> — ارسال، جوینر، کانال، لیسنر\n"
+        "🌀 <b>سروش</b> — ارسال، جوینر، پاسخ خودکار\n"
+    )
+    if edit_mid:
+        try:
+            await TG_APP.bot.edit_message_text(
+                chat_id=cid, message_id=edit_mid, text=txt,
+                reply_markup=mode_selector_kb(),
+                parse_mode="HTML", disable_web_page_preview=True)
+            return edit_mid
+        except Exception: pass
+    try:
+        m = await TG_APP.bot.send_message(
+            chat_id=cid, text=txt, reply_markup=mode_selector_kb(),
+            parse_mode="HTML", disable_web_page_preview=True)
+        return m.message_id
+    except Exception as e:
+        log_print(f"[mode-selector] {type(e).__name__}: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# /start  /menu  /version
+# ══════════════════════════════════════════════════════════════
+async def cmd_start(update, context):
+    cid = update.effective_chat.id
+    if cid != FORCED_OWNER:
+        try: await update.message.reply_text("⛔ خصوصی است.")
+        except Exception: pass
+        return
+    USER_MODE.pop(cid, None)
+    if rb is not None:
+        try: rb.STATE["panel"].pop(cid, None)
+        except Exception: pass
+    if sr is not None:
+        try: sr.STATE["panel"].pop(cid, None)
+        except Exception: pass
+    mid = await _render_mode_selector(cid)
+    if mid:
+        if rb is not None:
+            try: rb.STATE["panel"][cid] = mid
+            except Exception: pass
+        if sr is not None:
+            try: sr.STATE["panel"][cid] = mid
+            except Exception: pass
+
+
+async def cmd_menu(update, context):
+    if not authorized(update): return
+    await cmd_start(update, context)
+
+
+async def cmd_version(update, context):
+    if not authorized(update): return
+    rb_v = getattr(rb, "VERSION", "—") if rb else "—"
+    sr_v = getattr(sr, "VERSION", "—") if sr else "—"
+    txt = (f"🔖 <b>app.py</b>: v20\n"
+           f"📱 <b>روبیکا</b>: {rb_v}\n"
+           f"🌀 <b>سروش</b>: {sr_v}\n"
+           f"👤 <b>مالک</b>: <code>{FORCED_OWNER}</code>\n"
+           f"🌐 <b>Public</b>: {esc(PUBLIC_URL)}\n"
+           f"💻 <b>Bind</b>: {HOST}:{PORT}\n"
+           f"💾 <b>Data</b>: <code>{DATA_DIR}</code>")
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════
+# CALLBACK ROUTER
+# ══════════════════════════════════════════════════════════════
+async def cb_router(update, context):
+    q = update.callback_query
+    if q is None: return
+    try: await q.answer()
+    except Exception: pass
+    if not authorized(update):
+        raise ApplicationHandlerStop
+
+    cid = update.effective_chat.id
+    data = q.data or ""
+
+    if data == "noop":
+        raise ApplicationHandlerStop
+
+    if q.message:
+        if rb is not None:
+            try: rb.STATE["panel"][cid] = q.message.message_id
+            except Exception: pass
+        if sr is not None:
+            try: sr.STATE["panel"][cid] = q.message.message_id
+            except Exception: pass
+
+    # ─── انتخاب پنل ───
+    if data == "mode:rubika":
+        USER_MODE[cid] = "rubika"
+        if rb is None:
+            try:
+                await q.edit_message_text("❌ پنل روبیکا لود نشده.",
+                                           reply_markup=mode_selector_kb())
+            except Exception: pass
+            raise ApplicationHandlerStop
+        try:
+            await rb.show_main()
+        except Exception as e:
+            log_print(f"[rb.show_main] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+        raise ApplicationHandlerStop
+
+    if data == "mode:soroosh":
+        USER_MODE[cid] = "soroosh"
+        if sr is None:
+            try:
+                await q.edit_message_text("❌ پنل سروش لود نشده.",
+                                           reply_markup=mode_selector_kb())
+            except Exception: pass
+            raise ApplicationHandlerStop
+        try:
+            await sr.show_main()
+        except Exception as e:
+            log_print(f"[sr.show_main] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+        raise ApplicationHandlerStop
+
+    # ─── بازگشت به انتخاب پنل ───
+    if data in ("menu:home", "mode:home"):
+        USER_MODE.pop(cid, None)
+        await _render_mode_selector(cid, edit_mid=q.message.message_id)
+        raise ApplicationHandlerStop
+
+    # ─── dispatch ───
+    mode = USER_MODE.get(cid)
+    if mode == "rubika" and rb is not None:
+        try:
+            await rb.route_cb(cid, data)
+        except Exception as e:
+            log_print(f"[rb.route_cb] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+            try:
+                await TG_APP.bot.send_message(
+                    chat_id=cid,
+                    text=f"❌ {esc(type(e).__name__)}: {esc(str(e)[:200])}")
+            except Exception: pass
+        raise ApplicationHandlerStop
+
+    if mode == "soroosh" and sr is not None:
+        try:
+            await sr.route_cb(cid, data)
+        except Exception as e:
+            log_print(f"[sr.route_cb] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+            try:
+                await TG_APP.bot.send_message(
+                    chat_id=cid,
+                    text=f"❌ {esc(type(e).__name__)}: {esc(str(e)[:200])}")
+            except Exception: pass
+        raise ApplicationHandlerStop
+
+    await _render_mode_selector(cid, edit_mid=q.message.message_id)
+    raise ApplicationHandlerStop
+
+
+# ══════════════════════════════════════════════════════════════
+# MESSAGE ROUTER
+# ══════════════════════════════════════════════════════════════
+async def msg_router(update, context):
+    if not authorized(update): return
+    cid = update.effective_chat.id
+    mode = USER_MODE.get(cid)
+
+    if mode == "rubika" and rb is not None:
+        try:
+            await rb.on_message(update, context)
+        except Exception as e:
+            log_print(f"[rb.on_message] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+        return
+
+    if mode == "soroosh" and sr is not None:
+        try:
+            await sr.on_message(update, context)
+        except Exception as e:
+            log_print(f"[sr.on_message] {type(e).__name__}: {e}")
+            import traceback; traceback.print_exc()
+        return
+
+    try:
+        await update.message.reply_text("🏠 اول یک پنل انتخاب کن.\n/start یا /menu")
+    except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════
+# POST INIT
+# ══════════════════════════════════════════════════════════════
+async def on_post_init(app: Application):
+    global TG_APP
+    TG_APP = app
+    if rb is not None: rb.APP = app
+    if sr is not None: sr.APP = app
+
+    log_print("=" * 60)
+    log_print("   🌐 Rubika + Soroosh — Unified Bot (Railway)")
+    log_print(f"   Owner : {FORCED_OWNER}")
+    log_print(f"   Public: {PUBLIC_URL}")
+    log_print(f"   Bind  : {HOST}:{PORT}")
+    log_print(f"   Data  : {DATA_DIR}")
+    log_print(f"   rb bot: {RB_PATH or '—'}")
+    log_print(f"   sr bot: {SR_PATH or '—'}")
+    log_print("=" * 60)
+
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "شروع / انتخاب پنل"),
+            BotCommand("menu", "منوی انتخاب پنل"),
+            BotCommand("version", "نسخه"),
+        ])
+    except Exception: pass
+
+    if rb is not None:
+        try:
+            asyncio.create_task(rb.start_all_listeners())
+            log_print("[rb] listeners scheduled")
+        except Exception as e:
+            log_print(f"[rb listeners] {type(e).__name__}: {e}")
+        try:
+            asyncio.create_task(rb.keepalive_loop())
+            log_print("[rb] keepalive scheduled")
+        except Exception as e:
+            log_print(f"[rb keepalive] {type(e).__name__}: {e}")
+
+    if sr is not None:
+        try:
+            asyncio.create_task(sr.start_all_listeners())
+            log_print("[sr] listeners scheduled")
+        except Exception as e:
+            log_print(f"[sr listeners] {type(e).__name__}: {e}")
+        try:
+            asyncio.create_task(sr.keepalive_loop())
+            log_print("[sr] keepalive scheduled")
+        except Exception as e:
+            log_print(f"[sr keepalive] {type(e).__name__}: {e}")
+        # ★ PV responder
+        try:
+            if hasattr(sr, "start_pv_responders"):
+                asyncio.create_task(sr.start_pv_responders())
+                log_print("[sr] pv-responders scheduled")
+        except Exception as e:
+            log_print(f"[sr pv] {type(e).__name__}: {e}")
+
+    log_print("   ✅ همه listenerها و keepaliveها فعال شدن")
+
+
+async def on_error(update, context):
+    log_print(f"[!] {type(context.error).__name__}: {context.error}")
+
+
+# ══════════════════════════════════════════════════════════════
+# BOT THREAD
 # ══════════════════════════════════════════════════════════════
 _bot_thread: Optional[threading.Thread] = None
 
 
 def _bot_worker():
+    global TG_APP
     log_print("   ربات تلگرام: ⏳ در حال راه‌اندازی polling...")
-    _buf = io.StringIO()
-    with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                _lr = getattr(bot, "_loop_ref", None)
-                if isinstance(_lr, list) and _lr:
-                    _lr[0] = loop
-                else:
-                    bot._loop_ref = [loop]
-            except Exception:
-                pass
-            try: bot.FORCED_OWNER = FORCED_OWNER
-            except Exception: pass
-            try: bot.STATE["owner"] = FORCED_OWNER
-            except Exception: pass
 
-            if callable(getattr(bot, "main", None)):
-                bot.main()
-            else:
-                runpy.run_path(str(BOT_PATH), run_name="__main__")
-        except SystemExit as e:
-            _buf.write(f"[bot] SystemExit: {e}\n")
-        except BaseException as e:
-            _buf.write(f"[bot] CRASH {type(e).__name__}: {e}\n")
-            import traceback as _tb
-            _tb.print_exc(file=_buf)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    if rb is not None:
+        try: rb._loop_ref[0] = loop
+        except Exception: pass
+    if sr is not None:
+        try: sr._loop_ref[0] = loop
+        except Exception: pass
+
+    req = HTTPXRequest(connection_pool_size=8, connect_timeout=30.0,
+                       read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
+    app = (Application.builder()
+           .token(TG_TOKEN)
+           .request(req)
+           .get_updates_request(req)
+           .post_init(on_post_init)
+           .build())
+
+    app.add_handler(CallbackQueryHandler(cb_router), group=-1)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("version", cmd_version))
+    app.add_handler(MessageHandler(
+        tg_filters.ALL & ~tg_filters.COMMAND, msg_router))
+    app.add_error_handler(on_error)
+
+    TG_APP = app
+    if rb is not None: rb.APP = app
+    if sr is not None: sr.APP = app
 
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"\n===== bot exit @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-            f.write(_buf.getvalue())
-    except Exception:
-        pass
-    log_print("   ربات تلگرام: 🔴 DOWN")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            poll_interval=2.0,
+            timeout=30.0,
+        )
+    except SystemExit:
+        log_print("   ربات تلگرام: SystemExit")
+    except BaseException as e:
+        log_print(f"   ربات تلگرام: ❌ {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        log_print("   ربات تلگرام: 🔴 DOWN")
 
 
 def start_bot_thread() -> bool:
     global _bot_thread
     if _bot_thread is not None and _bot_thread.is_alive():
         return False
-    _bot_thread = threading.Thread(target=_bot_worker, daemon=True, name="telegram-bot")
+    _bot_thread = threading.Thread(target=_bot_worker, daemon=True,
+                                    name="telegram-bot")
     _bot_thread.start()
     return True
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۲) FastAPI lifespan
+# LIFESPAN
 # ══════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
-    _ensure_owner_file()
 
-    log_print("=" * 56)
-    log_print("   🌐  Rubika Web Panel  ·  🤖  Telegram Bot")
-    log_print(f"   فایل ربات: {BOT_PATH}")
-    log_print(f"   مالک    : {FORCED_OWNER}")
-    log_print(f"   Data dir : {DATA_DIR}")
-    log_print("=" * 56)
+    log_print("=" * 60)
+    log_print("   🌐  Rubika + Soroosh Web Panel — v20")
+    log_print("=" * 60)
 
-    log_print(f"   پنل وب     : 🟢 UP     0.0.0.0:{PORT}")
     start_bot_thread()
-    await asyncio.sleep(2.5)
+    await asyncio.sleep(2.0)
 
     if _bot_thread and _bot_thread.is_alive():
         log_print("   ربات تلگرام: 🟢 UP     polling فعال")
     else:
-        log_print(f"   ربات تلگرام: ⚠️  بالا نیومد — لاگ: {LOG_FILE}")
+        log_print("   ربات تلگرام: ⚠️  بالا نیومد")
 
-    log_print("-" * 56)
-    log_print("   ✅  هر دو سرویس در حال اجرا هستن")
-    log_print("-" * 56)
+    log_print("-" * 60)
+    log_print(f"   ✅ Public URL:  {PUBLIC_URL}")
+    log_print(f"      Login    :  {PUBLIC_URL}/login")
+    log_print(f"      Dash     :  {PUBLIC_URL}/dash")
+    log_print(f"      Health   :  {PUBLIC_URL}/api/health")
+    log_print(f"      Status   :  {PUBLIC_URL}/api/status")
+    log_print("-" * 60)
+    log_print(f"   🔧 Bind      :  http://{HOST}:{PORT}")
     log_print("")
 
     yield
 
-    log_print("\n   [shutdown] در حال خاموش کردن سرویس‌ها...")
+    log_print("\n   [shutdown] خاموش کردن...")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۳) FastAPI app
+# FastAPI
 # ══════════════════════════════════════════════════════════════
-app = FastAPI(title="Rubika Web Panel", lifespan=lifespan)
+app = FastAPI(title="Rubika + Soroosh Panel", lifespan=lifespan)
 
 if STATIC.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
 import traceback as _tb_global
+
 
 @app.exception_handler(Exception)
 async def _unhandled_handler(request: Request, exc: Exception):
@@ -638,8 +802,7 @@ async def _unhandled_handler(request: Request, exc: Exception):
             f.write(f"\n===== 500 @ {request.method} {request.url.path} =====\n")
             f.write(f"{type(exc).__name__}: {exc}\n")
             f.write(tb)
-    except Exception:
-        pass
+    except Exception: pass
     return JSONResponse(status_code=500, content={
         "error": type(exc).__name__,
         "message": str(exc)[:500],
@@ -648,7 +811,7 @@ async def _unhandled_handler(request: Request, exc: Exception):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۴) Auth helpers
+# AUTH HELPERS
 # ══════════════════════════════════════════════════════════════
 def _get_token(request: Request) -> Optional[str]:
     tok = request.cookies.get("session")
@@ -684,7 +847,7 @@ def _require(req, page):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۵) HTML Pages
+# HTML Pages
 # ══════════════════════════════════════════════════════════════
 @app.get("/")
 async def root(req: Request):
@@ -736,7 +899,7 @@ async def p_logs(request: Request): return _require(request, "logs.html")
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۶) Auth API
+# AUTH API
 # ══════════════════════════════════════════════════════════════
 class LoginReq(BaseModel): telegram_id: int
 class VerifyReq(BaseModel): telegram_id: int; code: str
@@ -749,9 +912,12 @@ async def auth_request(req: LoginReq):
     code = gen_code()
     PENDING[req.telegram_id] = {"code": code, "exp": time.time() + 300, "tries": 0}
     try:
-        await TG.send_message(chat_id=req.telegram_id,
-            text=f"🔐 <b>کد ورود پنل</b>\n\n<code>{code}</code>\n\n<i>۵ دقیقه</i>",
-            parse_mode="HTML")
+        from telegram import Bot as _TGB
+        async with _TGB(token=TG_TOKEN) as tg:
+            await tg.send_message(
+                chat_id=req.telegram_id,
+                text=f"🔐 <b>کد ورود پنل</b>\n\n<code>{code}</code>\n\n<i>۵ دقیقه</i>",
+                parse_mode="HTML")
     except Exception as e:
         raise HTTPException(500, f"ارسال نشد: {e}")
     return {"ok": True}
@@ -773,8 +939,9 @@ async def auth_verify(req: VerifyReq, response: Response):
     token = secrets.token_urlsafe(32)
     SESSIONS[token] = {"uid": req.telegram_id, "exp": time.time() + 7 * 86400}
     save_sessions()
+    # ★ روی HTTPS (Railway) کوکی secure می‌ذاریم
     response.set_cookie("session", token, httponly=True, samesite="lax",
-                        secure=True, path="/", max_age=7 * 86400)
+                        secure=IS_HTTPS, path="/", max_age=7 * 86400)
     return {"ok": True, "token": token}
 
 
@@ -793,977 +960,40 @@ async def me(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۱۷) Rubika client manager
+# HEALTH / STATUS
 # ══════════════════════════════════════════════════════════════
-CLIENTS: Dict[str, Dict[str, Any]] = {}
-_LOCKS: Dict[str, asyncio.Lock] = {}
-CLIENT_RECENT_SEC = 120
-CLIENT_HC_TIMEOUT = 15.0
+@app.get("/api/health")
+async def api_health():
+    return {
+        "ok": True,
+        "version": "v20",
+        "owner": FORCED_OWNER,
+        "rubika_loaded": rb is not None,
+        "soroosh_loaded": sr is not None,
+        "bot_alive": bool(_bot_thread and _bot_thread.is_alive()),
+        "host": HOST,
+        "port": PORT,
+        "public_url": PUBLIC_URL,
+        "railway": IS_RAILWAY,
+        "data_dir": str(DATA_DIR),
+    }
 
 
-def _lock_for(aid: str) -> asyncio.Lock:
-    l = _LOCKS.get(aid)
-    if l is None:
-        l = asyncio.Lock()
-        _LOCKS[aid] = l
-    return l
-
-
-def _cli_alive(cli) -> bool:
-    for attr in ("session", "_session", "http_session", "aiohttp_session"):
-        s = getattr(cli, attr, None)
-        if s is None: continue
-        closed = getattr(s, "closed", None)
-        if closed is not None: return not closed
-    return True
-
-
-def _is_dead_session_error(e) -> bool:
-    s = str(e).lower()
-    return any(k in s for k in (
-        "session is closed", "connector is closed",
-        "client session has been closed", "cannot connect",
-        "connection reset", "server disconnected",
-        "event loop is closed", "unclosed client session",
-        "invalid_auth", "invalid auth", "not_registered",
-        "auth_dead", "unauthorized", "auth_invalid",
-    ))
-
-
-# ★★★ v17: fix KeyError 'auth' — rubpy v7 only needs name (reads .rp)
-async def _make_client(aid: str):
-    acc = bot.get_account(aid)
-    if not acc:
-        raise HTTPException(404, "اکانت نیست")
-
-    sess = acc.get("session_name")
-    if not sess:
-        raise HTTPException(400, f"session_name روی اکانت {aid} ست نشده")
-
-    # rubpy v7+ همه چیز (auth, private_key, ...) رو از فایل {name}.rp می‌خونه
-    # پس فقط name کافیه. اگه SafeClient _aid رو قبول نکرد، بدون اون بساز.
-    try:
-        cli = bot.SafeClient(name=sess, _aid=aid)
-    except TypeError:
-        cli = bot.SafeClient(name=sess)
-
-    try:
-        await cli.__aenter__()
-    except RuntimeError as er:
-        raise HTTPException(401, f"AUTH_DEAD: {str(er)[:150]}")
-    return cli
-
-
-async def _safe_exit(cli):
-    try: await cli.__aexit__(None, None, None)
+@app.get("/api/status")
+async def api_status(uid: int = Depends(get_uid)):
+    rb_accs = 0; sr_accs = 0
+    try: rb_accs = len(rb.list_accounts()) if rb else 0
     except Exception: pass
-
-
-async def get_client(aid: str):
-    now = time.time()
-    entry = CLIENTS.get(aid)
-    if entry and _cli_alive(entry["cli"]):
-        if (now - entry["ts"]) < CLIENT_RECENT_SEC:
-            return entry["cli"]
-
-    async with _lock_for(aid):
-        entry = CLIENTS.get(aid)
-        if entry and _cli_alive(entry["cli"]):
-            age = time.time() - entry["ts"]
-            if age < CLIENT_RECENT_SEC:
-                return entry["cli"]
-            try:
-                await asyncio.wait_for(entry["cli"].get_me(), timeout=CLIENT_HC_TIMEOUT)
-                entry["ts"] = time.time()
-                return entry["cli"]
-            except asyncio.TimeoutError:
-                entry["ts"] = time.time()
-                return entry["cli"]
-            except Exception as e:
-                estr = str(e).lower()
-                if (_is_dead_session_error(e) or "invalid_auth" in estr
-                        or "not_registered" in estr or "invalid auth" in estr):
-                    CLIENTS.pop(aid, None)
-                    try:
-                        asyncio.get_running_loop().create_task(_safe_exit(entry["cli"]))
-                    except RuntimeError:
-                        pass
-                    raise HTTPException(401, "AUTH_DEAD: session expired, relogin needed")
-                else:
-                    entry["ts"] = time.time()
-                    return entry["cli"]
-
-        cli = await _make_client(aid)
-        CLIENTS[aid] = {"cli": cli, "ts": time.time()}
-        return cli
-
-
-async def get_client_cached(aid: str):
-    entry = CLIENTS.get(aid)
-    if entry and _cli_alive(entry["cli"]):
-        return entry["cli"]
-    return None
-
-
-async def drop_client(aid: str):
-    _CHAT_LIST_CACHE.pop(aid, None)
-    async with _lock_for(aid):
-        entry = CLIENTS.pop(aid, None)
-    if entry:
-        try: await entry["cli"].__aexit__(None, None, None)
-        except Exception: pass
-
-
-def invalidate_client(aid: str):
-    entry = CLIENTS.pop(aid, None)
-    if entry:
-        try:
-            asyncio.get_running_loop().create_task(_safe_exit(entry["cli"]))
-        except RuntimeError:
-            pass
-
-
-_MY_GUID: Dict[str, str] = {}
-_MY_GUID_LOCKS: Dict[str, asyncio.Lock] = {}
-
-
-async def get_my_guid(aid: str) -> Optional[str]:
-    if aid in _MY_GUID: return _MY_GUID[aid]
-    lock = _MY_GUID_LOCKS.setdefault(aid, asyncio.Lock())
-    async with lock:
-        if aid in _MY_GUID: return _MY_GUID[aid]
-        try:
-            cli = await get_client(aid)
-            me_ = await cli.get_me()
-            g = me_.user.user_guid
-            _MY_GUID[aid] = g
-            return g
-        except Exception:
-            return None
-
-
-_CHAT_LIST_CACHE: Dict[str, Dict[str, Any]] = {}
-CHAT_LIST_TTL = 180
-_ACCOUNT_IDS_CACHE = {"data": set(), "ts": 0.0}
-
-
-def _account_ids_cached():
-    now = time.time()
-    if now - _ACCOUNT_IDS_CACHE["ts"] > 5:
-        try: _ACCOUNT_IDS_CACHE["data"] = set(bot.list_accounts().keys())
-        except Exception: pass
-        _ACCOUNT_IDS_CACHE["ts"] = now
-    return _ACCOUNT_IDS_CACHE["data"]
-
-
-# ══════════════════════════════════════════════════════════════
-# ۱۸) Accounts API
-# ══════════════════════════════════════════════════════════════
-@app.get("/api/accounts")
-async def api_accounts(uid: int = Depends(get_uid)):
-    out = []
-    for aid, a in bot.list_accounts().items():
-        out.append({"id": aid, "name": a.get("name"), "phone": a.get("phone"),
-                    "user_guid": a.get("user_guid"), "created": a.get("created", 0),
-                    "channels_count": len(a.get("channels", []))})
-    return {"accounts": out}
-
-
-class AddAccReq(BaseModel): phone: str
-
-
-@app.post("/api/accounts/add")
-async def api_acc_add(req: AddAccReq, uid: int = Depends(get_uid)):
-    p = req.phone.replace("+", "").replace(" ", "").replace("-", "")
-    if p.startswith("0"): p = "98" + p[1:]
-    if not p.isdigit() or len(p) < 10: raise HTTPException(400, "شماره نامعتبر")
-    try: ctx = await bot.rubika_send_code(p)
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    LOGIN_CTX[uid] = ctx
-    st = ctx.get("status")
-    return {"ok": True, "need_passkey": st == "SendPassKey",
-            "hint": ctx.get("hint"), "status": st}
-
-
-class VerifyAccReq(BaseModel): code: str = ""; pass_key: Optional[str] = None
-
-
-@app.post("/api/accounts/verify")
-async def api_acc_verify(req: VerifyAccReq, uid: int = Depends(get_uid)):
-    ctx = LOGIN_CTX.get(uid)
-    if not ctx: raise HTTPException(400, "اول شماره رو بفرست")
-    if req.pass_key:
-        try:
-            res = await ctx["client"].send_code(phone_number=ctx["phone"], pass_key=req.pass_key)
-            if getattr(res, "status", None) != "OK": raise HTTPException(400, "رمز غلط")
-            ctx["phone_code_hash"] = res.phone_code_hash
-        except HTTPException: raise
-        except Exception as e: raise HTTPException(400, bot._fmt_error(e))
-        return {"ok": True, "step": "code"}
-    try: res = await bot.rubika_complete_login(ctx, req.code)
-    except Exception as e: raise HTTPException(400, bot._fmt_error(e))
-    if not res.get("ok"): raise HTTPException(400, f"کد اشتباه ({res.get('status')})")
-    LOGIN_CTX.pop(uid, None)
-    _MY_GUID.pop(res["aid"], None)
-    _ACCOUNT_IDS_CACHE["ts"] = 0
-    wlog(f"✅ اکانت جدید: {res['name']}")
-    return {"ok": True, "aid": res["aid"], "name": res["name"]}
-
-
-@app.delete("/api/accounts/{aid}")
-async def api_acc_del(aid: str, uid: int = Depends(get_uid)):
-    await drop_client(aid); bot.remove_account(aid); _MY_GUID.pop(aid, None)
-    _ACCOUNT_IDS_CACHE["ts"] = 0
-    return {"ok": True}
-
-
-@app.post("/api/accounts/{aid}/relogin")
-async def api_acc_relogin(aid: str, uid: int = Depends(get_uid)):
-    a = bot.get_account(aid)
-    if not a: raise HTTPException(404, "اکانت نیست")
-    try: ctx = await bot.rubika_send_code(a["phone"])
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    LOGIN_CTX[uid] = ctx
-    return {"ok": True, "need_passkey": ctx.get("status") == "SendPassKey",
-            "hint": ctx.get("hint")}
-
-
-@app.get("/api/accounts/{aid}/profile")
-async def api_profile(aid: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    p = await bot.rubika_get_my_profile(cli)
-    try:
-        me_ = await cli.get_me(); p["user_guid"] = me_.user.user_guid
+    try: sr_accs = len(sr.list_accounts()) if sr else 0
     except Exception: pass
-    return p
-
-
-class ProfileReq(BaseModel):
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    bio: Optional[str] = None
-    username: Optional[str] = None
-
-
-@app.post("/api/accounts/{aid}/profile")
-async def api_profile_upd(aid: str, req: ProfileReq, uid: int = Depends(get_uid)):
-    cli = await get_client(aid); results = []
-    if req.first_name is not None:
-        ok, info = await bot.rubika_set_name(cli, req.first_name, req.last_name or "")
-        results.append({"field": "name", "ok": ok, "info": str(info)[:200]})
-        if ok: bot.update_account_field(aid, "name", req.first_name)
-    if req.bio is not None:
-        ok, info = await bot.rubika_set_bio(cli, req.bio)
-        results.append({"field": "bio", "ok": ok, "info": str(info)[:200]})
-    if req.username:
-        ok, info = await bot.rubika_set_username(cli, req.username.strip())
-        results.append({"field": "username", "ok": ok, "info": str(info)[:200]})
-    return {"results": results}
-
-
-@app.get("/api/accounts/{aid}/chats")
-async def api_chats(aid: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try:
-        raw = await bot.get_all_chats_raw(cli)
-        me_ = await cli.get_me(); my = me_.user.user_guid
-        pv = [c for c in raw if c["type"] == "User" and c["guid"] != my and not c["is_blocked"]]
-        gr = [c for c in raw if c["type"] == "Group"]
-        ch = [c for c in raw if c["type"] == "Channel"]
-        return {"pv": pv, "groups": gr, "channels": ch, "total": len(raw)}
-    except Exception as e:
-        if _is_dead_session_error(e): invalidate_client(aid)
-        raise HTTPException(500, bot._fmt_error(e))
-
-
-@app.get("/api/accounts/{aid}/chat-list")
-async def api_chat_list(aid: str, force: bool = False, uid: int = Depends(get_uid)):
-    now = time.time()
-    c = _CHAT_LIST_CACHE.get(aid)
-    if c and not force and (now - c["ts"]) < CHAT_LIST_TTL:
-        return c["data"]
-
-    cli = await get_client(aid)
-    try:
-        raw = await bot.get_all_chats_raw(cli)
-        me_ = await cli.get_me()
-        my = me_.user.user_guid
-        _MY_GUID[aid] = my
-
-        for x in raw:
-            t = (x.get("type") or "").lower()
-            if t == "user":     x["type"] = "User"
-            elif t == "group":  x["type"] = "Group"
-            elif t == "channel":x["type"] = "Channel"
-            elif t == "bot":    x["type"] = "Bot"
-            elif t == "service":x["type"] = "Service"
-
-        sem = asyncio.Semaphore(12)
-
-        async def fetch_last(x):
-            async with sem:
-                try:
-                    msgs = await bot.fetch_messages(cli, x["guid"], 1, my)
-                    if msgs:
-                        m = msgs[0] or {}
-                        t = m.get("time") or 0
-                        try: t = int(t)
-                        except: t = 0
-                        if t > 1_000_000_000_000: t //= 1000
-                        return {**x, "last_text": (m.get("text") or "")[:140],
-                                "last_time": t,
-                                "last_is_mine": bool(m.get("is_mine")),
-                                "last_type": m.get("type") or "Text"}
-                except Exception:
-                    pass
-                return {**x, "last_text": "", "last_time": 0,
-                        "last_is_mine": False, "last_type": ""}
-
-        enriched = list(await asyncio.gather(*[fetch_last(x) for x in raw]))
-        enriched.sort(key=lambda y: y.get("last_time") or 0, reverse=True)
-
-        pv, gr, ch, bots = [], [], [], []
-        for y in enriched:
-            t = y.get("type") or ""
-            g = y.get("guid") or ""
-            if g == my: continue
-            if t == "User":
-                if y.get("is_blocked"): continue
-                pv.append(y)
-            elif t == "Group":   gr.append(y)
-            elif t == "Channel": ch.append(y)
-            elif t in ("Bot", "Service"): bots.append(y)
-
-        data = {"pv": pv, "groups": gr, "channels": ch, "bots": bots,
-                "total": len(enriched)}
-        _CHAT_LIST_CACHE[aid] = {"ts": now, "data": data}
-        return data
-    except Exception as e:
-        if _is_dead_session_error(e): invalidate_client(aid)
-        raise HTTPException(500, bot._fmt_error(e))
-
-
-@app.get("/api/accounts/{aid}/chats/{guid}/info")
-async def api_chat_info(aid: str, guid: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try:
-        info = None
-        for m in ("get_chat_info", "getChatInfo", "get_object_info",
-                  "getObjectInfo", "get_channel_info", "getChannelInfo"):
-            fn = getattr(cli, m, None)
-            if not fn: continue
-            try:
-                for kwargs in ({"object_guid": guid}, {"chat_id": guid}):
-                    try:
-                        r = fn(**kwargs)
-                        if asyncio.iscoroutine(r): r = await r
-                        if r: info = r; break
-                    except TypeError: continue
-                if info: break
-            except Exception: continue
-        if not info:
-            raw = await bot.get_all_chats_raw(cli)
-            info = next((c for c in raw if c["guid"] == guid), {})
-        g = lambda *ks, d=None: bot._g(info, *ks, default=d)
-        return {"guid": guid,
-                "title": g("first_name", "firstName", "title", "name") or "",
-                "username": g("username", "user_name") or "",
-                "bio": g("bio", "about", "description") or "",
-                "type": g("type") or "", "phone": g("phone") or "",
-                "avatar": g("avatar", "avatar_url", "avatarUrl", "profile_photo",
-                            "profilePhoto", "photo", "photo_url") or ""}
-    except Exception as e:
-        raise HTTPException(500, bot._fmt_error(e))
-
-
-# ══════════════════════════════════════════════════════════════
-# ۱۹) Messages
-# ══════════════════════════════════════════════════════════════
-async def _bot_fetch(cli, guid, limit, my, **kw):
-    try: return await bot.fetch_messages(cli, guid, limit, my, **kw)
-    except TypeError: return None
-
-
-def _inc_id(mid: str) -> str:
-    try: return str(int(mid) + 1)
-    except (TypeError, ValueError): return mid
-
-
-def _attach_reply_previews(msgs):
-    by_id = {str(m.get("id") or ""): m for m in msgs if m.get("id")}
-    for m in msgs:
-        rid = m.get("reply_to_message_id") or m.get("reply_to")
-        if rid is None: continue
-        p = by_id.get(str(rid))
-        if not p: continue
-        m["reply_preview"] = {
-            "id": str(rid), "text": (p.get("text") or "")[:120],
-            "sender": p.get("sender") or ("شما" if p.get("is_mine") else ""),
-            "type": p.get("type") or "Text"}
-
-
-def _mtime(m):
-    try: t = int(m.get("time") or 0)
-    except Exception: t = 0
-    return t // 1000 if t > 1_000_000_000_000 else t
-
-
-async def _fetch_before(cli, guid, before_id, limit, my):
-    last_err = None
-    for anchor in (before_id, _inc_id(before_id)):
-        for kw in ({"max_id": anchor}, {"from_max_id": anchor},
-                   {"before_id": anchor}, {"offset_id": anchor}):
-            try: r = await _bot_fetch(cli, guid, limit, my, **kw)
-            except HTTPException: raise
-            except Exception as e: last_err = e; continue
-            if r is not None: return r
-    if last_err: raise last_err
-    raise HTTPException(501, "fetch_messages: max_id پشتیبانی نمی‌شود")
-
-
-async def _fetch_after(cli, guid, mid, limit, my):
-    for anchor in (mid, _inc_id(mid)):
-        for kw in ({"min_id": anchor}, {"from_min_id": anchor}, {"after_id": anchor}):
-            try: r = await _bot_fetch(cli, guid, limit, my, **kw)
-            except Exception: continue
-            if r is not None: return r
-    return None
-
-
-async def _fetch_around(cli, guid, mid, limit, my):
-    half = max(limit // 2, 5)
-    older = await _fetch_before(cli, guid, mid, half + 2, my)
-    try: newer = await _fetch_after(cli, guid, mid, half + 2, my)
-    except Exception: newer = None
-    combined = list(reversed(older or [])) + (newer or [])
-    combined.sort(key=_mtime)
-    seen, out = set(), []
-    for m in combined:
-        i = str(m.get("id") or "")
-        if i and i in seen: continue
-        if i: seen.add(i)
-        out.append(m)
-    if len(out) > limit:
-        idx = next((i for i, m in enumerate(out)
-                    if str(m.get("id") or "") == str(mid)), len(out) // 2)
-        start = max(0, idx - limit // 2)
-        end = start + limit
-        if end > len(out): end = len(out); start = max(0, end - limit)
-        out = out[start:end]
-    return out
-
-
-@app.get("/api/accounts/{aid}/chats/{guid}/messages")
-async def api_chat_msgs(aid: str, guid: str, limit: int = 30,
-                        before_id: Optional[str] = None,
-                        around: Optional[str] = None,
-                        uid: int = Depends(get_uid)):
-    import traceback as _tb
-    cli = await get_client(aid)
-    my = _MY_GUID.get(aid) or await get_my_guid(aid)
-    limit = max(1, min(int(limit), 100))
-    try:
-        if around:
-            try:
-                msgs = await _fetch_around(cli, guid, str(around), limit, my)
-                if msgs:
-                    _attach_reply_previews(msgs)
-                    return {"messages": msgs, "has_more": False, "around": True}
-            except Exception as e:
-                if _is_dead_session_error(e): invalidate_client(aid)
-                log_print(f"[msgs] around failed: {type(e).__name__}: {e}")
-                log_print(_tb.format_exc())
-            try:
-                msgs = await bot.fetch_messages(cli, guid, limit, my)
-                _attach_reply_previews(msgs)
-                return {"messages": msgs, "has_more": True, "around_failed": True}
-            except Exception as e2:
-                if _is_dead_session_error(e2): invalidate_client(aid)
-                log_print(f"[msgs] around-fallback failed: {type(e2).__name__}: {e2}")
-                log_print(_tb.format_exc())
-                raise HTTPException(500, f"{type(e2).__name__}: {str(e2)[:300]}")
-        if before_id:
-            try:
-                msgs = await _fetch_before(cli, guid, str(before_id), limit, my)
-            except Exception as e:
-                if _is_dead_session_error(e): invalidate_client(aid)
-                log_print(f"[msgs] before_id failed aid={aid} guid={guid} before={before_id}")
-                log_print(f"[msgs] {type(e).__name__}: {e}")
-                log_print(_tb.format_exc())
-                raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
-        else:
-            try:
-                msgs = await bot.fetch_messages(cli, guid, limit, my)
-            except Exception as e:
-                if _is_dead_session_error(e): invalidate_client(aid)
-                log_print(f"[msgs] fetch failed aid={aid} guid={guid} limit={limit}")
-                log_print(f"[msgs] {type(e).__name__}: {e}")
-                log_print(_tb.format_exc())
-                raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
-        has_more = len(msgs) >= limit
-        _attach_reply_previews(msgs)
-        return {"messages": msgs, "has_more": has_more}
-    except HTTPException: raise
-    except Exception as e:
-        if _is_dead_session_error(e): invalidate_client(aid)
-        log_print(f"[msgs] outer failed: {type(e).__name__}: {e}")
-        log_print(_tb.format_exc())
-        raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
-
-
-# ══════════════════════════════════════════════════════════════
-# ★ DEBUG endpoint
-# ══════════════════════════════════════════════════════════════
-@app.get("/api/debug/messages/{aid}/{guid}")
-async def api_debug_messages(aid: str, guid: str, uid: int = Depends(get_uid)):
-    import traceback as _tb
-    import inspect as _ins
-    steps = []
-
-    try:
-        cli = await get_client(aid)
-        steps.append({"step": "get_client", "ok": True})
-    except HTTPException as e:
-        return {"failed_at": "get_client", "code": e.status_code,
-                "detail": str(e.detail), "steps": steps}
-    except Exception as e:
-        return {"failed_at": "get_client", "code": 500,
-                "detail": f"{type(e).__name__}: {e}",
-                "traceback": _tb.format_exc()[:2000],
-                "steps": steps}
-
-    my = None
-    try:
-        me = await cli.get_me()
-        my = me.user.user_guid
-        steps.append({"step": "get_me", "ok": True, "my_guid": my})
-    except Exception as e:
-        steps.append({"step": "get_me", "ok": False,
-                      "error": f"{type(e).__name__}: {str(e)[:300]}"})
-
-    has_gm = hasattr(cli, "get_messages") and callable(getattr(cli, "get_messages", None))
-    steps.append({"step": "has_get_messages", "ok": has_gm})
-
-    if not has_gm:
-        candidates = [a for a in dir(cli)
-                      if not a.startswith("_") and "message" in a.lower()]
-        return {"failed_at": "no_get_messages", "code": 500,
-                "detail": "متد get_messages روی rubpy پیدا نشد",
-                "available_methods_with_message": candidates[:50],
-                "steps": steps}
-
-    fn = getattr(cli, "get_messages")
-    try:
-        sig = str(_ins.signature(fn))
-        steps.append({"step": "get_messages_signature", "ok": True, "signature": sig})
-    except Exception as e:
-        steps.append({"step": "get_messages_signature", "ok": False,
-                      "error": str(e)[:200]})
-
-    combos = [
-        {"desc": "positional (guid, '0', '30', 'FromMax')",
-         "call": lambda: fn(guid, "0", "30", "FromMax")},
-        {"desc": "positional (guid, 0, 30, 'FromMax')",
-         "call": lambda: fn(guid, 0, 30, "FromMax")},
-        {"desc": "kwargs (object_guid, message_id, sort)",
-         "call": lambda: fn(object_guid=guid, message_id="0", sort="FromMax")},
-        {"desc": "kwargs (object_guid, from_max_id)",
-         "call": lambda: fn(object_guid=guid, from_max_id="0")},
-        {"desc": "kwargs (chat_id, message_id, sort)",
-         "call": lambda: fn(chat_id=guid, message_id="0", sort="FromMax")},
-    ]
-
-    combo_results = []
-    for c in combos:
-        try:
-            r = c["call"]()
-            if asyncio.iscoroutine(r): r = await r
-            combo_results.append({"try": c["desc"], "ok": True,
-                                   "type": type(r).__name__,
-                                   "sample_keys": list(r.keys())[:10] if isinstance(r, dict) else None,
-                                   "sample_str": str(r)[:200]})
-            break
-        except TypeError as e:
-            combo_results.append({"try": c["desc"], "ok": False,
-                                   "error": f"TypeError: {str(e)[:200]}"})
-        except Exception as e:
-            combo_results.append({"try": c["desc"], "ok": False,
-                                   "error": f"{type(e).__name__}: {str(e)[:200]}"})
-
-    steps.append({"step": "try_get_messages_combos", "results": combo_results})
-
-    try:
-        msgs = await bot.fetch_messages(cli, guid, 30, my)
-        steps.append({"step": "fetch_messages", "ok": True,
-                      "count": len(msgs) if msgs else 0,
-                      "first": (msgs[0] if msgs else None)})
-    except Exception as e:
-        steps.append({"step": "fetch_messages", "ok": False,
-                      "error": f"{type(e).__name__}: {str(e)[:300]}",
-                      "traceback": _tb.format_exc()[:1500]})
-
-    return {"ok": True, "steps": steps}
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۰) Send / Edit / Delete / Forward
-# ══════════════════════════════════════════════════════════════
-class SendReq(BaseModel): target: str; text: str
-
-
-@app.post("/api/accounts/{aid}/send")
-async def api_send(aid: str, req: SendReq, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try: await bot.send_text(cli, req.target, req.text)
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"ok": True}
-
-
-def _err_text(e):
-    return getattr(e, "detail", None) or bot._fmt_error(e)
-
-
-def _mid(m):
-    v = m.get("id")
-    return str(v) if v not in (None, "") else None
-
-
-async def _call(cli, names, variants):
-    last = None
-    for n in names:
-        fn = getattr(cli, n, None)
-        if not fn: continue
-        for kw in variants:
-            try:
-                r = fn(**kw)
-                if asyncio.iscoroutine(r): r = await r
-                return r
-            except TypeError as e:
-                last = e; continue
-    if last: raise HTTPException(501, f"آرگومان‌ها سازگار نیست: {last}")
-    raise HTTPException(501, "پشتیبانی نمی‌شود")
-
-
-def _extract_mid(res):
-    for path in (("message_update", "message_id"), ("message_id",),
-                 ("message", "message_id"), ("id",)):
-        o = res
-        for k in path:
-            o = o.get(k) if isinstance(o, dict) else getattr(o, k, None)
-            if o is None: break
-        if o: return str(o)
-    return None
-
-
-async def _last_mid(cli, guid):
-    try:
-        msgs = await bot.fetch_messages(cli, guid, 1)
-        return _mid(msgs[0]) if msgs else None
-    except Exception:
-        return None
-
-
-class SendMsgReq(BaseModel):
-    text: str
-    reply_to: Optional[str] = None
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/messages")
-async def api_msg_send(aid: str, guid: str, req: SendMsgReq, uid: int = Depends(get_uid)):
-    text = req.text.strip()
-    if not text: raise HTTPException(400, "پیام خالی است")
-    if len(text) > 4096: raise HTTPException(400, "پیام بیش از ۴۰۹۶ کاراکتر")
-    cli = await get_client(aid); mid = None
-    try:
-        if req.reply_to:
-            res = await _call(cli, ["send_message", "sendMessage"], [
-                {"object_guid": guid, "text": text, "reply_to_message_id": req.reply_to},
-                {"chat_id": guid, "text": text, "reply_to_message_id": req.reply_to}])
-            mid = _extract_mid(res)
-        else:
-            r = cli.send_message(guid, text)
-            if asyncio.iscoroutine(r): r = await r
-            mid = _extract_mid(r)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"ok": True, "id": mid}
-
-
-class EditMsgReq(BaseModel): text: str
-
-
-@app.put("/api/accounts/{aid}/chats/{guid}/messages/{mid}")
-async def api_msg_edit(aid: str, guid: str, mid: str, req: EditMsgReq,
-                       uid: int = Depends(get_uid)):
-    text = req.text.strip()
-    if not text: raise HTTPException(400, "پیام خالی است")
-    cli = await get_client(aid)
-    try:
-        await _call(cli, ["edit_message", "editMessage"], [
-            {"object_guid": guid, "message_id": mid, "text": text},
-            {"chat_id": guid, "message_id": mid, "text": text}])
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    f = FEEDS.get((aid, guid))
-    if f and mid in f.snap: f.snap[mid] = {**f.snap[mid], "text": text}
-    return {"ok": True}
-
-
-@app.delete("/api/accounts/{aid}/chats/{guid}/messages/{mid}")
-async def api_msg_del(aid: str, guid: str, mid: str, for_all: bool = True,
-                      uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    t = "Global" if for_all else "Local"
-    try:
-        await _call(cli, ["delete_messages", "deleteMessages"], [
-            {"object_guid": guid, "message_ids": [mid], "type": t},
-            {"chat_id": guid, "message_ids": [mid], "type": t}])
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    f = FEEDS.get((aid, guid))
-    if f: f.snap.pop(mid, None)
-    feed_emit(aid, guid, {"type": "deleted_messages", "ids": [mid]})
-    return {"ok": True}
-
-
-class ForwardReq(BaseModel):
-    to: str
-    message_ids: List[str]
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/forward")
-async def api_msg_forward(aid: str, guid: str, req: ForwardReq,
-                          uid: int = Depends(get_uid)):
-    if not req.message_ids: raise HTTPException(400, "پیامی انتخاب نشده")
-    cli = await get_client(aid)
-    try:
-        await _call(cli, ["forward_messages", "forwardMessages"], [
-            {"from_object_guid": guid, "message_ids": req.message_ids, "to_object_guid": req.to},
-            {"from_chat_id": guid, "message_ids": req.message_ids, "to_chat_id": req.to}])
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"ok": True}
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/file")
-async def api_send_file(aid: str, guid: str, file: UploadFile = File(...),
-                        caption: str = Form(""), uid: int = Depends(get_uid)):
-    data = await file.read()
-    if not data: raise HTTPException(400, "فایل خالی است")
-    if len(data) > 50 * 1024 * 1024: raise HTTPException(413, "حجم بیش از ۵۰ مگابایت")
-    cli = await get_client(aid)
-    suffix = Path(file.filename or "file").suffix
-    fd, tmp = tempfile.mkstemp(suffix=suffix)
-    try:
-        with os.fdopen(fd, "wb") as f: f.write(data)
-        is_img = (file.content_type or "").startswith("image/")
-        names = (["send_photo"] if is_img else []) + ["send_document", "send_file"]
-        variants = []
-        for key in (("photo",) if is_img else ()) + ("document", "file"):
-            variants.append({"object_guid": guid, key: tmp, "caption": caption})
-            variants.append({"chat_id": guid, key: tmp, "caption": caption})
-        await _call(cli, names, variants)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    finally:
-        try: os.remove(tmp)
-        except Exception: pass
-    return {"ok": True}
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/seen")
-async def api_seen(aid: str, guid: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    await _mark_seen(cli, guid)
-    return {"ok": True}
-
-
-async def _mark_seen(cli, guid, mid=None):
-    try:
-        mid = mid or await _last_mid(cli, guid)
-        if not mid: return
-        await _call(cli, ["seen_chats", "seenChats"], [{"seen_list": {guid: mid}}])
-    except Exception: pass
-
-
-async def _send_activity(aid, guid):
-    try:
-        cli = await get_client(aid)
-        await _call(cli, ["send_chat_activity", "sendChatActivity"], [
-            {"object_guid": guid, "activity": "Typing"},
-            {"chat_id": guid, "activity": "Typing"}])
-    except Exception:
-        pass
-
-
-class ChatOpReq(BaseModel): type: str = "User"
-
-
-async def _leave(cli, guid, typ):
-    if typ == "Group":
-        await _call(cli, ["leave_group", "leaveGroup"],
-                    [{"group_guid": guid}, {"object_guid": guid}, {"chat_id": guid}])
-    elif typ == "Channel":
-        await _call(cli, ["join_channel_action", "joinChannelAction"], [
-            {"channel_guid": guid, "action": "Leave"},
-            {"object_guid": guid, "action": "Leave"}])
-    else:
-        raise HTTPException(400, "فقط گروه و کانال")
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/leave")
-async def api_chat_leave(aid: str, guid: str, req: ChatOpReq,
-                        uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try: await _leave(cli, guid, req.type)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"ok": True}
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/clear")
-async def api_chat_clear(aid: str, guid: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    last = await _last_mid(cli, guid)
-    if not last: return {"ok": True}
-    try:
-        await _call(cli, ["delete_chat_history", "deleteChatHistory"], [
-            {"object_guid": guid, "last_message_id": last},
-            {"chat_id": guid, "last_message_id": last}])
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    feed_emit(aid, guid, {"type": "cleared"})
-    return {"ok": True}
-
-
-@app.post("/api/accounts/{aid}/chats/{guid}/remove")
-async def api_chat_remove(aid: str, guid: str, req: ChatOpReq,
-                          uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try:
-        if req.type == "User":
-            last = await _last_mid(cli, guid)
-            await _call(cli, ["delete_user_chat", "deleteUserChat"], [
-                {"user_guid": guid, "last_deleted_message_id": last},
-                {"object_guid": guid, "last_deleted_message_id": last}])
-        else:
-            await _leave(cli, guid, req.type)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"ok": True}
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۱) Channels basic
-# ══════════════════════════════════════════════════════════════
-@app.get("/api/accounts/{aid}/channels")
-async def api_channels(aid: str, uid: int = Depends(get_uid)):
-    a = bot.get_account(aid)
-    if not a: raise HTTPException(404, "اکانت نیست")
-    return {"channels": a.get("channels", [])}
-
-
-@app.get("/api/accounts/{aid}/collect/{kind}")
-async def api_collect(aid: str, kind: str, uid: int = Depends(get_uid)):
-    cli = await get_client(aid)
-    try:
-        if kind == "pv": items = await bot.collect_pv(cli)
-        elif kind == "groups": items = await bot.collect_groups(cli)
-        else: raise HTTPException(400, "kind باید pv یا groups")
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(500, bot._fmt_error(e))
-    return {"items": items}
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۲) Settings / Queue / Reports / Job
-# ══════════════════════════════════════════════════════════════
-@app.get("/api/settings")
-async def api_cfg(uid: int = Depends(get_uid)):
-    return bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-
-
-class CfgReq(BaseModel):
-    message: Optional[str] = None
-    delay: Optional[float] = None
-    cooldown: Optional[float] = None
-    max_parallel: Optional[int] = None
-    batch_per_account: Optional[int] = None
-    max_attempts: Optional[int] = None
-    max_channels_per_account: Optional[int] = None
-    channels: Optional[List[str]] = None
-
-
-@app.post("/api/settings")
-async def api_cfg_upd(req: CfgReq, uid: int = Depends(get_uid)):
-    cfg = bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-    for k, v in pyd_dict(req, exclude_none=True).items(): cfg[k] = v
-    bot._save(bot.CFG_FILE, cfg)
-    return {"ok": True, "cfg": cfg}
-
-
-@app.get("/api/queue")
-async def api_q(uid: int = Depends(get_uid)):
-    return bot.TaskQueue(bot.QUEUE_FILE).stats()
-
-
-@app.get("/api/queue/tasks")
-async def api_q_tasks(status: Optional[str] = None, uid: int = Depends(get_uid)):
-    q = bot.TaskQueue(bot.QUEUE_FILE); tasks = q.tasks
-    if status: tasks = [t for t in tasks if t["status"] == status]
-    return {"tasks": tasks[-500:]}
-
-
-@app.post("/api/queue/clear")
-async def api_q_clear(what: str = Query(...), uid: int = Depends(get_uid)):
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    if what == "all": await q.wipe()
-    elif what == "done": await q.clear("done")
-    elif what == "failed": await q.clear("failed")
-    return {"ok": True, "stats": q.stats()}
-
-
-@app.get("/api/reports")
-async def api_reports(uid: int = Depends(get_uid)):
-    q = bot.TaskQueue(bot.QUEUE_FILE); s = q.stats()
-    by_account, failed_samples = {}, []
-    for t in q.tasks:
-        st = t.get("status", "?"); acc = t.get("owner_account") or "?"
-        by_account.setdefault(acc, {"done": 0, "failed": 0, "pending": 0, "in_progress": 0})
-        if st in by_account[acc]: by_account[acc][st] += 1
-        if st == "failed" and len(failed_samples) < 30:
-            failed_samples.append({"target": t.get("target"),
-                                    "error": (t.get("last_error") or "")[:150],
-                                    "attempts": t.get("attempts")})
-    return {"totals": s, "by_account": by_account, "failed_samples": failed_samples}
-
-
-@app.post("/api/job/start")
-async def api_job_start(uid: int = Depends(get_uid)):
-    j = bot.STATE.get("job")
-    if j and not j.done(): raise HTTPException(400, "در جریانه")
-    cfg = bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-    q = bot.TaskQueue(bot.QUEUE_FILE); s = q.stats()
-    if s["pending"] + s["in_progress"] == 0: raise HTTPException(400, "صف خالیه")
-
-    async def _job():
-        try: await bot.run_workers(cfg, wlog)
-        except Exception as e: wlog(f"❌ job: {e}")
-
-    bot.STATE["job"] = asyncio.create_task(_job())
-    return {"ok": True}
-
-
-@app.post("/api/job/stop")
-async def api_job_stop(uid: int = Depends(get_uid)):
-    if bot.STATE.get("cancel"): bot.STATE["cancel"].set()
-    return {"ok": True}
-
-
-@app.get("/api/job/status")
-async def api_job_status(uid: int = Depends(get_uid)):
-    j = bot.STATE.get("job")
-    return {"running": bool(j and not j.done())}
+    return {
+        "owner": FORCED_OWNER,
+        "bot_alive": bool(_bot_thread and _bot_thread.is_alive()),
+        "rubika": {"loaded": rb is not None, "accounts": rb_accs},
+        "soroosh": {"loaded": sr is not None, "accounts": sr_accs},
+        "active_modes": dict(USER_MODE),
+        "public_url": PUBLIC_URL,
+    }
 
 
 @app.get("/api/logs")
@@ -1772,210 +1002,8 @@ async def api_logs(uid: int = Depends(get_uid)):
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۳) Extract
+# WEBSOCKET
 # ══════════════════════════════════════════════════════════════
-@app.get("/api/extract/channels")
-async def api_extract_channels(uid: int = Depends(get_uid)):
-    cfg = bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-    return {"channels": cfg.get("channels", [])}
-
-
-class ExtractChReq(BaseModel): channels: List[str]
-
-
-@app.post("/api/extract/channels")
-async def api_extract_set(req: ExtractChReq, uid: int = Depends(get_uid)):
-    cfg = bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-    cfg["channels"] = [c.strip() for c in req.channels if c.strip()]
-    bot._save(bot.CFG_FILE, cfg)
-    return {"ok": True, "channels": cfg["channels"]}
-
-
-class RunExtractReq(BaseModel):
-    aid: str
-    max_count: int = 0
-
-
-@app.post("/api/extract/run")
-async def api_extract_run(req: RunExtractReq, uid: int = Depends(get_uid)):
-    acc = bot.get_account(req.aid)
-    if not acc: raise HTTPException(404, "اکانت نیست")
-    cfg = bot._load(bot.CFG_FILE, bot.DEFAULT_CFG)
-    channels = cfg.get("channels", [])
-    if not channels: raise HTTPException(400, "کانالی نیست")
-    asyncio.create_task(_run_extract_bg(req.aid, channels, req.max_count, uid))
-    return {"ok": True, "started": True}
-
-
-async def _run_extract_bg(aid, channels, max_count, uid):
-    try:
-        cli = await get_client(aid)
-        await HUB.broadcast({"type": "extract_start", "channels": channels}, uid)
-        bot.STATE["cancel"] = asyncio.Event()
-        joined = await bot.joiner(cli, channels, max_count, wlog)
-        await HUB.broadcast({"type": "extract_done", "joined": joined}, uid)
-    except Exception as e:
-        wlog(f"❌ extract: {bot._fmt_error(e)}")
-        await HUB.broadcast({"type": "extract_error", "error": bot._fmt_error(e)}, uid)
-    finally:
-        bot.STATE["cancel"] = None
-
-
-@app.post("/api/extract/stop")
-async def api_extract_stop(uid: int = Depends(get_uid)):
-    if bot.STATE.get("cancel"): bot.STATE["cancel"].set()
-    return {"ok": True}
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۴) Chat feed
-# ══════════════════════════════════════════════════════════════
-class ChatFeed:
-    def __init__(self, aid, guid):
-        self.aid = aid; self.guid = guid
-        self.active_subs = set()
-        self.passive_subs = set()
-        self.task = None; self.snap = {}
-
-    @property
-    def subs(self): return self.active_subs | self.passive_subs
-
-    @property
-    def interval(self): return 2.0 if self.active_subs else 15.0
-
-    @property
-    def _fetch_count(self): return 40 if self.active_subs else 15
-
-    def start(self):
-        if not self.task or self.task.done():
-            self.task = asyncio.create_task(self._run())
-
-    def stop(self):
-        if self.task and not self.task.done(): self.task.cancel()
-
-    def add(self, conn, passive=False):
-        if passive:
-            if conn not in self.active_subs: self.passive_subs.add(conn)
-        else:
-            self.active_subs.add(conn); self.passive_subs.discard(conn)
-
-    def emit(self, msg):
-        for c in list(self.active_subs) + list(self.passive_subs):
-            if not c.push(msg):
-                self.active_subs.discard(c); self.passive_subs.discard(c)
-
-    def _diff(self, msgs):
-        cur = {}
-        for m in msgs:
-            i = _mid(m)
-            if i: cur[i] = m
-        if not cur: return
-        for m in msgs:
-            rid = (m.get("reply_to_message_id") or m.get("reply_to_id") or m.get("reply_to"))
-            if rid and str(rid) in self.snap:
-                p = self.snap[str(rid)]
-                m["reply_preview"] = {
-                    "id": str(rid), "text": (p.get("text") or "")[:120],
-                    "sender": p.get("sender") or ("شما" if p.get("is_mine") else ""),
-                    "type": p.get("type") or "Text"}
-        newest_prev = max((_mtime(m) for m in self.snap.values()), default=0)
-        oldest_cur = min(_mtime(m) for m in cur.values())
-        new = [m for i, m in cur.items() if i not in self.snap and _mtime(m) >= newest_prev]
-        edited = [m for i, m in cur.items()
-                  if i in self.snap and (m.get("text") or "") != (self.snap[i].get("text") or "")]
-        deleted = [i for i, m in self.snap.items() if i not in cur and _mtime(m) > oldest_cur]
-        self.snap = cur
-        new.sort(key=_mtime)
-        base = {"aid": self.aid, "guid": self.guid}
-        if new:     self.emit({"type": "new_messages", **base, "messages": new})
-        if edited:  self.emit({"type": "edited_messages", **base, "messages": edited})
-        if deleted: self.emit({"type": "deleted_messages", **base, "ids": deleted})
-
-    async def _run(self):
-        key = (self.aid, self.guid)
-        fails = 0; cli = None
-        try:
-            if not self.active_subs:
-                await asyncio.sleep(0.3 + (hash(self.guid) % 30) / 10.0)
-                if not self.subs: return
-            cli = await get_client(self.aid)
-            my = _MY_GUID.get(self.aid) or await get_my_guid(self.aid)
-            first = await bot.fetch_messages(cli, self.guid, self._fetch_count, my)
-            self.snap = {_mid(m): m for m in first if _mid(m)}
-            while self.subs:
-                await asyncio.sleep(self.interval)
-                if not self.subs: break
-                try:
-                    if cli is None: cli = await get_client(self.aid)
-                    msgs = await bot.fetch_messages(cli, self.guid, self._fetch_count, my)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    cli = None; fails += 1
-                    if _is_dead_session_error(e) and fails >= 3:
-                        invalidate_client(self.aid)
-                    if fails >= 5:
-                        self.emit({"type": "chat_error", "aid": self.aid,
-                                   "guid": self.guid, "error": _err_text(e)})
-                        break
-                    await asyncio.sleep(min(15.0, 2.0 * fails))
-                    continue
-                fails = 0
-                self._diff(msgs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.emit({"type": "chat_error", "aid": self.aid, "guid": self.guid,
-                       "error": _err_text(e)})
-        finally:
-            if FEEDS.get(key) is self: FEEDS.pop(key, None)
-
-
-FEEDS: Dict[tuple, ChatFeed] = {}
-MAX_SUBS_PER_CONN = 30
-
-
-def feed_subscribe(conn, aid, guid, passive=False):
-    if aid not in _account_ids_cached():
-        conn.push({"type": "chat_error", "aid": aid, "guid": guid, "error": "اکانت نیست"})
-        return
-    key = (aid, guid)
-    if key not in conn.subs and len(conn.subs) >= MAX_SUBS_PER_CONN:
-        conn.push({"type": "chat_error", "aid": aid, "guid": guid,
-                   "error": "تعداد اشتراک بیش از حد"})
-        return
-    f = FEEDS.get(key)
-    if not f or (f.task and f.task.done()):
-        f = ChatFeed(aid, guid); FEEDS[key] = f; f.start()
-    f.add(conn, passive=passive); conn.subs.add(key)
-    conn.push({"type": "subscribed", "aid": aid, "guid": guid})
-
-
-def feed_unsubscribe(conn, key, passive=False):
-    f = FEEDS.get(key)
-    if not f: return
-    if passive: f.passive_subs.discard(conn)
-    else:       f.active_subs.discard(conn)
-    if conn not in f.active_subs and conn not in f.passive_subs:
-        conn.subs.discard(key)
-    if not f.subs:
-        f.stop(); FEEDS.pop(key, None)
-
-
-def feed_unsub_all(conn, key):
-    f = FEEDS.get(key)
-    if f:
-        f.active_subs.discard(conn); f.passive_subs.discard(conn)
-        if not f.subs:
-            f.stop(); FEEDS.pop(key, None)
-    conn.subs.discard(key)
-
-
-def feed_emit(aid, guid, msg):
-    f = FEEDS.get((aid, guid))
-    if f: f.emit({**msg, "aid": aid, "guid": guid})
-
-
 @app.websocket("/ws")
 async def ws_ep(ws: WebSocket, token: str = Query("")):
     s = _check_token(token) or _check_token(ws.cookies.get("session"))
@@ -1992,923 +1020,32 @@ async def ws_ep(ws: WebSocket, token: str = Query("")):
                 break
             if raw == "ping":
                 conn.push("pong"); continue
-            try: msg = json.loads(raw)
-            except Exception: continue
-            if not isinstance(msg, dict): continue
-            t = msg.get("type")
-            aid, guid = msg.get("aid"), msg.get("guid")
-            if t == "chat_subscribe" and aid and guid:
-                feed_subscribe(conn, str(aid), str(guid), passive=False)
-            elif t == "chat_unsubscribe" and aid and guid:
-                feed_unsubscribe(conn, (str(aid), str(guid)), passive=False)
-            elif t == "list_subscribe" and aid:
-                for g in (msg.get("guids") or [])[:12]:
-                    try: feed_subscribe(conn, str(aid), str(g), passive=True)
-                    except Exception: pass
-            elif t == "list_unsubscribe" and aid:
-                for g in (msg.get("guids") or [])[:12]:
-                    feed_unsubscribe(conn, (str(aid), str(g)), passive=True)
-            elif t == "typing" and aid and guid:
-                asyncio.create_task(_send_activity(str(aid), str(guid)))
-            elif t == "seen" and aid and guid:
-                async def _seen(a=str(aid), g=str(guid), m=msg.get("mid")):
-                    try: await _mark_seen(await get_client(a), g, str(m) if m else None)
-                    except Exception: pass
-                asyncio.create_task(_seen())
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        for key in list(conn.subs): feed_unsub_all(conn, key)
         HUB.disconnect(conn)
         try: await ws.close()
         except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════
-# ۲۵) Avatar
-# ══════════════════════════════════════════════════════════════
-from fastapi.responses import Response as _AvResp
-import os as _av_os
-
-_AVATAR_CACHE = {}
-_AVATAR_TTL = 1800
-_AVATAR_NEG = {}
-_AVATAR_NEG_TTL = 60
-_AVATAR_MY_GUID = {}
-
-
-async def _av_resolve_guid(aid, guid, cli):
-    if guid and guid != aid and not guid.startswith("acc_"):
-        return guid
-    if aid in _AVATAR_MY_GUID:
-        return _AVATAR_MY_GUID[aid]
-    try:
-        me = await cli.get_me()
-        g = me.user.user_guid
-        if g:
-            _AVATAR_MY_GUID[aid] = g
-            return g
-    except Exception:
-        pass
-    return guid
-
-
-async def _av_list(cli, guid):
-    fn = getattr(cli, "get_avatars", None)
-    if not fn: return []
-    try:
-        u = fn(object_guid=guid)
-        if asyncio.iscoroutine(u): u = await u
-        ou = getattr(u, "original_update", {}) or {}
-        if isinstance(ou, dict):
-            return list(ou.get("avatars", []) or [])
-    except Exception:
-        pass
-    return []
-
-
-async def _av_dl_obj(cli, d):
-    return None
-
-
-async def _av_dl_by_idx(cli, real_guid, idx):
-    fn = getattr(cli, "get_avatars", None)
-    if not fn: return None
-    try:
-        u = fn(object_guid=real_guid)
-        if asyncio.iscoroutine(u): u = await u
-    except Exception:
-        return None
-    ou = getattr(u, "original_update", {}) or {}
-    avatars = ou.get("avatars", []) if isinstance(ou, dict) else []
-    if idx < 0 or idx >= len(avatars): return None
-    av = avatars[idx]
-    if not isinstance(av, dict): return None
-    file_data = av.get("main") or av.get("thumbnail")
-    if not isinstance(file_data, dict): return None
-    dl = getattr(cli, "download", None)
-    if not dl: return None
-    try:
-        u.file_inline = file_data
-        u.is_file_inline = True
-        r = dl(file_inline=u)
-        if asyncio.iscoroutine(r): r = await r
-        if isinstance(r, (bytes, bytearray)) and r: return bytes(r)
-    except Exception: pass
-    try:
-        r = dl(file_inline=file_data)
-        if asyncio.iscoroutine(r): r = await r
-        if isinstance(r, (bytes, bytearray)) and r: return bytes(r)
-    except Exception: pass
-    return None
-
-
-async def _av_dl_main(cli, guid):
-    fn = getattr(cli, "download_profile_picture", None)
-    if not fn: return None
-    try:
-        r = fn(object_guid=guid)
-        if asyncio.iscoroutine(r): r = await r
-        if isinstance(r, (bytes, bytearray)) and r: return bytes(r)
-    except Exception:
-        pass
-    return None
-
-
-def _av_clear_cache(aid):
-    for k in list(_AVATAR_CACHE.keys()):
-        if k.startswith(aid + ":"): del _AVATAR_CACHE[k]
-    for k in list(_AVATAR_NEG.keys()):
-        if k.startswith(aid + ":"): del _AVATAR_NEG[k]
-
-
-@app.get("/api/accounts/{aid}/avatars/{guid}")
-async def api_avatar_list(aid: str, guid: str):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(404, f"no client: {str(e)[:100]}")
-    real_guid = await _av_resolve_guid(aid, guid, cli)
-    avatars = await _av_list(cli, real_guid)
-    items = []
-    for i, av in enumerate(avatars):
-        if not isinstance(av, dict): continue
-        items.append({
-            "idx": i, "avatar_id": av.get("avatar_id") or "",
-            "main": bool(av.get("main")),
-            "create_time": int(av.get("create_time") or 0),
-            "url": f"/api/accounts/{aid}/avatar/{guid}?idx={i}"})
-    items.sort(key=lambda a: (not a["main"], -a["create_time"]))
-    for i, a in enumerate(items): a["pos"] = i
-    return {"guid": guid, "real_guid": real_guid,
-            "count": len(items), "avatars": items}
-
-
-@app.get("/api/accounts/{aid}/avatar/{guid}")
-async def api_avatar(aid: str, guid: str, idx: int = -1):
-    now = time.time()
-    key = f"{aid}:{guid}:{idx}"
-    c = _AVATAR_CACHE.get(key)
-    if c and (now - c["ts"]) < _AVATAR_TTL:
-        return _AvResp(content=c["bytes"], media_type=c.get("mime") or "image/jpeg",
-                       headers={"Cache-Control": "public, max-age=1800"})
-    n = _AVATAR_NEG.get(key)
-    if n and (now - n) < _AVATAR_NEG_TTL:
-        raise HTTPException(404, "no avatar (cached)")
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(404, f"no client: {str(e)[:100]}")
-    real_guid = await _av_resolve_guid(aid, guid, cli)
-    data = None
-    if idx >= 0:
-        data = await _av_dl_by_idx(cli, real_guid, idx)
-    if not data:
-        data = await _av_dl_main(cli, real_guid)
-    if not data:
-        _AVATAR_NEG[key] = now
-        raise HTTPException(404, "no avatar")
-    _AVATAR_CACHE[key] = {"ts": now, "bytes": data, "mime": "image/jpeg"}
-    return _AvResp(content=data, media_type="image/jpeg",
-                   headers={"Cache-Control": "public, max-age=1800"})
-
-
-@app.post("/api/accounts/{aid}/avatar")
-async def api_avatar_upload(aid: str, file: UploadFile = File(...),
-                             uid: int = Depends(get_uid)):
-    import tempfile as _tmp
-    data = await file.read()
-    if not data: raise HTTPException(400, "فایل خالی")
-    if len(data) > 10 * 1024 * 1024: raise HTTPException(413, "حجم بیش از ۱۰ مگابایت")
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    suffix = Path(file.filename or "img.jpg").suffix or ".jpg"
-    fd, tmp = _tmp.mkstemp(suffix=suffix)
-    try:
-        with _av_os.fdopen(fd, "wb") as f: f.write(data)
-        me = await cli.get_me()
-        my_guid = me.user.user_guid
-        last = None
-        for name in ("upload_avatar", "uploadAvatar", "set_avatar", "setAvatar"):
-            fn = getattr(cli, name, None)
-            if not fn: continue
-            for kw in ({"object_guid": my_guid, "image": tmp},
-                       {"object_guid": my_guid, "image": tmp, "thumbnail_file_id": None}):
-                try:
-                    r = fn(**kw)
-                    if asyncio.iscoroutine(r): r = await r
-                    _av_clear_cache(aid)
-                    return {"ok": True, "method": name}
-                except Exception as e:
-                    last = f"{name}: {type(e).__name__}: {str(e)[:150]}"
-                    continue
-        raise HTTPException(501, f"آپلود نشد: {last}")
-    finally:
-        try: _av_os.remove(tmp)
-        except Exception: pass
-
-
-@app.delete("/api/accounts/{aid}/avatar")
-async def api_avatar_delete(aid: str, avatar_id: str = Query(""),
-                             uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    me = await cli.get_me()
-    my_guid = me.user.user_guid
-    if not avatar_id:
-        avs = await _av_list(cli, my_guid)
-        for av in avs:
-            if isinstance(av, dict) and av.get("main"):
-                avatar_id = av.get("avatar_id") or ""; break
-        if not avatar_id and avs and isinstance(avs[0], dict):
-            avatar_id = avs[0].get("avatar_id") or ""
-    last = None
-    for name in ("delete_avatar", "deleteAvatar"):
-        fn = getattr(cli, name, None)
-        if not fn: continue
-        variants = [
-            {"object_guid": my_guid, "avatar_id": avatar_id} if avatar_id else None,
-            {"object_guid": my_guid},
-            {"chat_id": my_guid, "avatar_id": avatar_id} if avatar_id else None,
-            {"chat_id": my_guid}]
-        for kw in variants:
-            if not kw: continue
-            try:
-                r = fn(**kw)
-                if asyncio.iscoroutine(r): r = await r
-                _av_clear_cache(aid)
-                return {"ok": True, "method": name, "avatar_id": avatar_id}
-            except TypeError:
-                last = f"{name}/{list(kw.keys())}: TypeError"; continue
-            except Exception as e:
-                last = f"{name}: {type(e).__name__}: {str(e)[:150]}"; continue
-    raise HTTPException(501, f"حذف نشد: {last}")
-
-
-@app.post("/api/accounts/{aid}/avatars/{guid}/prefetch")
-async def api_avatar_prefetch(aid: str, guid: str):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(404, f"no client: {str(e)[:100]}")
-    real_guid = await _av_resolve_guid(aid, guid, cli)
-    avs = await _av_list(cli, real_guid)
-    if not avs: return {"ok": True, "count": 0}
-    ordered = [(i, av) for i, av in enumerate(avs) if isinstance(av, dict)]
-    ordered.sort(key=lambda t: (not bool(t[1].get("main")),
-                                 -int(t[1].get("create_time") or 0)))
-
-    async def one(pos, av):
-        key = f"{aid}:{guid}:{pos}"
-        now = time.time()
-        c = _AVATAR_CACHE.get(key)
-        if c and (now - c["ts"]) < _AVATAR_TTL: return
-        for field in ("thumbnail", "main"):
-            d = av.get(field)
-            if not d: continue
-            try:
-                r = await _av_dl_obj(cli, d)
-                if r:
-                    _AVATAR_CACHE[key] = {"ts": time.time(), "bytes": r, "mime": "image/jpeg"}
-                    return
-            except Exception:
-                continue
-
-    sem = asyncio.Semaphore(3)
-
-    async def bounded(pos, av):
-        async with sem: await one(pos, av)
-
-    asyncio.create_task(asyncio.gather(*[bounded(p, a) for p, a in ordered]))
-    return {"ok": True, "count": len(ordered)}
-
-
-@app.get("/account/{aid}")
-async def p_account(request: Request, aid: str):
-    if not _check_token(_get_token(request)):
-        return RedirectResponse("/login", status_code=302)
-    return _page("account_manage.html")
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۶) Batch system
-# ══════════════════════════════════════════════════════════════
-BATCHES_FILE = "batches.json"
-
-
-def _load_batches(): return bot._load(BATCHES_FILE, [])
-def _save_batches(b): bot._save(BATCHES_FILE, b)
-
-
-def _get_batch(bid):
-    for b in _load_batches():
-        if b.get("id") == bid: return b
-    return None
-
-
-@app.get("/api/batches")
-async def api_batches(uid: int = Depends(get_uid)):
-    batches = _load_batches()
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    by_batch = {}
-    for t in q.tasks:
-        bid = t.get("batch_id")
-        if not bid: continue
-        d = by_batch.setdefault(bid, {"done": 0, "failed": 0, "pending": 0, "in_progress": 0})
-        st = t.get("status", "pending")
-        if st in d: d[st] += 1
-    out = []
-    for b in batches:
-        stats = by_batch.get(b["id"], {"done": 0, "failed": 0, "pending": 0, "in_progress": 0})
-        out.append({**b, "stats": stats, "total": sum(stats.values())})
-    out.sort(key=lambda x: x.get("created", 0), reverse=True)
-    return {"batches": out[:200]}
-
-
-@app.get("/api/batches/{bid}")
-async def api_batch_detail(bid: str, uid: int = Depends(get_uid)):
-    b = _get_batch(bid)
-    if not b: raise HTTPException(404, "پیدا نشد")
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    tasks = [t for t in q.tasks if t.get("batch_id") == bid]
-    by_acc = {}
-    for t in tasks:
-        aid = t.get("owner_account") or "?"
-        d = by_acc.setdefault(aid, {"done": 0, "failed": 0, "pending": 0,
-                                    "in_progress": 0, "samples": []})
-        st = t.get("status", "pending")
-        if st in d: d[st] += 1
-        if st == "failed" and len(d["samples"]) < 8:
-            d["samples"].append({"target": t.get("target"),
-                                  "error": (t.get("last_error") or "")[:200],
-                                  "attempts": t.get("attempts", 0)})
-    stats = {"done": 0, "failed": 0, "pending": 0, "in_progress": 0}
-    for d in by_acc.values():
-        for k in stats: stats[k] += d.get(k, 0)
-    return {"batch": b, "stats": stats, "by_account": by_acc, "total": len(tasks)}
-
-
-@app.delete("/api/batches/{bid}")
-async def api_batch_delete(bid: str, uid: int = Depends(get_uid)):
-    b = _get_batch(bid)
-    if not b: raise HTTPException(404, "پیدا نشد")
-    _save_batches([x for x in _load_batches() if x.get("id") != bid])
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    q.tasks = [t for t in q.tasks
-               if t.get("batch_id") != bid or t.get("status") == "done"]
-    q._save()
-    return {"ok": True}
-
-
-class EnqueueReq(BaseModel):
-    items: List[Dict[str, Any]]
-    owner_account: str
-    batch_id: Optional[str] = None
-    message: Optional[str] = None
-    type: Optional[str] = None
-    file_name: Optional[str] = None
-
-
-@app.post("/api/enqueue")
-async def api_enqueue(req: EnqueueReq, uid: int = Depends(get_uid)):
-    bid = (req.batch_id or "").strip() or ("b_" + secrets.token_hex(6))
-    batches = _load_batches()
-    existing = next((b for b in batches if b.get("id") == bid), None)
-    if not existing:
-        existing = {"id": bid, "created": int(time.time()),
-                    "message": (req.message or "")[:500],
-                    "type": req.type or "both",
-                    "file_name": req.file_name or "",
-                    "owner_account": req.owner_account}
-        batches.append(existing)
-        _save_batches(batches)
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    for it in req.items:
-        it["owner_account"] = req.owner_account
-        it["batch_id"] = bid
-    n = await q.add(req.items)
-    return {"ok": True, "added": n, "batch_id": bid, "stats": q.stats()}
-
-
-@app.get("/api/batches-jobs/status")
-async def api_batches_job_status(uid: int = Depends(get_uid)):
-    j = bot.STATE.get("job")
-    q = bot.TaskQueue(bot.QUEUE_FILE)
-    return {"running": bool(j and not j.done()), "queue": q.stats()}
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۷) Channel management
-# ══════════════════════════════════════════════════════════════
-def _ch_friendly_err(e):
-    s = str(e); s_low = s.lower()
-    if "10" in s and ("username" in s_low or "یوزر" in s or "نام کاربری" in s):
-        return {"code": "USERNAME_LIMIT",
-                "message": "بیشتر از ۱۰ نام کاربری نمی‌تونی بزنی."}
-    if "3" in s and ("روز" in s or "day" in s_low):
-        return {"code": "3DAY_LIMIT", "message": "باید از نشست شما ۳ روز گذشته باشد."}
-    if "owner" in s_low or "مالک" in s:
-        return {"code": "OWNER_ONLY", "message": "حذف کانال فقط توسط مالک کانال."}
-    if "not_found" in s_low or "پیدا" in s:
-        return {"code": "NOT_FOUND", "message": "کانال پیدا نشد."}
-    return {"code": "UNKNOWN", "message": str(e)[:300]}
-
-
-@app.get("/api/accounts/{aid}/channels-all")
-async def api_all_channels(aid: str, uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    out = []
-    try:
-        raw = await bot.get_live_channels(cli)
-        for c in raw:
-            out.append({"guid": c.get("guid") or "",
-                        "title": c.get("title") or "",
-                        "username": c.get("username") or "",
-                        "type": "public" if c.get("username") else "private",
-                        "source": "live"})
-    except Exception:
-        pass
-    acc = bot.get_account(aid) or {}
-    local = {c.get("guid"): c for c in (acc.get("channels") or []) if c.get("guid")}
-    seen = set()
-    for c in out:
-        seen.add(c["guid"])
-        if c["guid"] in local:
-            lc = local[c["guid"]]
-            if not c.get("title") and lc.get("title"): c["title"] = lc["title"]
-            if not c.get("username") and lc.get("username"):
-                c["username"] = lc["username"]; c["type"] = "public"
-    for g, lc in local.items():
-        if g not in seen:
-            out.append({"guid": g, "title": lc.get("title") or "",
-                        "username": lc.get("username") or "",
-                        "type": "public" if lc.get("username") else "private",
-                        "source": "local"})
-    return {"count": len(out), "channels": out}
-
-
-@app.get("/api/accounts/{aid}/channels/{guid}")
-async def api_channel_info(aid: str, guid: str, uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    info = None
-    for mname in ("get_channel_info", "getChannelInfo", "get_info", "getInfo",
-                  "get_chat_info", "getChatInfo"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        try:
-            r = fn(object_guid=guid)
-            if asyncio.iscoroutine(r): r = await r
-            if r: info = r; break
-        except Exception:
-            continue
-
-    def g(*keys, d=None):
-        if info is None: return d
-        for k in keys:
-            if isinstance(info, dict) and k in info and info[k]: return info[k]
-            v = getattr(info, k, None)
-            if v: return v
-        return d
-
-    title = g("title", "first_name", "name") or ""
-    username = (g("username") or "").lstrip("@")
-    description = g("description", "bio", "about") or ""
-    if not title or not description:
-        acc = bot.get_account(aid) or {}
-        for ch in (acc.get("channels") or []):
-            if ch.get("guid") == guid:
-                if not title: title = ch.get("title") or ""
-                if not description: description = ch.get("description") or ""
-                if not username: username = (ch.get("username") or "").lstrip("@")
-                break
-    return {"guid": guid, "title": title, "username": username,
-            "description": description, "is_public": bool(username)}
-
-
-@app.put("/api/accounts/{aid}/channels/{guid}")
-async def api_channel_edit(aid: str, guid: str, req: dict, uid: int = Depends(get_uid)):
-    title = (req.get("title") or "").strip()
-    desc = (req.get("description") or "").strip()
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    last_err = None; ok = False
-    for mname in ("edit_channel_info", "editChannelInfo", "update_channel_info"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        kw = {"channel_guid": guid}
-        if title: kw["title"] = title
-        if desc is not None: kw["description"] = desc
-        try:
-            r = fn(**kw)
-            if asyncio.iscoroutine(r): r = await r
-            ok = True; break
-        except TypeError:
-            try:
-                kw2 = {"object_guid": guid}
-                if title: kw2["title"] = title
-                if desc is not None: kw2["description"] = desc
-                r = fn(**kw2)
-                if asyncio.iscoroutine(r): r = await r
-                ok = True; break
-            except Exception as e2:
-                last_err = e2; continue
-        except Exception as e:
-            last_err = e; continue
-    if not ok:
-        fe = _ch_friendly_err(last_err); raise HTTPException(501, fe["message"])
-    try:
-        accounts = bot.list_accounts()
-        if aid in accounts:
-            for ch in (accounts[aid].get("channels") or []):
-                if ch.get("guid") == guid:
-                    if title: ch["title"] = title
-                    if desc is not None: ch["description"] = desc
-                    break
-            bot.save_accounts(accounts)
-    except Exception:
-        pass
-    return {"ok": True}
-
-
-def _ch_extract_join_link(r):
-    if r is None: return None
-    if isinstance(r, dict):
-        for k in ("join_link", "link", "url", "invite_link", "invite"):
-            v = r.get(k)
-            if isinstance(v, str) and v.startswith("http"): return v
-        for k in ("data", "result", "chat", "response"):
-            n = r.get(k)
-            if isinstance(n, dict):
-                x = _ch_extract_join_link(n)
-                if x: return x
-    else:
-        for k in ("join_link", "link", "url", "invite_link", "invite"):
-            v = getattr(r, k, None)
-            if isinstance(v, str) and v.startswith("http"): return v
-    try:
-        s = str(r); m = re.search(r'https?://[^\s"\'<>]+', s)
-        if m: return m.group(0)
-    except Exception:
-        pass
-    return None
-
-
-async def _ch_create_join_link(cli, guid):
-    variants = [
-        dict(object_guid=guid, request_needed=False),
-        dict(object_guid=guid, request_needed=False, usage_limit=0),
-        dict(object_guid=guid), dict(chat_id=guid), dict(channel_guid=guid)]
-    for mname in ("create_join_link", "createJoinLink", "add_join_link", "addJoinLink"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        for kw in variants:
-            try:
-                r = fn(**kw)
-                if asyncio.iscoroutine(r): r = await r
-                link = _ch_extract_join_link(r)
-                if link: return link
-            except Exception:
-                continue
-    return None
-
-
-async def _ch_create_join_link_robust(cli, guid):
-    link = await _ch_create_join_link(cli, guid)
-    if link: return True, link
-    return False, "no join link method"
-
-
-@app.get("/api/accounts/{aid}/channels/{guid}/invite")
-async def api_channel_invite_get(aid: str, guid: str, uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    for mname in ("get_join_links", "getJoinLinks", "get_channel_link",
-                  "getChannelLink", "get_link", "getLink"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        for kw in ({"object_guid": guid}, {"channel_guid": guid}, {"chat_id": guid}):
-            try:
-                r = fn(**kw)
-                if asyncio.iscoroutine(r): r = await r
-                link = _ch_extract_join_link(r)
-                if link: return {"ok": True, "link": link, "existing": True}
-            except Exception:
-                continue
-    ok, link = await _ch_create_join_link_robust(cli, guid)
-    if ok: return {"ok": True, "link": link, "existing": False}
-    return {"ok": True, "link": "", "empty": True, "error": str(link)[:200]}
-
-
-@app.post("/api/accounts/{aid}/channels/{guid}/invite")
-async def api_channel_invite_new(aid: str, guid: str, uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    ok, link = await _ch_create_join_link_robust(cli, guid)
-    if ok:
-        try:
-            accounts = bot.list_accounts()
-            if aid in accounts:
-                for ch in (accounts[aid].get("channels") or []):
-                    if ch.get("guid") == guid: ch["join_link"] = link; break
-                bot.save_accounts(accounts)
-        except Exception:
-            pass
-        return {"ok": True, "link": link, "existing": False}
-    raise HTTPException(501, f"ساخت لینک نشد: {link}")
-
-
-@app.post("/api/accounts/{aid}/channels/{guid}/username")
-async def api_channel_set_username(aid: str, guid: str, req: dict,
-                                    uid: int = Depends(get_uid)):
-    username = (req.get("username") or "").strip().lstrip("@")
-    if not username: raise HTTPException(400, "نام کاربری لازم است")
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    ok, msg = await _ch_set_username_robust(cli, guid, username)
-    if not ok: raise HTTPException(501, msg)
-    try:
-        accounts = bot.list_accounts()
-        if aid in accounts:
-            for ch in (accounts[aid].get("channels") or []):
-                if ch.get("guid") == guid:
-                    ch["username"] = "@" + username
-                    ch["is_public"] = True
-                    break
-            bot.save_accounts(accounts)
-    except Exception:
-        pass
-    return {"ok": True, "username": "@" + username}
-
-
-@app.post("/api/accounts/{aid}/channels/{guid}/make-private")
-async def api_channel_make_private(aid: str, guid: str, uid: int = Depends(get_uid)):
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    has_uname = await _ch_get_username(cli, guid)
-    cleared = False; clear_msg = ""
-    if has_uname:
-        cleared, clear_msg = await _ch_clear_username(cli, guid)
-        if not cleared:
-            raise HTTPException(501, f"یوزرنیم {has_uname} پاک نشد: {clear_msg}")
-        await asyncio.sleep(1.5)
-    join_link = None
-    for attempt in range(3):
-        join_link = await _ch_create_join_link(cli, guid)
-        if join_link: break
-        await asyncio.sleep(1.5 + attempt)
-    try:
-        accounts = bot.list_accounts()
-        if aid in accounts:
-            for ch in (accounts[aid].get("channels") or []):
-                if ch.get("guid") == guid:
-                    ch["username"] = ""; ch["is_public"] = False
-                    ch["type"] = "private"
-                    if join_link: ch["join_link"] = join_link
-                    break
-            bot.save_accounts(accounts)
-    except Exception:
-        pass
-    return {"ok": True, "was_username": has_uname or "",
-            "cleared": cleared, "join_link": join_link}
-
-
-async def _ch_remove_username(cli, guid):
-    attempts = [
-        ("update_channel_username", {"channel_guid": guid, "username": ""}),
-        ("update_channel_username", {"object_guid": guid, "username": ""}),
-        ("edit_channel_info", {"channel_guid": guid, "username": ""}),
-    ]
-    for mname, kw in attempts:
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        try:
-            r = fn(**kw)
-            if asyncio.iscoroutine(r): r = await r
-            return True, f"{mname}"
-        except Exception:
-            continue
-    return False, "no method"
-
-
-async def _ch_set_username_robust(cli, guid, username):
-    last = None
-    for mname in ("update_channel_username", "updateChannelUsername",
-                  "set_channel_username", "setChannelUsername"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        for kw in ({"channel_guid": guid, "username": username},
-                   {"channel_guid": guid, "username": "@" + username},
-                   {"object_guid": guid, "username": username},
-                   {"object_guid": guid, "username": "@" + username}):
-            try:
-                r = fn(**kw)
-                if asyncio.iscoroutine(r): r = await r
-                return True, "ok"
-            except Exception as e:
-                last = e; continue
-    return False, f"no method: {last}"
-
-
-async def _ch_get_username(cli, guid):
-    for mname in ("get_channel_info", "getChannelInfo"):
-        fn = getattr(cli, mname, None)
-        if not fn: continue
-        try:
-            r = fn(object_guid=guid)
-            if asyncio.iscoroutine(r): r = await r
-            u = getattr(r, "username", None) or (r.get("username") if isinstance(r, dict) else None)
-            if u: return u
-        except Exception:
-            continue
-    return None
-
-
-async def _ch_clear_username(cli, guid):
-    return await _ch_remove_username(cli, guid)
-
-
-def _ch_link(r):
-    if r is None: return None
-    if isinstance(r, dict):
-        for k in ("join_link", "link", "url", "invite_link"):
-            v = r.get(k)
-            if isinstance(v, str) and v.startswith("http"): return v
-        for k in ("data", "result", "chat", "response"):
-            n = r.get(k)
-            if isinstance(n, dict):
-                x = _ch_link(n)
-                if x: return x
-    else:
-        for k in ("join_link", "link", "url", "invite_link"):
-            v = getattr(r, k, None)
-            if isinstance(v, str) and v.startswith("http"): return v
-    s = str(r); m = re.search(r"https?://[^\s\"<>]+", s)
-    return m.group(0) if m else None
-
-
-@app.post("/api/accounts/{aid}/channels")
-async def api_channel_create(aid: str, req: dict, uid: int = Depends(get_uid)):
-    title = (req.get("title") or "").strip()
-    desc = (req.get("description") or "").strip()
-    ctype = (req.get("type") or "private").lower()
-    username = (req.get("username") or "").strip().lstrip("@")
-    if not title: raise HTTPException(400, "نام کانال لازم است")
-    if ctype == "public" and not username:
-        raise HTTPException(400, "برای عمومی یوزرنیم لازم است")
-    try:
-        cli = await get_client(aid)
-    except Exception as e:
-        raise HTTPException(500, f"no client: {e}")
-    try:
-        r = cli.add_channel(title=title, description=desc or None)
-        if asyncio.iscoroutine(r): r = await r
-        guid = bot.extract_chat_guid(r)
-    except Exception as e:
-        raise HTTPException(501, f"ساخت نشد: {bot._fmt_error(e)}")
-    if not guid: raise HTTPException(501, "guid پیدا نشد")
-    await asyncio.sleep(1.5)
-    warnings = []
-    if ctype == "private":
-        for val in ("Private", "private"):
-            try:
-                r = cli.edit_channel_info(channel_guid=guid, channel_type=val)
-                if asyncio.iscoroutine(r): r = await r
-                break
-            except Exception as e:
-                warnings.append(f"private: {bot._fmt_error(e)}")
-        await asyncio.sleep(1.5)
-    if ctype == "public":
-        u_ok = False
-        for u in (username, "@" + username):
-            try:
-                r = cli.update_channel_username(channel_guid=guid, username=u)
-                if asyncio.iscoroutine(r): r = await r
-                u_ok = True; break
-            except Exception as e:
-                warnings.append(f"username: {bot._fmt_error(e)}")
-        if u_ok:
-            try:
-                r = cli.edit_channel_info(channel_guid=guid, channel_type="Public")
-                if asyncio.iscoroutine(r): r = await r
-            except Exception:
-                pass
-    join_link = None
-    if ctype == "private":
-        for attempt in range(3):
-            try:
-                r = cli.create_join_link(object_guid=guid, request_needed=False)
-                if asyncio.iscoroutine(r): r = await r
-                join_link = _ch_link(r)
-                if join_link: break
-            except Exception:
-                pass
-            await asyncio.sleep(1.5)
-    try:
-        bot.add_channel_to_storage(aid, {
-            "guid": guid, "title": title, "description": desc,
-            "username": ("@" + username) if ctype == "public" else "",
-            "join_link": join_link,
-            "is_public": (ctype == "public"),
-            "type": ctype, "created": int(time.time())})
-    except Exception:
-        pass
-    return {"ok": True, "guid": guid, "type": ctype,
-            "invite_link": join_link, "warnings": warnings}
-
-
-@app.get("/manage/{aid}")
-async def p_manage(request: Request, aid: str):
-    if not _check_token(_get_token(request)):
-        return RedirectResponse("/login", status_code=302)
-    return _page("account_manage.html")
-
-
-@app.get("/channel/{aid}/{guid}")
-async def p_channel(request: Request, aid: str, guid: str):
-    if not _check_token(_get_token(request)):
-        return RedirectResponse("/login", status_code=302)
-    return _page("channel_manage.html")
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۸) Diagnostics
-# ══════════════════════════════════════════════════════════════
-@app.get("/api/accounts/{aid}/diag")
-async def api_diag(aid: str, uid: int = Depends(get_uid)):
-    out = {"aid": aid}
-    entry = CLIENTS.get(aid)
-    out["has_cached_client"] = bool(entry)
-    if entry:
-        out["cli_alive"] = _cli_alive(entry["cli"])
-        out["client_age_sec"] = int(time.time() - entry["ts"])
-    try:
-        cli = await get_client(aid)
-        out["get_client"] = "ok"
-    except Exception as e:
-        out["get_client"] = f"ERR {type(e).__name__}: {str(e)[:200]}"
-        return out
-    try:
-        me = await cli.get_me()
-        out["my_guid"] = me.user.user_guid
-        out["my_name"] = me.user.first_name
-        out["get_me"] = "ok"
-    except Exception as e:
-        out["get_me"] = f"ERR {type(e).__name__}: {str(e)[:200]}"
-        return out
-    try:
-        raw = await bot.get_all_chats_raw(cli)
-        out["total_chats"] = len(raw)
-        types = {}
-        for c in raw:
-            t = c.get("type") or "?"
-            types[t] = types.get(t, 0) + 1
-        out["types"] = types
-    except Exception as e:
-        out["get_chats"] = f"ERR {type(e).__name__}: {str(e)[:200]}"
-    return out
-
-
-@app.get("/api/health")
-async def api_health():
-    return {
-        "ok": True,
-        "owner": FORCED_OWNER,
-        "bot_alive": bool(_bot_thread and _bot_thread.is_alive()),
-        "data_dir": str(DATA_DIR),
-        "bot_path": str(BOT_PATH),
-    }
-
-
-# ══════════════════════════════════════════════════════════════
-# ۲۹) Local
+# MAIN
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
-    log_print("=" * 56)
-    log_print(f"   🌐 Running locally on http://0.0.0.0:{PORT}")
-    log_print(f"   مالک: {FORCED_OWNER}")
-    log_print("=" * 56)
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info",
-                proxy_headers=True, forwarded_allow_ips="*")
+    log_print("=" * 60)
+    log_print("   🌐  Rubika + Soroosh — Unified (Railway)")
+    log_print(f"   Public: {PUBLIC_URL}")
+    log_print(f"   Bind  : {HOST}:{PORT}")
+    log_print(f"   Owner : {FORCED_OWNER}")
+    log_print("=" * 60)
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level="info",
+        proxy_headers=True,               # ★ برای Railway (پشت پروکسی)
+        forwarded_allow_ips="*",          # ★ اجازه X-Forwarded-* از پروکسی Railway
+    )
