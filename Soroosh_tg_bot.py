@@ -5,7 +5,7 @@ import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.6"
+VERSION = "Soroosh v27.9.7"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -1444,15 +1444,24 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
                 _IPU = None
 
         raw = getattr(cli, "raw", None) or cli
+
+        actual_entity = entity
+        if isinstance(entity, int):
+            try:
+                actual_entity = await cli.get_entity(entity)
+                flog(f"[send-file] int resolved to {type(actual_entity).__name__}")
+            except Exception as ie:
+                _log("resolve_int_entity", ie)
+                actual_entity = entity
         peer = None
         try:
-            peer = await raw.get_input_entity(entity)
+            peer = await raw.get_input_entity(actual_entity)
             flog("[send-file] peer= get_input_entity")
         except Exception as pe:
             _log("get_input_entity", pe)
             try:
-                eid = getattr(entity, "id", None)
-                eah = getattr(entity, "access_hash", None)
+                eid = getattr(actual_entity, "id", None) or (entity if isinstance(entity, int) else None)
+                eah = getattr(actual_entity, "access_hash", None)
                 if eid and eah and _IPU is not None:
                     peer = _IPU(int(eid), int(eah))
                     flog("[send-file] peer= InputPeerUser fallback")
@@ -3221,6 +3230,21 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
         if cli is None:
             send_ok = False; send_err = f"connect: {err}"
         else:
+            # resolve sender entity قبل از ارسال
+            sender_entity = None
+            try:
+                sender_entity = await cli.get_entity(sender_id)
+                flog(f"[pv] resolved sender for {sender_id}: {type(sender_entity).__name__}")
+            except Exception as _re:
+                flog(f"[pv] resolve sender fail: {type(_re).__name__}: {_re}", "warning")
+                _un = user_info.get("username")
+                if _un:
+                    try:
+                        sender_entity = await cli.get_entity(_un.lstrip("@"))
+                    except Exception: pass
+            
+            target = sender_entity if sender_entity is not None else sender_id
+            
             items = cfg.get("items") or []
             for item in items:
                 if stop_event.is_set(): break
@@ -3229,7 +3253,7 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
                     if kind == "text":
                         txt = item.get("text") or ""
                         if txt:
-                            r = cli.send_message(sender_id, txt)
+                            r = cli.send_message(target, txt)
                             if asyncio.iscoroutine(r): r = await r
                             await asyncio.sleep(random.uniform(1.0, 2.5))
                     elif kind == "file":
