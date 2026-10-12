@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9.10 (PV file→entity fix + real error reporting)
+# Soroosh_tg_bot.py — v27.9.11 (PV file upload fix: warmup + upload-then-send + fresh client)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.10"
+VERSION = "Soroosh v27.9.11"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -1361,10 +1361,10 @@ def _detect_file_kind(file_path: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.10 — _send_file_to_entity (خطای واقعی + چند حالت ارسال)
+# ⭐ v27.9.11 — _send_file_to_entity (warmup + upload-then-send + fresh)
 # ══════════════════════════════════════════════════════════════════
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    """v27.9.10: چند حالت ارسال + error واقعی برمی‌گردونه"""
+    """v27.9.11 — warmup + upload-then-send + fresh-client fallback"""
     async def _aw(r):
         return (await r) if asyncio.iscoroutine(r) else r
 
@@ -1379,13 +1379,59 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
         return False, "not_found"
 
     kind = _detect_file_kind(file_path)
-    flog(f"[send-file] {os.path.basename(file_path)} kind={kind}")
+    try:
+        _fsz = os.path.getsize(file_path)
+    except Exception:
+        _fsz = -1
+    flog(f"[send-file] {os.path.basename(file_path)} kind={kind} size={_fsz}")
     last_err = ""
+
+    # گرم‌کردن اتصال قبل از آپلود (فایل روی اتصال تازه رد می‌شه)
+    try:
+        await asyncio.wait_for(cli.get_me(), timeout=15)
+        await asyncio.sleep(1.0)
+    except Exception: pass
 
     sf = getattr(cli, "send_file", None)
     sd = getattr(cli, "send_document", None)
+    up = getattr(cli, "upload_file", None)
 
-    # حالت‌های مختلف ارسال
+    # ── روش ۱: آپلود جدا + ارسال با handle (با اندازه پارت‌های مختلف) ──
+    if up and sf:
+        for part_kb in (None, 64, 128, 32):
+            part_supported = True
+            for attempt in range(1, 3):
+                try:
+                    if part_kb is None:
+                        handle = await _aw(up(file_path))
+                    else:
+                        try:
+                            handle = await _aw(up(file_path, part_size_kb=part_kb))
+                        except TypeError:
+                            part_supported = False
+                            break
+                    try:
+                        await _aw(sf(entity, handle, caption=caption))
+                    except TypeError:
+                        await _aw(sf(entity, handle))
+                        if caption:
+                            try: await _aw(cli.send_message(entity, caption))
+                            except Exception: pass
+                    flog(f"[send-file] OK via upload+send part={part_kb} attempt={attempt}")
+                    return True, f"OK-upload-{part_kb}"
+                except FloodWaitError as fe:
+                    await asyncio.sleep(min(fe.seconds + 1, 30))
+                    last_err = f"Flood {fe.seconds}s"
+                except Exception as e:
+                    last_err = f"upload[{part_kb}]:{type(e).__name__}:{str(e)[:70]}"
+                    flog(f"[send-file] {last_err}", "warning")
+                    if "USER_SUSPENDED" in str(e).upper():
+                        return False, "ACCOUNT_SUSPENDED"
+                    await asyncio.sleep(1.5 * attempt)
+            if not part_supported:
+                continue
+
+    # ── روش ۲: ارسال مستقیم ──
     variants = []
     if sf:
         variants.append(("send_file+cap", lambda: sf(entity, file_path, caption=caption)))
@@ -1394,53 +1440,53 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
     if sd:
         variants.append(("send_document", lambda: sd(entity, file_path, caption=caption)))
 
-    for attempt in range(1, 3):
-        for tag, fn in variants:
-            try:
-                await _aw(fn())
-                # اگر بدون کپشن فرستاده شد، کپشن جدا بره
-                if tag == "send_file" and caption:
-                    try: await _aw(cli.send_message(entity, caption))
-                    except Exception: pass
-                flog(f"[send-file] OK via {tag} (attempt {attempt})")
-                return True, f"OK-{tag}"
-            except FloodWaitError as fe:
-                await asyncio.sleep(min(fe.seconds + 1, 30))
-                last_err = f"Flood {fe.seconds}s"
-            except Exception as e:
-                last_err = f"{tag}:{type(e).__name__}:{str(e)[:80]}"
-                flog(f"[send-file] {last_err}", "warning")
-                if "USER_SUSPENDED" in str(e).upper():
-                    return False, "ACCOUNT_SUSPENDED"
-        await asyncio.sleep(2 * attempt)
+    for tag, fn in variants:
+        try:
+            await _aw(fn())
+            if tag == "send_file" and caption:
+                try: await _aw(cli.send_message(entity, caption))
+                except Exception: pass
+            flog(f"[send-file] OK via {tag}")
+            return True, f"OK-{tag}"
+        except Exception as e:
+            last_err = f"{tag}:{type(e).__name__}:{str(e)[:70]}"
+            flog(f"[send-file] {last_err}", "warning")
+            if "USER_SUSPENDED" in str(e).upper():
+                return False, "ACCOUNT_SUSPENDED"
 
-    # آپلود به Saved Messages + فوروارد
+    # ── روش ۳: اتصال کاملاً تازه (کلاینت جدید از session) و تلاش دوباره ──
     try:
-        me = await cli.get_me()
-        mid = None
-        if sf and me:
-            r = await _aw(sf(me, file_path))
-            mid = getattr(r, "id", None)
-            if mid is None:
-                upd = getattr(r, "updates", None) or r
-                for m in (getattr(upd, "updates", None) or getattr(upd, "messages", None) or []):
-                    mid = getattr(m, "id", None)
-                    if mid: break
-        if mid:
-            fm = getattr(cli, "forward_messages", None)
-            if fm:
-                await _aw(fm(entity, mid, me))
-                if caption:
-                    try: await _aw(cli.send_message(entity, caption))
-                    except Exception: pass
-                return True, "OK-fwd"
+        raw = getattr(cli, "raw", None)
+        sess = None
+        if raw is not None:
+            try: sess = raw.session.save()
+            except Exception: sess = None
+        if sess:
+            fresh = SoroushClient(StringSession(sess))
+            await fresh.connect()
+            try:
+                await asyncio.sleep(1.5)
+                try: await fresh.get_me()
+                except Exception: pass
+                try:
+                    _eid = getattr(entity, "id", None)
+                    tgt = await fresh.get_entity(_eid) if _eid is not None else entity
+                except Exception:
+                    tgt = entity
+                await _aw(fresh.send_file(tgt, file_path, caption=caption))
+                flog("[send-file] OK via fresh client")
+                return True, "OK-fresh"
+            finally:
+                try: await fresh.disconnect()
+                except Exception: pass
     except Exception as e:
-        last_err += f" | fwd:{type(e).__name__}:{str(e)[:60]}"
+        last_err += f" | fresh:{type(e).__name__}:{str(e)[:60]}"
 
+    # ── آخرین راه: فقط کپشن به‌صورت متن ──
     if caption:
         try:
             await _aw(cli.send_message(entity, caption))
-            return True, "text_fallback"
+            return True, f"text_fallback ({last_err[:60]})"
         except Exception: pass
 
     flog(f"[send-file] FAILED: {last_err}", "error")
@@ -3121,7 +3167,7 @@ async def restart_all_listeners():
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.10 — PV POLLING + reply با entity درست
+# ⭐ v27.9.11 — PV POLLING + reply با entity درست + warmup قبل آپلود
 # ══════════════════════════════════════════════════════════════════
 PV_LISTENER_TASKS: Dict[str, asyncio.Task] = {}
 _PV_SEEN_MSGS: Dict[str, Dict[str, float]] = {}
@@ -3130,7 +3176,7 @@ _PV_STOP_EVENTS: Dict[str, asyncio.Event] = {}
 
 
 async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event, sender_entity=None):
-    """v27.9.10: resolve entity یک‌بار برای متن و فایل"""
+    """v27.9.11: resolve entity + warmup قبل از آپلود فایل"""
     name = acc.get("name") or aid
     cfg = _load_pv_items()
     delay_sec = int(cfg.get("delay_seconds", 120))
@@ -3171,6 +3217,12 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event, sender_enti
             if target is None:
                 target = sender_id
             flog(f"[pv] target type: {type(target).__name__}")
+
+            # ── گرم‌کردن اتصال برای آپلود (اتصال تازه فایل قبول نمی‌کنه) ──
+            try:
+                await asyncio.wait_for(cli.get_me(), timeout=15)
+                await asyncio.sleep(1.5)
+            except Exception: pass
 
             items = cfg.get("items") or []
             for item in items:
@@ -3292,7 +3344,6 @@ async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
     if stop_evt is None:
         stop_evt = asyncio.Event(); _PV_STOP_EVENTS[aid] = stop_evt
 
-    # ✅ v27.9.10: sender entity پاس داده می‌شه
     t = asyncio.create_task(_pv_send_reply(aid, acc, sender_id, user_info, stop_evt, sender))
     _PV_REPLY_TASKS[key] = t
 
@@ -5857,7 +5908,7 @@ def main(token=None, owner_id=None):
     if token: TG_TOKEN = token
     else: TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
     if not TG_TOKEN or ":" not in TG_TOKEN: print("[x] TG_TOKEN نیست."); return
-    if owner_id: FORCE1D_OWNER = int(owner_id)
+    if owner_id: FORCED_OWNER = int(owner_id)
     else:
         try: FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "8389746549"))
         except: FORCED_OWNER = 8389746549
