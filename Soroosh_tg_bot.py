@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9.1 (PV send fix + raw fallback + text fallback)
+# Soroosh_tg_bot.py — v27.9.2 (PV send fix + notify + pv:menu fix + text fallback)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.1"
+VERSION = "Soroosh v27.9.2"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -341,6 +341,7 @@ DEFAULT_PV_ITEMS = {
     "enabled": False,
     "delay_seconds": 120,
     "reply_once": True,
+    "notify": True,
     "items": [{"kind": "text", "text": "سلام 👋"}]
 }
 
@@ -1369,8 +1370,7 @@ def _detect_file_kind(file_path: str) -> str:
 # ⭐ PATCH v27.9.1 — ارسال فایل با fallback چند سطحی + لاگ خطای واقعی
 # ══════════════════════════════════════════════════════════════════
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    """v27.9.1: ارسال فایل با fallback چند سطحی + لاگ خطای واقعی RPC"""
-    # بدون فایل → فقط متن
+    """v27.9.2: ارسال فایل با fallback چند سطحی + لاگ خطای واقعی RPC"""
     if not file_path:
         if caption:
             try:
@@ -2633,7 +2633,6 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                 try:
                     ent = t.get("entity") or t["target"]
                     if not _is_group_or_channel(ent) and t.get("type") != "pv": continue
-                    # ⭐ PATCH v27.9.1: فایل رد شد → متن بفرست
                     if attach_file and os.path.exists(attach_file):
                         _ok, _err = await _send_file_to_entity(cli, ent, attach_file, attach_caption or sender_text)
                         if not _ok and sender_text:
@@ -3024,7 +3023,6 @@ async def _send_worker(aid, acc, op_id, cfg, stop, log):
                 if stop.is_set(): break
                 try:
                     ent = t.get("entity") or t["target"]
-                    # ⭐ PATCH v27.9.1: فایل رد شد → متن بفرست
                     if attach_file and os.path.exists(attach_file):
                         _ok, _err = await _send_file_to_entity(cli, ent, attach_file, text)
                         if not _ok and text:
@@ -3206,6 +3204,9 @@ async def restart_all_listeners():
     await asyncio.sleep(1); await start_all_listeners()
 
 
+# ══════════════════════════════════════════════════════════════════
+# ⭐ PATCH v27.9.2 — _pv_responder_worker با نوتیف
+# ══════════════════════════════════════════════════════════════════
 async def _pv_responder_worker(aid, acc, stop_event):
     name = acc.get("name") or acc.get("phone") or aid
     flog(f"[pv] {name}: worker started")
@@ -3223,12 +3224,12 @@ async def _pv_responder_worker(aid, acc, stop_event):
             @raw.on(events.NewMessage(incoming=True))
             async def _on_pv(event):
                 sender_id = None
+                user_info = {}
                 try:
                     cfg = _load_pv_items()
                     if not cfg.get("enabled"): return
                     if not getattr(event, "is_private", False): return
                     if getattr(event, "out", False): return
-                    user_info = {}
                     try:
                         sender = await event.get_sender()
                         if sender is None: return
@@ -3262,6 +3263,8 @@ async def _pv_responder_worker(aid, acc, stop_event):
                     items = cfg.get("items") or []
                     if not APP:
                         flog(f"[pv] {name}: APP not ready", "warning"); return
+                    send_ok = True
+                    send_err = None
                     for item in items:
                         if stop_event.is_set(): return
                         kind = item.get("kind", "text")
@@ -3284,20 +3287,39 @@ async def _pv_responder_worker(aid, acc, stop_event):
                                         await asyncio.sleep(random.uniform(1.0, 2.5))
                                     except Exception as fe:
                                         flog(f"[pv] copy failed: {type(fe).__name__}: {fe}", "warning")
+                                        send_ok = False
+                                        send_err = f"copy: {str(fe)[:100]}"
                             elif kind == "delay":
                                 sec = int(item.get("seconds", 3))
                                 await asyncio.sleep(sec)
                         except FloodWaitError as fe:
                             await asyncio.sleep(fe.seconds + 1)
+                            send_ok = False
+                            send_err = f"Flood {fe.seconds}s"
                         except Exception as e:
                             flog(f"[pv] send step err: {type(e).__name__}: {e}", "warning")
+                            send_ok = False
+                            send_err = f"{type(e).__name__}: {str(e)[:120]}"
 
                     if cfg.get("reply_once", True):
                         _mark_pv_replied(aid, str(sender_id))
                     try:
-                        _record_pv_reply(aid, str(sender_id), ok=True, err=None)
+                        _record_pv_reply(aid, str(sender_id), ok=send_ok, err=send_err)
                     except Exception: pass
-                    flog(f"[pv] {name}: replied to {sender_id} ✅")
+
+                    if cfg.get("notify", True):
+                        u_label = (user_info.get("first_name") or
+                                   (("@" + user_info["username"]) if user_info.get("username") else None) or
+                                   str(sender_id))
+                        try:
+                            if send_ok:
+                                await tg_send(f"✅ پیام PV به <b>{esc(u_label)}</b> ارسال شد")
+                            else:
+                                await tg_send(f"❌ پیام PV به <b>{esc(u_label)}</b> خطا: <code>{esc(send_err or '?')}</code>")
+                        except Exception as ne:
+                            flog(f"[pv] notify err: {type(ne).__name__}", "warning")
+
+                    flog(f"[pv] {name}: replied to {sender_id} ({'OK' if send_ok else 'FAIL'})")
                 except Exception as e:
                     flog(f"[pv] handler err: {type(e).__name__}: {e}", "warning")
                     try:
@@ -3617,10 +3639,12 @@ async def show_pv_menu():
     enabled = bool(cfg.get("enabled"))
     delay = int(cfg.get("delay_seconds", 120))
     once = bool(cfg.get("reply_once", True))
+    notify_on = bool(cfg.get("notify", True))
     items = cfg.get("items") or []
     txt = head("💬", "پاسخ خودکار PV")
     txt += f"وضعیت: <b>{'🟢 فعال' if enabled else '⚪ خاموش'}</b>\n"
     txt += f"⏱ تایمر: <b>{delay}s</b>  ·  🔁 یک‌بار: <b>{'🟢' if once else '⚪'}</b>\n"
+    txt += f"🔔 نوتیف: <b>{'🟢' if notify_on else '⚪'}</b>\n"
     txt += f"📨 پیام‌ها: <b>{len(items)}</b> عدد\n\n"
     if items:
         for i, it in enumerate(items, 1):
@@ -3633,6 +3657,7 @@ async def show_pv_menu():
         txt += "<i>💡 هر عکس/ویدیو/فایلی که تو همین چت PV بفرستی ذخیره می‌شه</i>"
     rows = [
         [B(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), "pv:toggle")],
+        [B(("🔔 نوتیف روشن" if notify_on else "🔕 نوتیف خاموش"), "pv:toggle_notify")],
         [B("⏱ تایمر", "pv:set_delay"), B("🔁 یک‌بار" + (" ✅" if once else ""), "pv:toggle_once")],
         [B("➕ متن", "pv:add_text")],
         [B("📎 ذخیره پیام (فایل/عکس)", "pv:add_saved")],
@@ -4969,6 +4994,12 @@ async def route_cb(cid, data):
     if h == "pv":
         cfg = _load_pv_items()
         sub = p[1] if len(p) > 1 else ""
+        if sub == "menu":
+            return await show_pv_menu()
+        if sub == "toggle_notify":
+            cfg["notify"] = not bool(cfg.get("notify", True))
+            _save_pv_items(cfg)
+            return await show_pv_menu()
         if sub == "toggle":
             cfg["enabled"] = not bool(cfg.get("enabled"))
             _save_pv_items(cfg)
