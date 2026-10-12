@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.8 (all fixes + infinite loop + PV report)
+# Soroosh_tg_bot.py — v27.9 (all fixes + __getattr__ + raw SendMedia fallback + infinite loop + PV report)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.8"
+VERSION = "Soroosh v27.9"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -454,11 +454,28 @@ def _get_account_lock(aid):
 
 
 class SafeSoroushClient:
+    """
+    پروکسی امن روی SoroushClient که:
+    - در صورت تایم‌اوت قفل رو آزاد می‌کنه
+    - تمام متدهای SoroushClient (send_file, send_photo, edit_message, ...)
+      رو از طریق __getattr__ به raw client پاس می‌ده
+    """
     def __init__(self, aid, session_string, name=None, use_lock=True):
         self.aid = aid; self.session_string = session_string
         self.name = name or aid; self._client = None
         self._lock = _get_account_lock(aid) if use_lock else None
         self._locked = False
+
+    def __getattr__(self, name):
+        # فقط زمانی صدا زده می‌شه که lookup معمولی شکست بخوره.
+        # هرچی روی raw client هست (send_file, send_photo, upload_file,
+        # edit_message, set_profile_photo, set_chat_photo, ...) از اینجا رد می‌شه.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raw = self.__dict__.get("_client")
+        if raw is None:
+            raise AttributeError(f"SafeSoroushClient[{self.__dict__.get('aid','?')}]: not connected ({name})")
+        return getattr(raw, name)
 
     async def __aenter__(self):
         if self._lock:
@@ -1356,6 +1373,7 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
     flog(f"[send-file] kind={kind} name={os.path.basename(file_path)} size={os.path.getsize(file_path)}")
     tried = []
 
+    # --- مرحله ۱: helper های سطح بالا (حالا با __getattr__ کار می‌کنن) ---
     sf = getattr(cli, "send_file", None)
     if sf:
         for kw in ({"caption": caption}, {}):
@@ -1427,7 +1445,50 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
             if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
             tried.append(f"sm:{type(e).__name__}")
 
-    err_summary = " | ".join(tried[:5])
+    # --- مرحله ۲: raw API fallback ---
+    try:
+        from splusthon.tl.functions.messages import SendMediaRequest
+        from splusthon.tl.types import (
+            InputMediaUploadedDocument, InputMediaUploadedPhoto,
+            DocumentAttributeFilename,
+        )
+        raw = getattr(cli, "raw", cli)
+        peer = await raw.get_input_entity(entity)
+        uploaded = await raw.upload_file(file_path)
+        if kind == "photo":
+            media = InputMediaUploadedPhoto(file=uploaded)
+        else:
+            fname = os.path.basename(file_path)
+            low = fname.lower()
+            if kind == "video" or low.endswith((".mp4", ".mov", ".mkv", ".webm")):
+                mime = "video/mp4"
+            elif low.endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif low.endswith(".png"):
+                mime = "image/png"
+            elif low.endswith(".gif"):
+                mime = "image/gif"
+            elif low.endswith(".pdf"):
+                mime = "application/pdf"
+            else:
+                mime = "application/octet-stream"
+            attrs = [DocumentAttributeFilename(file_name=fname)]
+            media = InputMediaUploadedDocument(
+                file=uploaded, mime_type=mime, attributes=attrs,
+            )
+        await raw(SendMediaRequest(
+            peer=peer, media=media, message=caption or "",
+            random_id=random.randint(-2**63, 2**63 - 1),
+        ))
+        flog(f"[send-file] ✅ raw SendMediaRequest")
+        return True, "OK"
+    except ImportError as ie:
+        tried.append(f"raw_imp:{ie}")
+    except Exception as e:
+        tried.append(f"raw:{type(e).__name__}")
+        flog(f"[send-file] raw fallback failed: {type(e).__name__}: {e}", "warning")
+
+    err_summary = " | ".join(tried[:5]) if tried else "no_methods_available"
     flog(f"[send-file] ❌ FAILED: {err_summary}", "error")
     return False, f"all_failed: {err_summary[:180]}"
 
