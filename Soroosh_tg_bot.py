@@ -5,7 +5,7 @@ import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.5"
+VERSION = "Soroosh v27.9.6"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -3232,6 +3232,27 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
                             r = cli.send_message(sender_id, txt)
                             if asyncio.iscoroutine(r): r = await r
                             await asyncio.sleep(random.uniform(1.0, 2.5))
+                    elif kind == "file":
+                        fpath = item.get("file_path")
+                        fcap = item.get("caption") or ""
+
+                        if fpath and os.path.exists(fpath):
+                            try:
+                                _ok_f, _err_f = await _send_file_to_entity(
+                                    cli, sender_id, fpath, fcap
+                                )
+                                if not _ok_f:
+                                    send_ok = False
+                                    send_err = str(_err_f)[:120]
+
+                                await asyncio.sleep(random.uniform(1.0, 2.5))
+                            except Exception as fe:
+                                send_ok = False
+                                send_err = f"file: {str(fe)[:100]}"
+                        else:
+                            send_ok = False
+                            send_err = f"file missing: {os.path.basename(str(fpath))}"
+
                     elif kind == "forward":
                         mid = item.get("message_id")
                         fcid = item.get("from_chat_id") or FORCED_OWNER
@@ -4792,14 +4813,36 @@ async def _on_message_impl(update, context):
     if conv.get("pv_save_msg"):
         conv.pop("pv_save_msg")
         media = _extract_media(msg)
-        if not media and not text:
+        caption = text or ""
+        if not media and not caption:
             return await ask("❌ پیام معتبر نیست. دوباره بفرست:")
+
+        local_path = None
+        if media:
+            try:
+                local_path = await _download_tg_file(media, "pv", "pvitem")
+            except Exception as de:
+                flog(f"[pv] download fail: {type(de).__name__}: {de}", "warning")
+                local_path = None
+
         cfg = _load_pv_items()
         items = cfg.get("items") or []
-        items.append({"kind": "forward", "message_id": msg.message_id, "from_chat_id": cid})
+
+        if local_path:
+            items.append({
+                "kind": "file",
+                "file_path": local_path,
+                "caption": caption
+            })
+            await tg_send(
+                f"✅ فایل ذخیره شد: <code>{os.path.basename(local_path)}</code>"
+            )
+        else:
+            items.append({"kind": "text", "text": caption})
+            await tg_send("✅ ذخیره شد")
+
         cfg["items"] = items
         _save_pv_items(cfg)
-        await tg_send("✅ ذخیره شد")
         return await show_pv_menu()
 
     if conv.get("accphoto_upload"):
