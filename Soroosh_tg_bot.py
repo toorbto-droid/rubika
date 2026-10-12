@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.5.1 (clean full)
+# Soroosh_tg_bot.py — v27.6 (raw_id fix + file fix + PV forward + resolve fix)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.5.1"
+VERSION = "Soroosh v27.6"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -79,6 +79,12 @@ try:
     except Exception: UploadProfilePhotoRequest = None; DeletePhotosRequest = None
     try: from splusthon.tl.types import InputPhoto, InputPhotoEmpty
     except Exception: InputPhoto = None; InputPhotoEmpty = None
+    try:
+        from splusthon.tl.functions.messages import SendMediaRequest, UploadMediaRequest
+    except Exception: SendMediaRequest = None; UploadMediaRequest = None
+    try:
+        from splusthon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument
+    except Exception: InputMediaUploadedPhoto = None; InputMediaUploadedDocument = None
 
     InputChannel = None
     for mod in ("splusthon.tl.types", "splusthon.tl.types.channels"):
@@ -167,7 +173,14 @@ def _is_perm_error(ex):
                                   "CHANNEL_PRIVATE", "CHAT_ADMIN_REQUIRED",
                                   "NOT_ENOUGH_RIGHTS", "SEND_MESSAGES_FORBIDDEN",
                                   "MESSAGE_SEND_FAILED", "FORBIDDEN", "USER_KICKED",
-                                  "USER_NOT_PARTICIPANT"))
+                                  "USER_NOT_PARTICIPANT", "USER_SUSPENDED",
+                                  "USER_DEACTIVATED", "SESSION_REVOKED",
+                                  "AUTH_KEY_UNREGISTERED"))
+
+def _is_suspended(ex):
+    msg = str(ex).upper()
+    return any(k in msg for k in ("USER_SUSPENDED", "USER_DEACTIVATED",
+                                   "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED"))
 
 def _is_group_or_channel(ent) -> bool:
     if ent is None: return False
@@ -220,7 +233,7 @@ SEEN_FILE        = os.path.join(SOROOSH_DIR, "seen_links.json")
 BANNED_FILE      = os.path.join(SOROOSH_DIR, "banned_groups.json")
 LDPROG_FILE      = os.path.join(SOROOSH_DIR, "linkdoni_progress.json")
 PV_REPLIES_FILE  = os.path.join(SOROOSH_DIR, "pv_replies.json")
-PV_CONFIG_FILE   = os.path.join(SOROOSH_DIR, "pv_responder.json")
+PV_ITEMS_FILE    = os.path.join(SOROOSH_DIR, "pv_items.json")
 
 _SEEN_CACHE: Optional[Set[str]] = None
 _BANNED_CACHE: Optional[Dict[str, Any]] = None
@@ -304,6 +317,7 @@ def _reset_ld_progress():
     try: _save(LDPROG_FILE, {})
     except Exception: pass
 
+# ═════ PV replies tracking ═════
 def _load_pv_replies() -> Dict[str, Any]:
     d = _load(PV_REPLIES_FILE, {})
     return d if isinstance(d, dict) else {}
@@ -326,14 +340,24 @@ def _has_pv_replied(aid: str, user_id: str) -> bool:
 def _clear_pv_replies():
     _save_pv_replies({})
 
-def _load_pv_cfg() -> Dict[str, Any]:
-    d = _load(PV_CONFIG_FILE, {
-        "enabled": False, "delay_seconds": 120, "reply_once": True,
-        "messages": [{"type": "text", "text": "سلام 👋"}],
-    })
-    return d if isinstance(d, dict) else {}
+# ═════ PV items (forward-based) ═════
+DEFAULT_PV_ITEMS = {
+    "enabled": False,
+    "delay_seconds": 120,
+    "reply_once": True,
+    "items": [
+        {"kind": "text", "text": "سلام 👋"}
+    ]
+}
 
-def _save_pv_cfg(d): _save(PV_CONFIG_FILE, d)
+def _load_pv_items() -> Dict[str, Any]:
+    d = _load(PV_ITEMS_FILE, DEFAULT_PV_ITEMS)
+    if not isinstance(d, dict): return dict(DEFAULT_PV_ITEMS)
+    for k, v in DEFAULT_PV_ITEMS.items():
+        if k not in d: d[k] = v
+    return d
+
+def _save_pv_items(d): _save(PV_ITEMS_FILE, d)
 
 
 # ═══════════════ LINK DONIES ═══════════════
@@ -569,6 +593,10 @@ def get_own_channel_ids(aid: str) -> Set[int]:
             if cid is not None:
                 try: out.add(int(cid))
                 except Exception: pass
+            rid = ch.get("raw_id")
+            if rid is not None:
+                try: out.add(int(rid))
+                except Exception: pass
     except Exception: pass
     return out
 
@@ -608,7 +636,19 @@ def _channel_data_from_obj(ch_obj) -> Dict[str, Any]:
         return None
     cid = g("id", "channel_id", "chat_id")
     if cid is not None:
-        try: out["id"] = int(cid); out["guid"] = "c" + str(int(cid))
+        try:
+            cid_i = int(cid)
+            out["id"] = cid_i
+            out["guid"] = "c" + str(cid_i)
+            # ★ ذخیره raw_id برای resolve
+            if cid_i < 0:
+                s = str(cid_i)
+                if s.startswith("-100"):
+                    out["raw_id"] = int(s[4:])
+                else:
+                    out["raw_id"] = abs(cid_i)
+            else:
+                out["raw_id"] = cid_i
         except Exception: pass
     ah = g("access_hash", "accessHash", "hash")
     if ah is not None:
@@ -626,30 +666,50 @@ def _channel_data_from_obj(ch_obj) -> Dict[str, Any]:
             if isinstance(l2, str) and l2.strip(): out["join_link"] = l2.strip(); break
     return out
 
+
+# ★★★ _resolve_channel_entity — فیکس کامل فرمت id ★★★
 async def _resolve_channel_entity(cli, ch: Dict[str, Any], aid: str = None):
     tried: List[str] = []
     cid = ch.get("id"); ah = ch.get("access_hash")
+    raw_id = ch.get("raw_id")
     try: cid_int = int(cid) if cid is not None else None
     except Exception: cid_int = None
-    if cid_int is not None and not ah:
-        try:
-            dialogs = await cli.get_dialogs()
+    try: raw_int = int(raw_id) if raw_id is not None else None
+    except Exception: raw_int = None
+
+    # ۱) جستجو در دیالوگ‌ها — بهترین روش
+    try:
+        dialogs = await cli.get_dialogs()
+        # 1a) با id
+        if cid_int is not None:
             for d in dialogs or []:
-                if getattr(d, "id", None) == cid_int:
+                d_id = getattr(d, "id", None)
+                if d_id == cid_int or (raw_int is not None and d_id == raw_int):
                     ent = getattr(d, "entity", None)
-                    if ent is None: continue
-                    ah_new = getattr(ent, "access_hash", None)
-                    if ah_new is not None and aid:
-                        try:
-                            accounts = list_accounts()
-                            if aid in accounts:
-                                for c in accounts[aid].get("channels") or []:
-                                    if c.get("id") == cid_int:
-                                        c["access_hash"] = str(ah_new)
-                                        save_accounts(accounts); break
-                        except Exception: pass
-                    return ent, "dialog_hash_grab"
-        except Exception as e: tried.append(f"hash_grab:{type(e).__name__}")
+                    if ent is not None:
+                        ah_new = getattr(ent, "access_hash", None)
+                        if ah_new is not None and aid:
+                            try:
+                                accounts = list_accounts()
+                                if aid in accounts:
+                                    for c in accounts[aid].get("channels") or []:
+                                        if c.get("id") == cid_int:
+                                            c["access_hash"] = str(ah_new)
+                                            save_accounts(accounts); break
+                            except Exception: pass
+                        return ent, "dialog_id"
+        # 1b) با title
+        title = (ch.get("title") or "").strip()
+        if title:
+            for d in dialogs or []:
+                ent = getattr(d, "entity", None)
+                if ent is None: continue
+                t2 = (getattr(ent, "title", None) or getattr(d, "name", None) or getattr(d, "title", None) or "")
+                if t2 == title: return ent, "dialog_by_title"
+    except Exception as e:
+        tried.append(f"dialogs:{type(e).__name__}")
+
+    # ۲) با username
     un = (ch.get("username") or "").lstrip("@").strip()
     if un:
         for t in (un, "@" + un):
@@ -657,31 +717,57 @@ async def _resolve_channel_entity(cli, ch: Dict[str, Any], aid: str = None):
                 ent = await cli.get_entity(t)
                 if ent: return ent, f"username:{t}"
             except Exception as e: tried.append(f"un:{t}:{type(e).__name__}")
+
+    # ۳) با فرمت‌های مختلف id — فیکس شده
     if cid_int is not None:
-        try:
-            dialogs = await cli.get_dialogs()
-            for d in dialogs or []:
-                if getattr(d, "id", None) == cid_int:
-                    ent = getattr(d, "entity", None)
-                    if ent: return ent, "dialog_id"
-        except Exception as e: tried.append(f"dialog:{type(e).__name__}")
-    if cid_int is not None:
-        for fmt in (cid_int, -cid_int, -1000000000000 - cid_int, str(cid_int), "c" + str(cid_int)):
+        formats_to_try = []
+        if cid_int > 0:
+            formats_to_try = [
+                cid_int,
+                -cid_int,
+                int(f"-100{cid_int}"),         # ★ فرمت اصلی
+                -1000000000000 - cid_int,
+                str(cid_int),
+                f"-100{cid_int}",
+            ]
+        else:
+            abs_id = abs(cid_int)
+            s = str(abs_id)
+            if s.startswith("100") and len(s) > 10:
+                # -100xxx
+                raw = int(s[3:])
+                formats_to_try = [cid_int, raw, -raw, int(f"-100{raw}")]
+            else:
+                formats_to_try = [cid_int, abs_id, int(f"-100{abs_id}"), str(cid_int)]
+        seen_fmts = set()
+        for fmt in formats_to_try:
             try:
+                key = str(fmt)
+                if key in seen_fmts: continue
+                seen_fmts.add(key)
                 ent = await cli.get_entity(fmt)
                 if ent: return ent, f"ge:{fmt}"
-            except Exception as e: tried.append(f"ge:{fmt}:{type(e).__name__}")
+            except Exception as e:
+                tried.append(f"ge:{fmt}:{type(e).__name__}")
+                continue
+
+    # ۴) با InputChannel
     if cid_int is not None and ah and InputChannel is not None:
-        try:
-            inp = InputChannel(cid_int, int(ah))
-            if GetFullChannelRequest:
-                try:
-                    full = cli(GetFullChannelRequest(channel=inp))
-                    if asyncio.iscoroutine(full): full = await full
-                    if full: return inp, "input_channel_ok"
-                except Exception as e: tried.append(f"ic_verify:{type(e).__name__}")
-            else: return inp, "input_channel"
-        except Exception as e: tried.append(f"ic_build:{type(e).__name__}")
+        for cid_try in ([cid_int, abs(cid_int)] if cid_int else []):
+            try:
+                inp = InputChannel(cid_try, int(ah))
+                if GetFullChannelRequest:
+                    try:
+                        full = cli(GetFullChannelRequest(channel=inp))
+                        if asyncio.iscoroutine(full): full = await full
+                        if full: return inp, "input_channel_ok"
+                    except Exception as e: tried.append(f"ic_verify:{type(e).__name__}")
+                else:
+                    return inp, "input_channel"
+            except Exception as e:
+                tried.append(f"ic_build:{type(e).__name__}")
+
+    # ۵) با guid
     g = ch.get("guid")
     if g:
         for t in (g, str(g).lstrip("c")):
@@ -689,16 +775,9 @@ async def _resolve_channel_entity(cli, ch: Dict[str, Any], aid: str = None):
                 ent = await cli.get_entity(t)
                 if ent: return ent, f"guid:{t}"
             except Exception as e: tried.append(f"g:{t}:{type(e).__name__}")
-    title = (ch.get("title") or "").strip()
-    if title:
-        try:
-            dialogs = await cli.get_dialogs()
-            for d in dialogs or []:
-                ent = getattr(d, "entity", None)
-                t2 = (getattr(ent, "title", None) or getattr(d, "name", None) or getattr(d, "title", None) or "")
-                if t2 == title and ent is not None: return ent, "dialog_by_title"
-        except Exception as e: tried.append(f"by_title:{type(e).__name__}")
-    return None, "|".join(tried[-5:]) if tried else "no strategy"
+
+    return None, "|".join(tried[-8:]) if tried else "no strategy"
+
 
 async def send_to_channel(aid: str, idx: int, text: str):
     channels = get_stored_channels(aid)
@@ -720,6 +799,7 @@ async def send_to_channel(aid: str, idx: int, text: str):
         if cli:
             try: await cli._disconnect()
             except Exception: pass
+
 
 async def export_invite_link(aid: str, idx: int):
     channels = get_stored_channels(aid)
@@ -817,6 +897,7 @@ async def export_invite_link(aid: str, idx: int):
             try: await cli._disconnect()
             except Exception: pass
 
+
 async def diagnose_channel(aid: str, idx: int) -> str:
     channels = get_stored_channels(aid)
     if idx < 0 or idx >= len(channels): return "کانال نیست"
@@ -894,6 +975,7 @@ async def get_account_stats(aid: str, force: bool = False) -> Dict[str, Any]:
     _STATS_CACHE[aid] = {"ts": now, "data": stats}; return stats
 
 
+# ═══════════════ LOGIN ═══════════════
 _LOGIN_TMP: Dict[str, Dict[str, Any]] = {}
 
 async def soroosh_send_code(phone_raw):
@@ -1160,7 +1242,6 @@ async def _send_with_edit_delay(cli, entity, real_text: str, placeholder: str = 
         msg_obj = r
     except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
     except Exception as e: return False, f"send:{type(e).__name__}: {_fmt_error(e)}"
-
     def _find_mid(mo):
         if mo is None: return None
         try:
@@ -1208,7 +1289,11 @@ async def _send_to_entity(cli, entity, text, snd_cfg: Dict[str, Any], log=None):
             if asyncio.iscoroutine(r): r = await r
             return True, None
         except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
-        except Exception as e: return False, f"{type(e).__name__}: {_fmt_error(e)}"
+        except Exception as e:
+            err_s = str(e).upper()
+            if "USER_SUSPENDED" in err_s:
+                raise RuntimeError("ACCOUNT_SUSPENDED")
+            return False, f"{type(e).__name__}: {_fmt_error(e)}"
 
 async def _set_personal_channel(cli, pub_ent) -> Tuple[bool, str]:
     if UpdatePersonalChannelRequest is None: return False, "API_not_available"
@@ -1236,26 +1321,106 @@ def _detect_file_kind(file_path: str) -> str:
     if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"): return "video"
     return "document"
 
+
+# ★★★ _send_file_to_entity — چند روش ★★★
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
     if not file_path: return False, "no_path"
-    if not os.path.exists(file_path): return False, f"not_found:{file_path[:80]}"
-    try:
-        sf = getattr(cli, "send_file", None)
-        if sf:
+    if not os.path.exists(file_path): return False, f"not_found:{os.path.basename(file_path)}"
+
+    kind = _detect_file_kind(file_path)
+    flog(f"[send-file] kind={kind} name={os.path.basename(file_path)}")
+    tried = []
+
+    # روش ۱: send_file
+    sf = getattr(cli, "send_file", None)
+    if sf:
+        for kw in ({"caption": caption}, {}):
             try:
-                r = sf(entity, file_path, caption=caption)
+                r = sf(entity, file_path, **kw)
                 if asyncio.iscoroutine(r): r = await r
+                flog(f"[send-file] ✅ send_file")
                 return True, "OK"
-            except TypeError:
+            except TypeError: tried.append("send_file:TypeErr"); continue
+            except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+            except Exception as e: tried.append(f"sf:{type(e).__name__}"); continue
+
+    # روش ۲: send_photo
+    if kind == "photo":
+        sp = getattr(cli, "send_photo", None)
+        if sp:
+            for kw in ({"caption": caption}, {}):
                 try:
-                    r = sf(entity, file_path)
+                    r = sp(entity, file_path, **kw)
                     if asyncio.iscoroutine(r): r = await r
+                    flog(f"[send-file] ✅ send_photo")
                     return True, "OK"
-                except Exception as e:
-                    return False, f"send_file:{type(e).__name__}: {_fmt_error(e)[:80]}"
-        return False, "send_file_not_available"
-    except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
-    except Exception as e: return False, f"{type(e).__name__}: {_fmt_error(e)[:100]}"
+                except TypeError: tried.append("sp:TypeErr"); continue
+                except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+                except Exception as e: tried.append(f"sp:{type(e).__name__}"); continue
+
+    # روش ۳: send_video
+    if kind == "video":
+        sv = getattr(cli, "send_video", None)
+        if sv:
+            for kw in ({"caption": caption}, {}):
+                try:
+                    r = sv(entity, file_path, **kw)
+                    if asyncio.iscoroutine(r): r = await r
+                    flog(f"[send-file] ✅ send_video")
+                    return True, "OK"
+                except TypeError: tried.append("sv:TypeErr"); continue
+                except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+                except Exception as e: tried.append(f"sv:{type(e).__name__}"); continue
+
+    # روش ۴: send_document
+    sd = getattr(cli, "send_document", None)
+    if sd:
+        for kw in ({"caption": caption}, {}):
+            try:
+                r = sd(entity, file_path, **kw)
+                if asyncio.iscoroutine(r): r = await r
+                flog(f"[send-file] ✅ send_document")
+                return True, "OK"
+            except TypeError: tried.append("sd:TypeErr"); continue
+            except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+            except Exception as e: tried.append(f"sd:{type(e).__name__}"); continue
+
+    # روش ۵: send_media
+    sm = getattr(cli, "send_media", None)
+    if sm:
+        try:
+            r = sm(entity, file_path, caption=caption)
+            if asyncio.iscoroutine(r): r = await r
+            flog(f"[send-file] ✅ send_media")
+            return True, "OK"
+        except TypeError: tried.append("sm:TypeErr")
+        except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+        except Exception as e: tried.append(f"sm:{type(e).__name__}")
+
+    # روش ۶: raw upload + SendMedia
+    try:
+        up = getattr(cli, "upload_file", None)
+        if up and SendMediaRequest is not None:
+            uf = up(file_path)
+            if asyncio.iscoroutine(uf): uf = await uf
+            if kind == "photo" and InputMediaUploadedPhoto is not None:
+                r = cli(SendMediaRequest(peer=entity, media=InputMediaUploadedPhoto(file=uf), message=caption or ""))
+                if asyncio.iscoroutine(r): r = await r
+                flog(f"[send-file] ✅ SendMedia(photo)")
+                return True, "OK"
+            elif InputMediaUploadedDocument is not None:
+                r = cli(SendMediaRequest(peer=entity, media=InputMediaUploadedDocument(
+                    file=uf, mime_type="application/octet-stream", attributes=[]), message=caption or ""))
+                if asyncio.iscoroutine(r): r = await r
+                flog(f"[send-file] ✅ SendMedia(doc)")
+                return True, "OK"
+    except Exception as e:
+        tried.append(f"raw:{type(e).__name__}")
+
+    err_summary = " | ".join(tried[:5])
+    flog(f"[send-file] ❌ FAILED: {err_summary}", "error")
+    return False, f"all_failed: {err_summary[:180]}"
+
 
 async def soroosh_set_profile_photo(cli, file_path: str) -> Tuple[bool, str]:
     if not os.path.exists(file_path): return False, "فایل پیدا نشد"
@@ -1381,6 +1546,7 @@ async def _lefter_collect(cli, mode: str = "all", exclude_ids: Set[int] = None) 
             if not eid: continue
             try:
                 if int(eid) in exclude_ids: continue
+                if abs(int(eid)) in exclude_ids: continue
             except Exception: pass
             ent = getattr(d, "entity", None)
             name = getattr(d, "name", None) or getattr(d, "title", None) or str(eid)
@@ -1838,6 +2004,7 @@ async def _collect_targets(cli, target: str, exclude_ids: Set[int] = None, group
             if is_user and is_bot: continue
             try:
                 if eid is not None and int(eid) in exclude_ids: continue
+                if eid is not None and abs(int(eid)) in exclude_ids: continue
             except Exception: pass
             if groups_only and not is_user:
                 if not _is_actual_group(ent): continue
@@ -1963,6 +2130,8 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                     try:
                         _new_cid = ch_data.get("id")
                         if _new_cid is not None: own_channel_ids.add(int(_new_cid))
+                        _new_rid = ch_data.get("raw_id")
+                        if _new_rid is not None: own_channel_ids.add(int(_new_rid))
                     except Exception: pass
                     await asyncio.sleep(1.0)
                     try:
@@ -2050,6 +2219,8 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                     try:
                         _new_cid = pub_data.get("id")
                         if _new_cid is not None: own_channel_ids.add(int(_new_cid))
+                        _new_rid = pub_data.get("raw_id")
+                        if _new_rid is not None: own_channel_ids.add(int(_new_rid))
                     except Exception: pass
                     await asyncio.sleep(1.0)
                     try:
@@ -2261,6 +2432,14 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                         else:
                             failed_count += 1
                             add_error("autotar-ارسال", _err or "send_failed", lk, name)
+                            if _err and "SUSPENDED" in _err.upper():
+                                await _finish(f"🚫 اکانت {name} معلق شده")
+                                return
+                    except RuntimeError as re:
+                        if "ACCOUNT_SUSPENDED" in str(re):
+                            await _finish(f"🚫 اکانت {name} معلق شده")
+                            return
+                        raise
                     except Exception as e:
                         failed_count += 1
                         add_error("autotar-ارسال", _fmt_error(e), lk, name)
@@ -2360,6 +2539,14 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                     else:
                         failed_count += 1
                         add_error("autotar-ارسال", _err or "send_failed", t.get("name"), name)
+                        if _err and "SUSPENDED" in _err.upper():
+                            await _finish(f"🚫 اکانت {name} معلق شده")
+                            return
+                except RuntimeError as re:
+                    if "ACCOUNT_SUSPENDED" in str(re):
+                        await _finish(f"🚫 اکانت {name} معلق شده")
+                        return
+                    raise
                 except FloodWaitError as fe:
                     failed_count += 1; add_error("autotar-ارسال", f"Flood {fe.seconds}s", t.get("name"), name)
                 except Exception as e:
@@ -2393,6 +2580,7 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
         live_task.cancel()
         try: await live_task
         except Exception: pass
+
 
 async def run_auto_tar(op, log, tpl_override=None):
     accounts = list_accounts(); sel = op.get("accounts") or []
@@ -2610,6 +2798,7 @@ async def _joiner_worker(aid, acc, op_id, join_delay, max_join, auto_msg, log):
         try: await live_task
         except Exception: pass
 
+
 async def run_joiner_lefter(op, log):
     accounts = list_accounts(); sel = op.get("accounts") or []
     if "all" in sel: sel = list(accounts.keys())
@@ -2712,6 +2901,26 @@ async def _send_worker(aid, acc, op_id, cfg, stop, log):
                 if _ok: sent += 1
                 else:
                     failed += 1; add_error("ارسال", _err or "send_failed", t.get("name"), name)
+                    if _err and "SUSPENDED" in _err.upper():
+                        async with lock:
+                            op2 = _get_op(op_id)
+                            if op2:
+                                op2["status"] = "failed"
+                                op2["progress"]["phase"] = f"🚫 اکانت {name} معلق شده"
+                                _save_op(op2)
+                        add_error("حساب-معلق", f"اکانت {name} معلق", None, name)
+                        return
+            except RuntimeError as re:
+                if "ACCOUNT_SUSPENDED" in str(re):
+                    async with lock:
+                        op2 = _get_op(op_id)
+                        if op2:
+                            op2["status"] = "failed"
+                            op2["progress"]["phase"] = f"🚫 اکانت {name} معلق شده"
+                            _save_op(op2)
+                    add_error("حساب-معلق", f"اکانت {name} معلق", None, name)
+                    return
+                raise
             except FloodWaitError as fe: failed += 1; add_error("ارسال", f"Flood {fe.seconds}s", t.get("name"), name)
             except Exception as e:
                 failed += 1; add_error("ارسال", _fmt_error(e), t.get("name"), name)
@@ -2742,6 +2951,7 @@ async def _send_worker(aid, acc, op_id, cfg, stop, log):
         live_task.cancel()
         try: await live_task
         except Exception: pass
+
 
 async def run_sender(op, log):
     accounts = list_accounts(); sel = op.get("accounts") or []
@@ -2824,6 +3034,7 @@ async def restart_all_listeners():
     LISTENER_TASKS.clear(); STATE["listener_stops"] = {}
     await asyncio.sleep(1); await start_all_listeners()
 
+# ═════ PV RESPONDER (forward-based) ═════
 async def _pv_responder_worker(aid, acc, stop_event):
     name = acc.get("name") or acc.get("phone") or aid
     flog(f"[pv] {name}: worker started")
@@ -2837,10 +3048,11 @@ async def _pv_responder_worker(aid, acc, stop_event):
             raw = cli.raw
             if raw is None:
                 await asyncio.sleep(10); continue
+
             @raw.on(events.NewMessage(incoming=True))
             async def _on_pv(event):
                 try:
-                    cfg = _load_pv_cfg()
+                    cfg = _load_pv_items()
                     if not cfg.get("enabled"): return
                     if not getattr(event, "is_private", False): return
                     if getattr(event, "out", False): return
@@ -2862,35 +3074,49 @@ async def _pv_responder_worker(aid, acc, stop_event):
                         for _ in range(delay_sec):
                             if stop_event.is_set(): return
                             await asyncio.sleep(1)
-                    msgs = cfg.get("messages") or []
-                    for m in msgs:
+
+                    # ─── با استفاده از copy_message در telegram bot ───
+                    items = cfg.get("items") or []
+                    if not APP:
+                        flog(f"[pv] {name}: APP not ready", "warning")
+                        return
+                    for item in items:
                         if stop_event.is_set(): return
-                        mtype = m.get("type", "text")
+                        kind = item.get("kind", "text")
                         try:
-                            if mtype == "text":
-                                txt = m.get("text") or ""
+                            if kind == "text":
+                                txt = item.get("text") or ""
                                 if txt:
                                     r = cli.send_message(sender_id, txt)
                                     if asyncio.iscoroutine(r): r = await r
                                     await asyncio.sleep(random.uniform(1.0, 2.5))
-                            elif mtype == "file":
-                                fpath = m.get("path") or ""
-                                cap = m.get("caption") or ""
-                                if fpath and os.path.exists(fpath):
-                                    await _send_file_to_entity(cli, sender_id, fpath, cap)
-                                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                            elif mtype == "delay":
-                                sec = int(m.get("seconds", 3))
+                            elif kind == "forward":
+                                # forward از PV مالک (telegram bot)
+                                mid = item.get("message_id")
+                                fcid = item.get("from_chat_id") or FORCED_OWNER
+                                if mid:
+                                    try:
+                                        await APP.bot.copy_message(
+                                            chat_id=sender_id,
+                                            from_chat_id=fcid,
+                                            message_id=int(mid)
+                                        )
+                                        await asyncio.sleep(random.uniform(1.0, 2.5))
+                                    except Exception as fe:
+                                        flog(f"[pv] copy failed: {type(fe).__name__}: {fe}", "warning")
+                            elif kind == "delay":
+                                sec = int(item.get("seconds", 3))
                                 await asyncio.sleep(sec)
                         except FloodWaitError as fe:
                             await asyncio.sleep(fe.seconds + 1)
                         except Exception as e:
-                            flog(f"[pv] send step err: {type(e).__name__}", "warning")
+                            flog(f"[pv] send step err: {type(e).__name__}: {e}", "warning")
+
                     if cfg.get("reply_once", True):
                         _mark_pv_replied(aid, str(sender_id))
                     flog(f"[pv] {name}: replied to {sender_id} ✅")
                 except Exception as e:
-                    flog(f"[pv] handler err: {type(e).__name__}", "warning")
+                    flog(f"[pv] handler err: {type(e).__name__}: {e}", "warning")
             while not stop_event.is_set():
                 await asyncio.sleep(2)
             try: await raw.disconnect()
@@ -2905,7 +3131,7 @@ async def _pv_responder_worker(aid, acc, stop_event):
                 except Exception: pass
 
 async def start_pv_responders():
-    cfg = _load_pv_cfg()
+    cfg = _load_pv_items()
     if not cfg.get("enabled"):
         flog("[pv] disabled — skip")
         return
@@ -3103,7 +3329,7 @@ async def show_main():
     accounts = list_accounts(); ops = _load_ops()
     running = [o for o in ops if _op_effective_status(o) == "running"]
     listening = sum(1 for t in LISTENER_TASKS.values() if not t.done())
-    pv_on = bool(_load_pv_cfg().get("enabled"))
+    pv_on = bool(_load_pv_items().get("enabled"))
     errs = len(_load_errors())
     tpls = len(list_templates())
     banned_n = len(_load_banned())
@@ -3141,31 +3367,38 @@ async def show_cache_menu():
     ]
     await panel(txt, kb_(*rows), page_tag="cache")
 
+# ★ PV Menu جدید (forward-based)
 async def show_pv_menu():
-    cfg = _load_pv_cfg()
+    cfg = _load_pv_items()
     enabled = bool(cfg.get("enabled"))
     delay = int(cfg.get("delay_seconds", 120))
     once = bool(cfg.get("reply_once", True))
-    msgs = cfg.get("messages") or []
+    items = cfg.get("items") or []
     txt = head("💬", "پاسخ خودکار PV")
     txt += f"وضعیت: <b>{'🟢 فعال' if enabled else '⚪ خاموش'}</b>\n"
     txt += f"⏱ تایمر: <b>{delay}s</b>  ·  🔁 یک‌بار: <b>{'🟢' if once else '⚪'}</b>\n"
-    txt += f"📨 پیام‌ها: <b>{len(msgs)}</b> عدد\n\n"
-    if msgs:
-        for i, m in enumerate(msgs, 1):
-            mt = m.get("type", "text")
-            if mt == "text": txt += f"{i}. 💬 <code>{esc(short(m.get('text', ''), 40))}</code>\n"
-            elif mt == "file": txt += f"{i}. 📎 <code>{esc(os.path.basename(m.get('path', '?')))}</code>\n"
-            elif mt == "delay": txt += f"{i}. ⏸ تأخیر {m.get('seconds', 3)}s\n"
+    txt += f"📨 پیام‌ها: <b>{len(items)}</b> عدد\n\n"
+    if items:
+        for i, it in enumerate(items, 1):
+            k = it.get("kind", "text")
+            if k == "text":
+                txt += f"{i}. 💬 <code>{esc(short(it.get('text', ''), 40))}</code>\n"
+            elif k == "forward":
+                txt += f"{i}. 📎 Forward  (msg_id: <code>{it.get('message_id', '?')}</code>)\n"
+            elif k == "delay":
+                txt += f"{i}. ⏸ تأخیر {it.get('seconds', 3)}s\n"
     else:
-        txt += "<i>هیچ پیامی تنظیم نشده</i>"
+        txt += "<i>هیچ پیامی تنظیم نشده</i>\n\n"
+        txt += "<i>💡 راهنمای ذخیره فایل:</i>\n"
+        txt += "هر عکس/ویدیو/فایلی که تو PV همین ربات بفرستی، ذخیره می‌شه و موقع پاسخ forward می‌شه."
     rows = [
         [B(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), "pv:toggle")],
-        [B("⏱ تنظیم تایمر", "pv:set_delay"),
-         B("🔁 یک‌بار" + (" ✅" if once else ""), "pv:toggle_once")],
-        [B("➕ افزودن پیام", "pv:add")],
+        [B("⏱ تایمر", "pv:set_delay"), B("🔁 یک‌بار" + (" ✅" if once else ""), "pv:toggle_once")],
+        [B("➕ متن", "pv:add_text")],
+        [B("📎 ذخیره پیام (فایل/عکس)", "pv:add_saved")],
+        [B("⏸ تأخیر", "pv:add_delay")],
     ]
-    if msgs:
+    if items:
         rows.append([B("📋 مشاهده/حذف", "pv:list")])
         rows.append([B("🗑 پاک کردن همه", "pv:clear")])
     rows.append([B("🔄 ری‌استارت", "pv:restart")])
@@ -3174,31 +3407,22 @@ async def show_pv_menu():
     await panel(txt, kb_(*rows), page_tag="pv_menu")
 
 async def show_pv_list():
-    cfg = _load_pv_cfg()
-    msgs = cfg.get("messages") or []
-    txt = head("📋", f"پیام‌های PV ({len(msgs)})")
-    for i, m in enumerate(msgs, 1):
-        mt = m.get("type", "text")
-        if mt == "text": txt += f"\n{i}. 💬 <code>{esc(short(m.get('text', ''), 60))}</code>"
-        elif mt == "file": txt += f"\n{i}. 📎 <code>{esc(os.path.basename(m.get('path', '?')))}</code>"
-        elif mt == "delay": txt += f"\n{i}. ⏸ <b>{m.get('seconds', 3)}s</b>"
+    cfg = _load_pv_items()
+    items = cfg.get("items") or []
+    txt = head("📋", f"پیام‌های PV ({len(items)})")
+    for i, it in enumerate(items, 1):
+        k = it.get("kind", "text")
+        if k == "text":
+            txt += f"\n{i}. 💬 <code>{esc(short(it.get('text', ''), 60))}</code>"
+        elif k == "forward":
+            txt += f"\n{i}. 📎 Forward msg_id=<code>{it.get('message_id', '?')}</code>"
+        elif k == "delay":
+            txt += f"\n{i}. ⏸ <b>{it.get('seconds', 3)}s</b>"
     rows = []
-    for i in range(len(msgs)):
+    for i in range(len(items)):
         rows.append([B(f"🗑 {i+1}", f"pv:del:{i}")])
     rows.append([B("⬅️", "pv:menu")])
     await panel(txt, kb_(*rows), page_tag="pv_list")
-
-async def show_pv_add_menu():
-    txt = head("➕", "افزودن پیام به صف PV")
-    txt += "نوع پیام رو انتخاب کن:"
-    rows = [
-        [B("💬 متن", "pv:add_text")],
-        [B("📎 فایل (آپلود تو ربات)", "pv:add_file_tg")],
-        [B("📎 فایل (مسیر سرور)", "pv:add_file")],
-        [B("⏸ تأخیر", "pv:add_delay")],
-        [B("⬅️ بازگشت", "pv:menu")],
-    ]
-    await panel(txt, kb_(*rows), page_tag="pv_add")
 
 def _acc_label(aid, a):
     st = _STATS_CACHE.get(aid, {}).get("data") or {}
@@ -3468,7 +3692,8 @@ def _op_view(op):
         txt += f"✅ <b>{s['done']}</b>   ❌ <b>{s['failed']}</b>"
         if op.get("max_join"): txt += f"   🎯 <b>{op['max_join']}</b>"
         ss = s.get("skipped_seen", 0); sb = s.get("skipped_banned", 0); rj = s.get("rejected", 0)
-        if ss or sb or rj: txt += f"\n🔍 seen: {ss} · 🚫 ban: {sb} · 🟡 غیرفعال: {rj}"
+        if ss or sb or rj:
+            txt += f"\n🔍 seen: {ss} · 🚫 ban: {sb} · 🟡 غیرفعال: {rj}"
     elif t == "lefter":
         txt += f"🚪 <b>{s['done']}</b> ترک   ❌ <b>{s['failed']}</b>"
     elif t == "autotar":
@@ -4047,47 +4272,45 @@ async def _on_message_impl(update, context):
         await panel(f"❌ <code>{esc(str(res.get('status'))[:400])}</code>",
                     kb_([B("🔄", "acc:add")], [B("🏠", "menu:main")]), page_tag="main"); return
 
+    # ★ PV waits
     if conv.get("pv_wait"):
         kind = conv.pop("pv_wait")
-        cfg = _load_pv_cfg()
-        msgs = cfg.get("messages") or []
+        cfg = _load_pv_items()
+        items = cfg.get("items") or []
         if kind == "delay":
             try: cfg["delay_seconds"] = max(0, int(re.sub(r"[^\d]", "", text) or "120"))
             except: cfg["delay_seconds"] = 120
         elif kind == "add_text":
-            msgs.append({"type": "text", "text": text})
-            cfg["messages"] = msgs
+            items.append({"kind": "text", "text": text})
+            cfg["items"] = items
         elif kind == "add_delay_sec":
             try: sec = max(0, int(re.sub(r"[^\d]", "", text) or "3"))
             except: sec = 3
-            msgs.append({"type": "delay", "seconds": sec})
-            cfg["messages"] = msgs
-        elif kind == "add_file_path":
-            path = text.strip()
-            if path and os.path.exists(path):
-                msgs.append({"type": "file", "path": path, "caption": ""})
-                cfg["messages"] = msgs
-            else:
-                _save_pv_cfg(cfg)
-                await tg_send(f"❌ فایل پیدا نشد: {path[:80]}")
-                return await show_pv_menu()
-        _save_pv_cfg(cfg)
+            items.append({"kind": "delay", "seconds": sec})
+            cfg["items"] = items
+        _save_pv_items(cfg)
         await tg_send("✅")
         return await show_pv_menu()
 
-    if conv.get("pv_upload"):
-        conv.pop("pv_upload")
-        media = msg.photo or msg.document or msg.video
-        if not media: return await ask("❌ فایل نبود. دوباره بفرست:")
-        try: fpath = await _download_tg_file(media, "pv", "pvfile")
-        except Exception as e: return await ask(f"❌ دانلود ناموفق: {str(e)[:100]}")
-        cfg = _load_pv_cfg()
-        msgs = cfg.get("messages") or []
-        msgs.append({"type": "file", "path": fpath, "caption": ""})
-        cfg["messages"] = msgs; _save_pv_cfg(cfg)
-        await tg_send("✅ فایل ذخیره شد")
+    # ★ PV: save message from bot PV for forward
+    if conv.get("pv_save_msg"):
+        conv.pop("pv_save_msg")
+        # این پیام رو ذخیره کن (message_id + from_chat)
+        if not (msg.text or msg.photo or msg.video or msg.document or msg.audio or msg.voice or msg.sticker):
+            return await ask("❌ پیام معتبر نیست. دوباره بفرست:")
+        cfg = _load_pv_items()
+        items = cfg.get("items") or []
+        items.append({
+            "kind": "forward",
+            "message_id": msg.message_id,
+            "from_chat_id": cid,
+        })
+        cfg["items"] = items
+        _save_pv_items(cfg)
+        await tg_send("✅ پیام ذخیره شد (موقع پاسخ forward می‌شه)")
         return await show_pv_menu()
 
+    # ★ upload عکس پروفایل اکانت
     if conv.get("accphoto_upload"):
         info = conv.pop("accphoto_upload")
         aid = info["aid"]
@@ -4111,6 +4334,7 @@ async def _on_message_impl(update, context):
         await tg_send("✅ عکس تنظیم شد" if ok else f"❌ {msg_r[:150]}")
         return await show_acc_photo_menu(aid)
 
+    # ★ upload عکس کانال
     if conv.get("chphoto_upload"):
         info = conv.pop("chphoto_upload")
         aid = info["aid"]; idx = info["idx"]
@@ -4138,6 +4362,7 @@ async def _on_message_impl(update, context):
         await tg_send("✅ عکس تنظیم شد" if ok else f"❌ {msg_r[:150]}")
         return await show_ch_photo_menu(aid, idx)
 
+    # ★ ارسال فایل به کانال
     if conv.get("chfile_upload") and conv["chfile_upload"].get("step") == "wait_file":
         info = conv["chfile_upload"]
         aid = info["aid"]; idx = info["idx"]
@@ -4181,7 +4406,7 @@ async def _on_message_impl(update, context):
         info = conv.pop("at_field_photo")
         tid = info["tid"]; section = info["section"]; field = info["field"]
         media = msg.photo or msg.document
-        if not media: return await ask("❌ عکس/فایل نبود. دوباره بفرست:")
+        if not media: return await ask("❌ فایل نبود. دوباره بفرست:")
         try: fpath = await _download_tg_file(media, "tpl", "tplfile")
         except Exception as e: return await ask(f"❌ دانلود ناموفق: {str(e)[:100]}")
         update_template(tid, section, field, fpath)
@@ -4407,7 +4632,14 @@ async def on_message(update, context):
     await _on_message_orig(update, context)
     try:
         if had_conv and authorized(update) and update.message:
-            await update.message.delete()
+            # ★ پیام‌های مربوط به ذخیره PV رو پاک نکن
+            pv_keep = False
+            try:
+                c = STATE["conv"].get(cid) or {}
+                if c.get("pv_save_msg"): pv_keep = True
+            except Exception: pass
+            if not pv_keep:
+                await update.message.delete()
     except Exception: pass
 
 
@@ -4424,44 +4656,41 @@ async def route_cb(cid, data):
     if data == "menu:cache": return await show_cache_menu()
     if data == "menu:pv": return await show_pv_menu()
 
+    # ★ PV
     if h == "pv":
-        cfg = _load_pv_cfg()
+        cfg = _load_pv_items()
         sub = p[1] if len(p) > 1 else ""
         if sub == "toggle":
             cfg["enabled"] = not bool(cfg.get("enabled"))
-            _save_pv_cfg(cfg)
+            _save_pv_items(cfg)
             if cfg["enabled"]: await start_pv_responders()
             else: _stop_all_pv()
             return await show_pv_menu()
         if sub == "toggle_once":
             cfg["reply_once"] = not bool(cfg.get("reply_once", True))
-            _save_pv_cfg(cfg); return await show_pv_menu()
+            _save_pv_items(cfg); return await show_pv_menu()
         if sub == "set_delay":
             get_conv(cid)["pv_wait"] = "delay"
             return await ask("⏱ تایمر (ثانیه، مثلاً 120):")
-        if sub == "add": return await show_pv_add_menu()
         if sub == "add_text":
             get_conv(cid)["pv_wait"] = "add_text"
             return await ask("💬 متن پیام:")
-        if sub == "add_file":
-            get_conv(cid)["pv_wait"] = "add_file_path"
-            return await ask("📎 مسیر فایل:")
-        if sub == "add_file_tg":
-            get_conv(cid)["pv_upload"] = True
-            return await ask("📎 فایل رو بفرست:")
         if sub == "add_delay":
             get_conv(cid)["pv_wait"] = "add_delay_sec"
             return await ask("⏸ تأخیر (ثانیه):")
+        if sub == "add_saved":
+            get_conv(cid)["pv_save_msg"] = True
+            return await ask("📎 پیام/عکس/ویدیو/فایل رو بفرست (تو همین چت PV):")
         if sub == "list": return await show_pv_list()
         if sub == "del" and len(p) >= 3:
             try: i = int(p[2])
             except: return await show_pv_list()
-            msgs = cfg.get("messages") or []
-            if 0 <= i < len(msgs):
-                msgs.pop(i); cfg["messages"] = msgs; _save_pv_cfg(cfg)
+            items = cfg.get("items") or []
+            if 0 <= i < len(items):
+                items.pop(i); cfg["items"] = items; _save_pv_items(cfg)
             await tg_send("🗑"); return await show_pv_list()
         if sub == "clear":
-            cfg["messages"] = []; _save_pv_cfg(cfg)
+            cfg["items"] = []; _save_pv_items(cfg)
             await tg_send("🗑"); return await show_pv_menu()
         if sub == "restart":
             await restart_all_pv(); await tg_send("🔄"); return await show_pv_menu()
