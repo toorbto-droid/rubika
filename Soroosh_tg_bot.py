@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9.5 (PV polling every 5s + instant notify + reply notify)
+# Soroosh_tg_bot.py — v27.9.10 (PV file→entity fix + real error reporting)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.9"
+VERSION = "Soroosh v27.9.10"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -1360,14 +1360,18 @@ def _detect_file_kind(file_path: str) -> str:
     return "document"
 
 
+# ══════════════════════════════════════════════════════════════════
+# ⭐ v27.9.10 — _send_file_to_entity (خطای واقعی + چند حالت ارسال)
+# ══════════════════════════════════════════════════════════════════
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    """v27.9.9: retry + upload-to-self + forward"""
+    """v27.9.10: چند حالت ارسال + error واقعی برمی‌گردونه"""
+    async def _aw(r):
+        return (await r) if asyncio.iscoroutine(r) else r
+
     if not file_path:
         if caption:
             try:
-                r = cli.send_message(entity, caption)
-                if asyncio.iscoroutine(r): r = await r
-                return True, "text_only"
+                await _aw(cli.send_message(entity, caption)); return True, "text_only"
             except Exception as e:
                 return False, f"text:{type(e).__name__}"
         return False, "no_path"
@@ -1376,120 +1380,73 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
 
     kind = _detect_file_kind(file_path)
     flog(f"[send-file] {os.path.basename(file_path)} kind={kind}")
+    last_err = ""
 
-    # ── تلاش ۱: مستقیم با retry ──
-    for attempt in range(1, 4):
-        flog(f"[send-file] attempt {attempt}/3")
+    sf = getattr(cli, "send_file", None)
+    sd = getattr(cli, "send_document", None)
 
-        sf = getattr(cli, "send_file", None)
-        if sf:
+    # حالت‌های مختلف ارسال
+    variants = []
+    if sf:
+        variants.append(("send_file+cap", lambda: sf(entity, file_path, caption=caption)))
+        variants.append(("send_file", lambda: sf(entity, file_path)))
+        variants.append(("send_file+force_doc", lambda: sf(entity, file_path, caption=caption, force_document=True)))
+    if sd:
+        variants.append(("send_document", lambda: sd(entity, file_path, caption=caption)))
+
+    for attempt in range(1, 3):
+        for tag, fn in variants:
             try:
-                r = sf(entity, file_path, caption=caption)
-                if asyncio.iscoroutine(r): r = await r
-                flog(f"[send-file] OK attempt={attempt}")
-                return True, "OK"
+                await _aw(fn())
+                # اگر بدون کپشن فرستاده شد، کپشن جدا بره
+                if tag == "send_file" and caption:
+                    try: await _aw(cli.send_message(entity, caption))
+                    except Exception: pass
+                flog(f"[send-file] OK via {tag} (attempt {attempt})")
+                return True, f"OK-{tag}"
+            except FloodWaitError as fe:
+                await asyncio.sleep(min(fe.seconds + 1, 30))
+                last_err = f"Flood {fe.seconds}s"
             except Exception as e:
-                err_s = str(e).upper()
-                flog(f"[send-file] send_file fail: {type(e).__name__}: {str(e)[:100]}", "warning")
-                if "FILE_REQUEST_RECEIVED_ON_CONNECTION_SERVER" in err_s or "SERVER" in err_s:
-                    break
+                last_err = f"{tag}:{type(e).__name__}:{str(e)[:80]}"
+                flog(f"[send-file] {last_err}", "warning")
+                if "USER_SUSPENDED" in str(e).upper():
+                    return False, "ACCOUNT_SUSPENDED"
+        await asyncio.sleep(2 * attempt)
 
-        sd = getattr(cli, "send_document", None)
-        if sd:
-            try:
-                try:
-                    r = sd(entity, file_path, caption=caption, force_document=True)
-                except TypeError:
-                    r = sd(entity, file_path, caption=caption)
-                if asyncio.iscoroutine(r): r = await r
-                flog(f"[send-file] OK via document")
-                return True, "OK-doc"
-            except Exception as e:
-                flog(f"[send-file] doc fail: {type(e).__name__}: {str(e)[:80]}", "warning")
-
-        if attempt < 3:
-            await asyncio.sleep(2 * attempt)
-
-    # ── تلاش ۲: آپلود به Saved Messages + فوروارد ──
-    flog("[send-file] trying upload-to-self + forward method")
+    # آپلود به Saved Messages + فوروارد
     try:
         me = await cli.get_me()
-        if me:
-            mid = None
-            sf = getattr(cli, "send_file", None)
-            if sf:
-                try:
-                    r = sf(me, file_path)
-                    if asyncio.iscoroutine(r): r = await r
-                    mid = getattr(r, "id", None)
-                    if mid is None:
-                        upd = getattr(r, "updates", None) or r
-                        msgs = (getattr(upd, "updates", None) or
-                                getattr(upd, "messages", None) or [])
-                        for m in msgs:
-                            mid = getattr(m, "id", None)
-                            if mid: break
-                    flog(f"[send-file] uploaded to self: mid={mid}")
-                except Exception as se:
-                    flog(f"[send-file] self-upload fail: {type(se).__name__}: {str(se)[:80]}", "warning")
-
-            if mid:
-                fm = getattr(cli, "forward_messages", None)
-                if fm:
-                    try:
-                        r2 = fm(entity, mid, me)
-                        if asyncio.iscoroutine(r2): r2 = await r2
-                        if caption:
-                            try:
-                                r3 = cli.send_message(entity, caption)
-                                if asyncio.iscoroutine(r3): r3 = await r3
-                            except Exception: pass
-                        flog("[send-file] OK via helper forward")
-                        return True, "OK-fwd"
-                    except Exception as fe:
-                        flog(f"[send-file] helper forward fail: {type(fe).__name__}: {str(fe)[:80]}", "warning")
-
-                try:
-                    from splusthon.tl.functions.messages import ForwardMessagesRequest
-                    raw = getattr(cli, "raw", None) or cli
-                    try:
-                        target_peer = await raw.get_input_entity(entity)
-                    except Exception:
-                        target_peer = entity
-                    try:
-                        self_peer = await raw.get_input_entity(me)
-                    except Exception:
-                        self_peer = me
-                    rr = cli(ForwardMessagesRequest(
-                        from_peer=self_peer,
-                        id=[mid],
-                        to_peer=target_peer,
-                        random_id=[random.randint(-2**63, 2**63 - 1)],
-                    ))
-                    if asyncio.iscoroutine(rr): rr = await rr
-                    if caption:
-                        try:
-                            r3 = cli.send_message(entity, caption)
-                            if asyncio.iscoroutine(r3): r3 = await r3
-                        except Exception: pass
-                    flog("[send-file] OK via raw forward")
-                    return True, "OK-rawfwd"
-                except Exception as rfe:
-                    flog(f"[send-file] raw forward fail: {type(rfe).__name__}: {str(rfe)[:80]}", "warning")
+        mid = None
+        if sf and me:
+            r = await _aw(sf(me, file_path))
+            mid = getattr(r, "id", None)
+            if mid is None:
+                upd = getattr(r, "updates", None) or r
+                for m in (getattr(upd, "updates", None) or getattr(upd, "messages", None) or []):
+                    mid = getattr(m, "id", None)
+                    if mid: break
+        if mid:
+            fm = getattr(cli, "forward_messages", None)
+            if fm:
+                await _aw(fm(entity, mid, me))
+                if caption:
+                    try: await _aw(cli.send_message(entity, caption))
+                    except Exception: pass
+                return True, "OK-fwd"
     except Exception as e:
-        flog(f"[send-file] forward method err: {type(e).__name__}: {str(e)[:80]}", "warning")
+        last_err += f" | fwd:{type(e).__name__}:{str(e)[:60]}"
 
-    # ── آخرین شانس: کپشن به عنوان متن ──
     if caption:
         try:
-            r = cli.send_message(entity, caption)
-            if asyncio.iscoroutine(r): r = await r
-            flog("[send-file] caption sent as text fallback")
+            await _aw(cli.send_message(entity, caption))
             return True, "text_fallback"
         except Exception: pass
 
-    flog("[send-file] FAILED all methods", "error")
-    return False, "all_failed"
+    flog(f"[send-file] FAILED: {last_err}", "error")
+    return False, f"all_failed: {last_err[:150]}"
+
+
 async def soroosh_set_profile_photo(cli, file_path: str) -> Tuple[bool, str]:
     if not os.path.exists(file_path): return False, "فایل پیدا نشد"
     try:
@@ -3164,7 +3121,7 @@ async def restart_all_listeners():
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.5 — PV POLLING هر ۵ ثانیه + نوتیف فوری + نوتیف پاسخ
+# ⭐ v27.9.10 — PV POLLING + reply با entity درست
 # ══════════════════════════════════════════════════════════════════
 PV_LISTENER_TASKS: Dict[str, asyncio.Task] = {}
 _PV_SEEN_MSGS: Dict[str, Dict[str, float]] = {}
@@ -3172,12 +3129,11 @@ _PV_REPLY_TASKS: Dict[str, asyncio.Task] = {}
 _PV_STOP_EVENTS: Dict[str, asyncio.Event] = {}
 
 
-async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
-    """بعد از تایمر، پیام‌های تنظیم‌شده رو می‌فرسته + نوتیف نتیجه"""
+async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event, sender_entity=None):
+    """v27.9.10: resolve entity یک‌بار برای متن و فایل"""
     name = acc.get("name") or aid
     cfg = _load_pv_items()
     delay_sec = int(cfg.get("delay_seconds", 120))
-
     flog(f"[pv] {name}: reply task started for {sender_id}, delay={delay_sec}s")
 
     if delay_sec > 0:
@@ -3195,21 +3151,27 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
         if cli is None:
             send_ok = False; send_err = f"connect: {err}"
         else:
-            # resolve sender entity قبل از ارسال
-            sender_entity = None
+            # ── resolve entity (یک بار، برای متن و فایل) ──
+            target = None
             try:
-                sender_entity = await cli.get_entity(sender_id)
-                flog(f"[pv] resolved sender for {sender_id}: {type(sender_entity).__name__}")
-            except Exception as _re:
-                flog(f"[pv] resolve sender fail: {type(_re).__name__}: {_re}", "warning")
-                _un = user_info.get("username")
-                if _un:
-                    try:
-                        sender_entity = await cli.get_entity(_un.lstrip("@"))
-                    except Exception: pass
-            
-            target = sender_entity if sender_entity is not None else sender_id
-            
+                dialogs = await cli.get_dialogs()
+                for d in dialogs or []:
+                    if getattr(d, "id", None) == sender_id and getattr(d, "entity", None) is not None:
+                        target = d.entity; break
+            except Exception as _de:
+                flog(f"[pv] dialogs resolve fail: {type(_de).__name__}", "warning")
+            if target is None and sender_entity is not None:
+                target = sender_entity
+            if target is None:
+                try: target = await cli.get_entity(sender_id)
+                except Exception: pass
+            if target is None and user_info.get("username"):
+                try: target = await cli.get_entity(user_info["username"].lstrip("@"))
+                except Exception: pass
+            if target is None:
+                target = sender_id
+            flog(f"[pv] target type: {type(target).__name__}")
+
             items = cfg.get("items") or []
             for item in items:
                 if stop_event.is_set(): break
@@ -3221,23 +3183,16 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
                             r = cli.send_message(target, txt)
                             if asyncio.iscoroutine(r): r = await r
                             await asyncio.sleep(random.uniform(1.0, 2.5))
+
                     elif kind == "file":
                         fpath = item.get("file_path")
                         fcap = item.get("caption") or ""
-
                         if fpath and os.path.exists(fpath):
-                            try:
-                                _ok_f, _err_f = await _send_file_to_entity(
-                                    cli, sender_id, fpath, fcap
-                                )
-                                if not _ok_f:
-                                    send_ok = False
-                                    send_err = str(_err_f)[:120]
-
-                                await asyncio.sleep(random.uniform(1.0, 2.5))
-                            except Exception as fe:
+                            _ok_f, _err_f = await _send_file_to_entity(cli, target, fpath, fcap)
+                            if not _ok_f:
                                 send_ok = False
-                                send_err = f"file: {str(fe)[:100]}"
+                                send_err = str(_err_f)[:150]
+                            await asyncio.sleep(random.uniform(1.0, 2.5))
                         else:
                             send_ok = False
                             send_err = f"file missing: {os.path.basename(str(fpath))}"
@@ -3247,15 +3202,14 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
                         fcid = item.get("from_chat_id") or FORCED_OWNER
                         if mid and APP:
                             try:
-                                await APP.bot.copy_message(
-                                    chat_id=sender_id, from_chat_id=fcid,
-                                    message_id=int(mid))
+                                await APP.bot.copy_message(chat_id=sender_id, from_chat_id=fcid, message_id=int(mid))
                                 await asyncio.sleep(random.uniform(1.0, 2.5))
                             except Exception as fe:
                                 send_ok = False; send_err = f"copy: {str(fe)[:100]}"
+
                     elif kind == "delay":
-                        sec = int(item.get("seconds", 3))
-                        await asyncio.sleep(sec)
+                        await asyncio.sleep(int(item.get("seconds", 3)))
+
                 except FloodWaitError as fe:
                     await asyncio.sleep(fe.seconds + 1)
                     send_ok = False; send_err = f"Flood {fe.seconds}s"
@@ -3281,8 +3235,7 @@ async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
         except Exception: pass
 
     flog(f"[pv] {name}: replied to {sender_id} ({'OK' if send_ok else 'FAIL'})")
-    key = f"{aid}:{sender_str}"
-    _PV_REPLY_TASKS.pop(key, None)
+    _PV_REPLY_TASKS.pop(f"{aid}:{sender_str}", None)
 
 
 async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
@@ -3304,7 +3257,6 @@ async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
     try: _record_pv_visit(aid, sender_str, user_info)
     except Exception: pass
 
-    # نوتیف فوری دریافت پیام
     if cfg.get("notify", True) and cfg.get("notify_on_receive", True):
         u_label = user_info.get("first_name") or user_info.get("username") or sender_str
         delay_sec = int(cfg.get("delay_seconds", 120))
@@ -3326,24 +3278,22 @@ async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
         except Exception as ne:
             flog(f"[pv] notify receive err: {ne}", "warning")
 
-    # reply_once check
     if cfg.get("reply_once", True) and _has_pv_replied(aid, sender_str):
         flog(f"[pv] {name}: skip reply → already replied to {sender_id}")
         return
 
-    # اگه reply task قبلاً در جریانه
     key = f"{aid}:{sender_str}"
     existing = _PV_REPLY_TASKS.get(key)
     if existing and not existing.done():
         flog(f"[pv] {name}: reply already in progress for {sender_id}")
         return
 
-    # spawn reply task
     stop_evt = _PV_STOP_EVENTS.get(aid)
     if stop_evt is None:
         stop_evt = asyncio.Event(); _PV_STOP_EVENTS[aid] = stop_evt
 
-    t = asyncio.create_task(_pv_send_reply(aid, acc, sender_id, user_info, stop_evt))
+    # ✅ v27.9.10: sender entity پاس داده می‌شه
+    t = asyncio.create_task(_pv_send_reply(aid, acc, sender_id, user_info, stop_evt, sender))
     _PV_REPLY_TASKS[key] = t
 
 
@@ -3435,7 +3385,6 @@ async def _pv_poller_worker(aid, acc, stop_event):
                 first_run_done = True
                 flog(f"[pv] {name}: first scan done ({len(seen)} msgs)")
 
-            # cleanup
             cutoff = time.time() - 3600
             for k in list(seen.keys()):
                 if seen[k] < cutoff: seen.pop(k, None)
@@ -3809,6 +3758,7 @@ async def show_pv_menu():
             if k == "text": txt += f"{i}. 💬 <code>{esc(short(it.get('text', ''), 40))}</code>\n"
             elif k == "forward": txt += f"{i}. 📎 Forward (id:<code>{it.get('message_id', '?')}</code>)\n"
             elif k == "delay": txt += f"{i}. ⏸ تأخیر {it.get('seconds', 3)}s\n"
+            elif k == "file": txt += f"{i}. 📁 <code>{esc(os.path.basename(it.get('file_path', '?')))}</code>\n"
     else:
         txt += "<i>هیچ پیامی تنظیم نشده</i>"
     rows = [
@@ -3841,6 +3791,7 @@ async def show_pv_list():
         if k == "text": txt += f"\n{i}. 💬 <code>{esc(short(it.get('text', ''), 60))}</code>"
         elif k == "forward": txt += f"\n{i}. 📎 Forward id=<code>{it.get('message_id', '?')}</code>"
         elif k == "delay": txt += f"\n{i}. ⏸ <b>{it.get('seconds', 3)}s</b>"
+        elif k == "file": txt += f"\n{i}. 📁 <code>{esc(os.path.basename(it.get('file_path', '?')))}</code>"
     rows = []
     for i in range(len(items)):
         rows.append([B(f"🗑 {i+1}", f"pv:del:{i}")])
@@ -3901,7 +3852,7 @@ async def show_pv_report(page=0):
             txt += f"👤 <b>{esc(short(name, 20))}</b>  ·  {esc(un)}\n"
             txt += f"   {status_str}  ·  📨×{r['count']}  ·  <i>{ago_str}</i>\n"
             if r.get("error"):
-                txt += f"   <code>{esc(short(r['error'], 40))}</code>\n"
+                txt += f"   <code>{esc(short(r['error'], 60))}</code>\n"
             txt += f"   🆔 <code>{esc(r['uid'])}</code>\n\n"
     nav_btns = []
     if pages > 1:
@@ -5906,7 +5857,7 @@ def main(token=None, owner_id=None):
     if token: TG_TOKEN = token
     else: TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
     if not TG_TOKEN or ":" not in TG_TOKEN: print("[x] TG_TOKEN نیست."); return
-    if owner_id: FORCED_OWNER = int(owner_id)
+    if owner_id: FORCE1D_OWNER = int(owner_id)
     else:
         try: FORCED_OWNER = int(os.environ.get("TG_OWNER_ID", "8389746549"))
         except: FORCED_OWNER = 8389746549
