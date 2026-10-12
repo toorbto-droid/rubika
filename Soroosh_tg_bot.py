@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9 (all fixes + __getattr__ + raw SendMedia fallback + infinite loop + PV report)
+# Soroosh_tg_bot.py — v27.9.1 (PV send fix + raw fallback + text fallback)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9"
+VERSION = "Soroosh v27.9.1"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -94,6 +94,12 @@ try:
             if hasattr(o, "InputPeerChannel"): InputPeerChannel = o.InputPeerChannel; break
         except Exception: pass
 
+    InputPeerUser = None
+    try:
+        from splusthon.tl.types import InputPeerUser as _IPU
+        InputPeerUser = _IPU
+    except Exception: pass
+
     CreateChannelRequest = ExportChatInviteRequest = EditTitleRequest = None
     EditPhotoRequest = GetFullChannelRequest = None
 
@@ -117,6 +123,7 @@ try:
         except Exception: pass
 
     print(f"[+] InputChannel: {'OK' if InputChannel else 'NO'}")
+    print(f"[+] InputPeerUser: {'OK' if InputPeerUser else 'NO'}")
     print(f"[+] CreateChannel: {'OK' if CreateChannelRequest else 'NO'}")
     print(f"[+] ExportInvite: {'OK' if ExportChatInviteRequest else 'NO'}")
     print(f"[+] GetFullChannel: {'OK' if GetFullChannelRequest else 'NO'}")
@@ -454,12 +461,6 @@ def _get_account_lock(aid):
 
 
 class SafeSoroushClient:
-    """
-    پروکسی امن روی SoroushClient که:
-    - در صورت تایم‌اوت قفل رو آزاد می‌کنه
-    - تمام متدهای SoroushClient (send_file, send_photo, edit_message, ...)
-      رو از طریق __getattr__ به raw client پاس می‌ده
-    """
     def __init__(self, aid, session_string, name=None, use_lock=True):
         self.aid = aid; self.session_string = session_string
         self.name = name or aid; self._client = None
@@ -467,9 +468,6 @@ class SafeSoroushClient:
         self._locked = False
 
     def __getattr__(self, name):
-        # فقط زمانی صدا زده می‌شه که lookup معمولی شکست بخوره.
-        # هرچی روی raw client هست (send_file, send_photo, upload_file,
-        # edit_message, set_profile_photo, set_chat_photo, ...) از اینجا رد می‌شه.
         if name.startswith("_"):
             raise AttributeError(name)
         raw = self.__dict__.get("_client")
@@ -1366,131 +1364,170 @@ def _detect_file_kind(file_path: str) -> str:
     if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"): return "video"
     return "document"
 
+
+# ══════════════════════════════════════════════════════════════════
+# ⭐ PATCH v27.9.1 — ارسال فایل با fallback چند سطحی + لاگ خطای واقعی
+# ══════════════════════════════════════════════════════════════════
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    if not file_path: return False, "no_path"
-    if not os.path.exists(file_path): return False, f"not_found:{os.path.basename(file_path)}"
-    kind = _detect_file_kind(file_path)
-    flog(f"[send-file] kind={kind} name={os.path.basename(file_path)} size={os.path.getsize(file_path)}")
-    tried = []
-
-    # --- مرحله ۱: helper های سطح بالا (حالا با __getattr__ کار می‌کنن) ---
-    sf = getattr(cli, "send_file", None)
-    if sf:
-        for kw in ({"caption": caption}, {}):
+    """v27.9.1: ارسال فایل با fallback چند سطحی + لاگ خطای واقعی RPC"""
+    # بدون فایل → فقط متن
+    if not file_path:
+        if caption:
             try:
-                r = sf(entity, file_path, **kw)
+                r = cli.send_message(entity, caption)
                 if asyncio.iscoroutine(r): r = await r
-                flog(f"[send-file] ✅ send_file"); return True, "OK"
-            except TypeError: tried.append("sf:TypeErr"); continue
-            except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+                return True, "text_only"
             except Exception as e:
-                es = str(e).upper()
-                if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
-                tried.append(f"sf:{type(e).__name__}"); continue
+                return False, f"text:{type(e).__name__}:{_fmt_error(e)[:80]}"
+        return False, "no_path"
+    if not os.path.exists(file_path):
+        return False, f"not_found:{os.path.basename(file_path)}"
 
+    kind = _detect_file_kind(file_path)
+    fsize = os.path.getsize(file_path)
+    flog(f"[send-file] kind={kind} name={os.path.basename(file_path)} size={fsize}")
+
+    tried: List[str] = []
+    details: List[str] = []
+
+    def _log(prefix, e):
+        m = _fmt_error(e) or str(e)
+        details.append(f"{prefix}={m[:150]}")
+        flog(f"[send-file] {prefix} EXC {type(e).__name__}: {m[:300]}", "warning")
+
+    # ─── ۱) helper های سطح بالا ───
+    candidates = []
+    sf = getattr(cli, "send_file", None)
+    if sf: candidates.append(("send_file", sf))
     if kind == "photo":
         sp = getattr(cli, "send_photo", None)
-        if sp:
-            for kw in ({"caption": caption}, {}):
-                try:
-                    r = sp(entity, file_path, **kw)
-                    if asyncio.iscoroutine(r): r = await r
-                    flog(f"[send-file] ✅ send_photo"); return True, "OK"
-                except TypeError: tried.append("sp:TypeErr"); continue
-                except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
-                except Exception as e:
-                    es = str(e).upper()
-                    if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
-                    tried.append(f"sp:{type(e).__name__}"); continue
-
+        if sp: candidates.append(("send_photo", sp))
     if kind == "video":
         sv = getattr(cli, "send_video", None)
-        if sv:
-            for kw in ({"caption": caption}, {}):
-                try:
-                    r = sv(entity, file_path, **kw)
-                    if asyncio.iscoroutine(r): r = await r
-                    flog(f"[send-file] ✅ send_video"); return True, "OK"
-                except TypeError: tried.append("sv:TypeErr"); continue
-                except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
-                except Exception as e:
-                    es = str(e).upper()
-                    if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
-                    tried.append(f"sv:{type(e).__name__}"); continue
-
+        if sv: candidates.append(("send_video", sv))
     sd = getattr(cli, "send_document", None)
-    if sd:
+    if sd: candidates.append(("send_document", sd))
+
+    for name, fn in candidates:
         for kw in ({"caption": caption}, {}):
             try:
-                r = sd(entity, file_path, **kw)
+                r = fn(entity, file_path, **kw)
                 if asyncio.iscoroutine(r): r = await r
-                flog(f"[send-file] ✅ send_document"); return True, "OK"
-            except TypeError: tried.append("sd:TypeErr"); continue
-            except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
+                flog(f"[send-file] OK {name}")
+                return True, "OK"
+            except TypeError:
+                tried.append(f"{name}:TypeErr"); continue
+            except FloodWaitError as fe:
+                return False, f"Flood {fe.seconds}s"
             except Exception as e:
-                es = str(e).upper()
-                if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
-                tried.append(f"sd:{type(e).__name__}"); continue
+                _log(name, e)
+                tried.append(f"{name}:{type(e).__name__}")
+                break
 
+    # ─── ۲) send_media ───
     sm = getattr(cli, "send_media", None)
     if sm:
-        try:
-            r = sm(entity, file_path, caption=caption)
-            if asyncio.iscoroutine(r): r = await r
-            flog(f"[send-file] ✅ send_media"); return True, "OK"
-        except TypeError: tried.append("sm:TypeErr")
-        except FloodWaitError as fe: return False, f"Flood {fe.seconds}s"
-        except Exception as e:
-            es = str(e).upper()
-            if "FORBIDDEN" in es: return False, f"BLOCKED:{_fmt_error(e)[:100]}"
-            tried.append(f"sm:{type(e).__name__}")
+        for kw in ({"caption": caption}, {}):
+            try:
+                r = sm(entity, file_path, **kw)
+                if asyncio.iscoroutine(r): r = await r
+                flog("[send-file] OK send_media")
+                return True, "OK"
+            except TypeError:
+                tried.append("sm:TypeErr"); continue
+            except FloodWaitError as fe:
+                return False, f"Flood {fe.seconds}s"
+            except Exception as e:
+                _log("send_media", e)
+                tried.append(f"sm:{type(e).__name__}")
+                break
 
-    # --- مرحله ۲: raw API fallback ---
+    # ─── ۳) raw SendMediaRequest + InputPeerUser fallback ───
     try:
         from splusthon.tl.functions.messages import SendMediaRequest
         from splusthon.tl.types import (
             InputMediaUploadedDocument, InputMediaUploadedPhoto,
             DocumentAttributeFilename,
         )
-        raw = getattr(cli, "raw", cli)
-        peer = await raw.get_input_entity(entity)
-        uploaded = await raw.upload_file(file_path)
-        if kind == "photo":
-            media = InputMediaUploadedPhoto(file=uploaded)
+        _IPU = InputPeerUser
+        if _IPU is None:
+            try:
+                from splusthon.tl.types import InputPeerUser as _IPU  # noqa
+            except Exception:
+                _IPU = None
+
+        raw = getattr(cli, "raw", None) or cli
+        peer = None
+        try:
+            peer = await raw.get_input_entity(entity)
+            flog("[send-file] peer= get_input_entity")
+        except Exception as pe:
+            _log("get_input_entity", pe)
+            try:
+                eid = getattr(entity, "id", None)
+                eah = getattr(entity, "access_hash", None)
+                if eid and eah and _IPU is not None:
+                    peer = _IPU(int(eid), int(eah))
+                    flog("[send-file] peer= InputPeerUser fallback")
+            except Exception as e2:
+                _log("InputPeerUser", e2)
+
+        if peer is None:
+            tried.append("no_peer")
         else:
-            fname = os.path.basename(file_path)
-            low = fname.lower()
-            if kind == "video" or low.endswith((".mp4", ".mov", ".mkv", ".webm")):
-                mime = "video/mp4"
-            elif low.endswith((".jpg", ".jpeg")):
-                mime = "image/jpeg"
-            elif low.endswith(".png"):
-                mime = "image/png"
-            elif low.endswith(".gif"):
-                mime = "image/gif"
-            elif low.endswith(".pdf"):
-                mime = "application/pdf"
+            uploaded = await raw.upload_file(file_path)
+            fname = os.path.basename(file_path); low = fname.lower()
+            if kind == "photo":
+                media = InputMediaUploadedPhoto(file=uploaded)
             else:
-                mime = "application/octet-stream"
-            attrs = [DocumentAttributeFilename(file_name=fname)]
-            media = InputMediaUploadedDocument(
-                file=uploaded, mime_type=mime, attributes=attrs,
-            )
-        await raw(SendMediaRequest(
-            peer=peer, media=media, message=caption or "",
-            random_id=random.randint(-2**63, 2**63 - 1),
-        ))
-        flog(f"[send-file] ✅ raw SendMediaRequest")
-        return True, "OK"
+                if   low.endswith((".mp4", ".mov", ".mkv", ".webm")): mime = "video/mp4"
+                elif low.endswith((".jpg", ".jpeg")):                   mime = "image/jpeg"
+                elif low.endswith(".png"):                              mime = "image/png"
+                elif low.endswith(".gif"):                              mime = "image/gif"
+                elif low.endswith(".pdf"):                              mime = "application/pdf"
+                else:                                                   mime = "application/octet-stream"
+                media = InputMediaUploadedDocument(
+                    file=uploaded, mime_type=mime,
+                    attributes=[DocumentAttributeFilename(file_name=fname)],
+                )
+
+            for variant in (
+                dict(peer=peer, media=media, message=caption or "",
+                     random_id=random.randint(-2**63, 2**63 - 1)),
+                dict(peer=peer, media=media, message=caption or "",
+                     random_id=random.randint(-2**63, 2**63 - 1),
+                     silent=False, background=False, clear_draft=False),
+            ):
+                try:
+                    r = raw(SendMediaRequest(**variant))
+                    if asyncio.iscoroutine(r): r = await r
+                    flog("[send-file] OK raw SendMediaRequest")
+                    return True, "OK"
+                except TypeError as te:
+                    tried.append(f"rawType:{str(te)[:40]}"); continue
+                except Exception as e:
+                    _log("raw_SendMedia", e)
+                    tried.append(f"raw:{type(e).__name__}"); break
     except ImportError as ie:
         tried.append(f"raw_imp:{ie}")
     except Exception as e:
-        tried.append(f"raw:{type(e).__name__}")
-        flog(f"[send-file] raw fallback failed: {type(e).__name__}: {e}", "warning")
+        _log("raw_block", e)
+        tried.append(f"raw_block:{type(e).__name__}")
 
-    err_summary = " | ".join(tried[:5]) if tried else "no_methods_available"
-    flog(f"[send-file] ❌ FAILED: {err_summary}", "error")
-    return False, f"all_failed: {err_summary[:180]}"
+    # ─── ۴) اگه همه شکست خوردن، حداقل متن ───
+    if caption:
+        try:
+            r = cli.send_message(entity, caption)
+            if asyncio.iscoroutine(r): r = await r
+            flog("[send-file] WARN fallback to text_only")
+            return True, "text_only_fallback"
+        except Exception as e:
+            _log("text_fallback", e)
+
+    err_sum = " | ".join(tried[:6]) if tried else "no_methods"
+    detail  = " || ".join(details[:3])
+    flog(f"[send-file] FAILED {err_sum}  <-  {detail}", "error")
+    return False, f"all_failed:{err_sum} <- {detail[:220]}"
 
 
 async def soroosh_set_profile_photo(cli, file_path: str) -> Tuple[bool, str]:
@@ -2596,8 +2633,17 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
                 try:
                     ent = t.get("entity") or t["target"]
                     if not _is_group_or_channel(ent) and t.get("type") != "pv": continue
+                    # ⭐ PATCH v27.9.1: فایل رد شد → متن بفرست
                     if attach_file and os.path.exists(attach_file):
                         _ok, _err = await _send_file_to_entity(cli, ent, attach_file, attach_caption or sender_text)
+                        if not _ok and sender_text:
+                            try:
+                                _r = cli.send_message(ent, sender_text)
+                                if asyncio.iscoroutine(_r): _r = await _r
+                                _ok, _err = True, "file_failed_text_sent"
+                                flog(f"[autotar] file failed -> text fallback: {t.get('name')}")
+                            except Exception as _te:
+                                flog(f"[autotar] text fallback also failed: {_te}", "warning")
                     else:
                         _ok, _err = await _send_to_entity(cli, ent, sender_text, snd, log=log)
                     if _ok: sent_count += 1
@@ -2978,8 +3024,17 @@ async def _send_worker(aid, acc, op_id, cfg, stop, log):
                 if stop.is_set(): break
                 try:
                     ent = t.get("entity") or t["target"]
+                    # ⭐ PATCH v27.9.1: فایل رد شد → متن بفرست
                     if attach_file and os.path.exists(attach_file):
                         _ok, _err = await _send_file_to_entity(cli, ent, attach_file, text)
+                        if not _ok and text:
+                            try:
+                                _r = cli.send_message(ent, text)
+                                if asyncio.iscoroutine(_r): _r = await _r
+                                _ok, _err = True, "file_failed_text_sent"
+                                flog(f"[send] file failed -> text fallback: {t.get('name')}")
+                            except Exception as _te:
+                                flog(f"[send] text fallback also failed: {_te}", "warning")
                     else:
                         _ok, _err = await _send_to_entity(cli, ent, text, snd_cfg, log=log)
                     if _ok:
