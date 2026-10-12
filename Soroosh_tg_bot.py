@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9.3 (PV fix final + notify + pv:menu)
+# Soroosh_tg_bot.py — v27.9.5 (PV polling every 5s + instant notify + reply notify)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.3"
+VERSION = "Soroosh v27.9.5"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -128,10 +128,6 @@ try:
     print(f"[+] ExportInvite: {'OK' if ExportChatInviteRequest else 'NO'}")
     print(f"[+] GetFullChannel: {'OK' if GetFullChannelRequest else 'NO'}")
 
-    try:
-        from splusthon.tl.functions.photos import UploadProfilePhotoRequest
-    except Exception: UploadProfilePhotoRequest = None
-
     SOROOSH_AVAILABLE = True
 except ImportError as _e:
     print(f"[x] splusthon not installed: {_e}"); sys.exit(1)
@@ -173,11 +169,6 @@ def _is_perm_error(ex):
                                   "USER_NOT_PARTICIPANT", "USER_SUSPENDED",
                                   "USER_DEACTIVATED", "SESSION_REVOKED",
                                   "AUTH_KEY_UNREGISTERED"))
-
-def _is_suspended(ex):
-    msg = str(ex).upper()
-    return any(k in msg for k in ("USER_SUSPENDED", "USER_DEACTIVATED",
-                                   "SESSION_REVOKED", "AUTH_KEY_UNREGISTERED"))
 
 def _is_group_or_channel(ent) -> bool:
     if ent is None: return False
@@ -342,6 +333,9 @@ DEFAULT_PV_ITEMS = {
     "delay_seconds": 120,
     "reply_once": True,
     "notify": True,
+    "notify_on_receive": True,
+    "notify_on_reply": True,
+    "poll_seconds": 5,
     "items": [{"kind": "text", "text": "سلام 👋"}]
 }
 
@@ -1367,7 +1361,6 @@ def _detect_file_kind(file_path: str) -> str:
 
 
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    """v27.9.3: ارسال فایل با fallback چند سطحی + لاگ خطای واقعی RPC"""
     if not file_path:
         if caption:
             try:
@@ -2919,7 +2912,7 @@ async def run_joiner_lefter(op, log):
         op2["status"] = "done"; op2["finished_at"] = int(time.time()); _save_op(op2)
 
 
-# ═══════════════ SENDER (with infinite loop) ═══════════════
+# ═══════════════ SENDER ═══════════════
 async def _send_worker(aid, acc, op_id, cfg, stop, log):
     name = acc.get("name") or acc.get("phone") or aid
     op = _get_op(op_id)
@@ -3132,9 +3125,8 @@ async def run_sender(op, log):
         op2["status"] = "done"; op2["finished_at"] = int(time.time()); _save_op(op2)
 
 
-# ═══════════════ LISTENER / KEEPALIVE / PV ═══════════════
+# ═══════════════ LISTENER / KEEPALIVE ═══════════════
 LISTENER_TASKS: Dict[str, asyncio.Task] = {}
-PV_LISTENER_TASKS: Dict[str, asyncio.Task] = {}
 
 async def _listener_loop(aid, acc, stop_event):
     name = acc.get("name") or acc.get("phone") or aid
@@ -3198,194 +3190,260 @@ async def restart_all_listeners():
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.3 — PV responder بازنویسی‌شده (fallback کامل + debug)
+# ⭐ v27.9.5 — PV POLLING هر ۵ ثانیه + نوتیف فوری + نوتیف پاسخ
 # ══════════════════════════════════════════════════════════════════
-async def _pv_responder_worker(aid, acc, stop_event):
-    name = acc.get("name") or acc.get("phone") or aid
-    flog(f"[pv] {name}: worker started")
-    while not stop_event.is_set():
-        cli = None
-        try:
-            cli, err = await _connect_with_retry(aid, acc["session_string"], name=name, tries=3)
-            if cli is None:
-                flog(f"[pv] {name}: connect fail: {err}", "warning")
-                await asyncio.sleep(30); continue
-            raw = cli.raw
-            if raw is None:
-                await asyncio.sleep(10); continue
+PV_LISTENER_TASKS: Dict[str, asyncio.Task] = {}
+_PV_SEEN_MSGS: Dict[str, Dict[str, float]] = {}
+_PV_REPLY_TASKS: Dict[str, asyncio.Task] = {}
+_PV_STOP_EVENTS: Dict[str, asyncio.Event] = {}
 
-            flog(f"[pv] {name}: raw connected — registering handler")
 
-            async def _on_pv(event):
-                sender_id = None
-                user_info = {}
+async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event):
+    """بعد از تایمر، پیام‌های تنظیم‌شده رو می‌فرسته + نوتیف نتیجه"""
+    name = acc.get("name") or aid
+    cfg = _load_pv_items()
+    delay_sec = int(cfg.get("delay_seconds", 120))
+
+    flog(f"[pv] {name}: reply task started for {sender_id}, delay={delay_sec}s")
+
+    if delay_sec > 0:
+        for _ in range(delay_sec):
+            if stop_event.is_set(): return
+            await asyncio.sleep(1)
+
+    sender_str = str(sender_id)
+    cli = None
+    send_ok = True
+    send_err = None
+
+    try:
+        cli, err = await _connect_with_retry(aid, acc["session_string"], name=name, tries=2, per_timeout=20)
+        if cli is None:
+            send_ok = False; send_err = f"connect: {err}"
+        else:
+            items = cfg.get("items") or []
+            for item in items:
+                if stop_event.is_set(): break
+                kind = item.get("kind", "text")
                 try:
-                    cfg = _load_pv_items()
-                    flog(f"[pv] {name}: event received type={type(event).__name__}")
-                    if not cfg.get("enabled"):
-                        flog(f"[pv] {name}: skip → not enabled"); return
-
-                    try:
-                        sender = await event.get_sender()
-                    except Exception as se:
-                        flog(f"[pv] {name}: get_sender err: {se}", "warning"); return
-                    if sender is None:
-                        flog(f"[pv] {name}: skip → no sender"); return
-
-                    sender_id = getattr(sender, "id", None)
-                    if sender_id is None:
-                        flog(f"[pv] {name}: skip → no sender_id"); return
-
-                    try:
-                        me = await cli.get_me()
-                        if getattr(me, "id", None) == sender_id:
-                            flog(f"[pv] {name}: skip → from me"); return
-                    except Exception: pass
-
-                    if getattr(sender, "bot", False):
-                        flog(f"[pv] {name}: skip → bot"); return
-
-                    is_private = True
-                    if hasattr(event, "is_private"):
-                        try: is_private = bool(getattr(event, "is_private"))
-                        except Exception: is_private = True
-                    if is_private:
-                        try:
-                            chat = await event.get_chat()
-                            chat_id = getattr(chat, "id", None)
-                            if chat_id is not None and chat_id != sender_id:
-                                is_private = False
-                        except Exception: pass
-                    if is_private and hasattr(event, "chat_id"):
-                        try:
-                            cid_ev = getattr(event, "chat_id", None)
-                            if cid_ev is not None and cid_ev != sender_id:
-                                is_private = False
-                        except Exception: pass
-
-                    if not is_private:
-                        flog(f"[pv] {name}: skip → not private"); return
-
-                    user_info = {
-                        "first_name": getattr(sender, "first_name", "") or "",
-                        "last_name": getattr(sender, "last_name", "") or "",
-                        "username": getattr(sender, "username", "") or "",
-                    }
-                    flog(f"[pv] {name}: PV from {sender_id} ({user_info.get('first_name')})")
-
-                    try: _record_pv_visit(aid, str(sender_id), user_info)
-                    except Exception as re:
-                        flog(f"[pv] record err: {type(re).__name__}", "warning")
-
-                    if cfg.get("reply_once", True) and _has_pv_replied(aid, str(sender_id)):
-                        flog(f"[pv] {name}: skip → already replied"); return
-
-                    delay_sec = int(cfg.get("delay_seconds", 120))
-                    flog(f"[pv] {name}: waiting {delay_sec}s before reply")
-                    if delay_sec > 0:
-                        for _ in range(delay_sec):
-                            if stop_event.is_set(): return
-                            await asyncio.sleep(1)
-
-                    items = cfg.get("items") or []
-                    send_ok = True
-                    send_err = None
-                    for item in items:
-                        if stop_event.is_set(): return
-                        kind = item.get("kind", "text")
-                        try:
-                            if kind == "text":
-                                txt = item.get("text") or ""
-                                if txt:
-                                    r = cli.send_message(sender_id, txt)
-                                    if asyncio.iscoroutine(r): r = await r
-                                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                            elif kind == "forward":
-                                mid = item.get("message_id")
-                                fcid = item.get("from_chat_id") or FORCED_OWNER
-                                if mid and APP:
-                                    try:
-                                        await APP.bot.copy_message(
-                                            chat_id=sender_id, from_chat_id=fcid,
-                                            message_id=int(mid))
-                                        await asyncio.sleep(random.uniform(1.0, 2.5))
-                                    except Exception as fe:
-                                        send_ok = False
-                                        send_err = f"copy: {str(fe)[:100]}"
-                            elif kind == "delay":
-                                sec = int(item.get("seconds", 3))
-                                await asyncio.sleep(sec)
-                        except FloodWaitError as fe:
-                            await asyncio.sleep(fe.seconds + 1)
-                            send_ok = False; send_err = f"Flood {fe.seconds}s"
-                        except Exception as e:
-                            flog(f"[pv] send step err: {type(e).__name__}: {e}", "warning")
-                            send_ok = False; send_err = f"{type(e).__name__}: {str(e)[:120]}"
-
-                    if cfg.get("reply_once", True):
-                        _mark_pv_replied(aid, str(sender_id))
-                    try: _record_pv_reply(aid, str(sender_id), ok=send_ok, err=send_err)
-                    except Exception: pass
-
-                    if cfg.get("notify", True):
-                        u_label = (user_info.get("first_name") or
-                                   (("@" + user_info["username"]) if user_info.get("username") else None) or
-                                   str(sender_id))
-                        try:
-                            if send_ok:
-                                await tg_send(f"✅ پیام PV به <b>{esc(u_label)}</b> ارسال شد")
-                            else:
-                                await tg_send(f"❌ پیام PV به <b>{esc(u_label)}</b> خطا: <code>{esc(send_err or '?')}</code>")
-                        except Exception as ne:
-                            flog(f"[pv] notify err: {type(ne).__name__}", "warning")
-
-                    flog(f"[pv] {name}: replied to {sender_id} ({'OK' if send_ok else 'FAIL'})")
+                    if kind == "text":
+                        txt = item.get("text") or ""
+                        if txt:
+                            r = cli.send_message(sender_id, txt)
+                            if asyncio.iscoroutine(r): r = await r
+                            await asyncio.sleep(random.uniform(1.0, 2.5))
+                    elif kind == "forward":
+                        mid = item.get("message_id")
+                        fcid = item.get("from_chat_id") or FORCED_OWNER
+                        if mid and APP:
+                            try:
+                                await APP.bot.copy_message(
+                                    chat_id=sender_id, from_chat_id=fcid,
+                                    message_id=int(mid))
+                                await asyncio.sleep(random.uniform(1.0, 2.5))
+                            except Exception as fe:
+                                send_ok = False; send_err = f"copy: {str(fe)[:100]}"
+                    elif kind == "delay":
+                        sec = int(item.get("seconds", 3))
+                        await asyncio.sleep(sec)
+                except FloodWaitError as fe:
+                    await asyncio.sleep(fe.seconds + 1)
+                    send_ok = False; send_err = f"Flood {fe.seconds}s"
                 except Exception as e:
-                    flog(f"[pv] handler err: {type(e).__name__}: {e}", "warning")
-                    try:
-                        if sender_id:
-                            _record_pv_reply(aid, str(sender_id), ok=False, err=str(e)[:200])
-                    except Exception: pass
-
-            registered = False
-            try:
-                if hasattr(raw, "add_event_handler"):
-                    raw.add_event_handler(_on_pv, events.NewMessage(incoming=True))
-                    registered = True
-                    flog(f"[pv] {name}: registered via add_event_handler")
-            except Exception as e1:
-                flog(f"[pv] {name}: add_event_handler fail: {e1}", "warning")
-            if not registered:
-                try:
-                    raw.on(events.NewMessage(incoming=True))(_on_pv)
-                    registered = True
-                    flog(f"[pv] {name}: registered via on()")
-                except Exception as e2:
-                    flog(f"[pv] {name}: on() fail: {e2}", "warning")
-            if not registered:
-                try:
-                    raw.add_event_handler(_on_pv, events.NewMessage)
-                    registered = True
-                    flog(f"[pv] {name}: registered via add_event_handler (no filter)")
-                except Exception as e3:
-                    flog(f"[pv] {name}: all registration methods failed: {e3}", "error")
-            if not registered:
-                flog(f"[pv] {name}: ❌ PV DISABLED for this account", "error")
-                await asyncio.sleep(60); continue
-
-            while not stop_event.is_set():
-                await asyncio.sleep(2)
-            try: await raw.disconnect()
+                    send_ok = False; send_err = f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        if cli:
+            try: await cli._disconnect()
             except Exception: pass
 
-        except asyncio.CancelledError: raise
+    if send_ok and cfg.get("reply_once", True):
+        _mark_pv_replied(aid, sender_str)
+    try: _record_pv_reply(aid, sender_str, ok=send_ok, err=send_err)
+    except Exception: pass
+
+    if cfg.get("notify", True) and cfg.get("notify_on_reply", True):
+        u_label = user_info.get("first_name") or user_info.get("username") or sender_str
+        try:
+            if send_ok:
+                await tg_send(f"✅ پاسخ PV به <b>{esc(u_label)}</b> ارسال شد")
+            else:
+                await tg_send(f"❌ پاسخ PV به <b>{esc(u_label)}</b> خطا: <code>{esc(send_err or '?')}</code>")
+        except Exception: pass
+
+    flog(f"[pv] {name}: replied to {sender_id} ({'OK' if send_ok else 'FAIL'})")
+    key = f"{aid}:{sender_str}"
+    _PV_REPLY_TASKS.pop(key, None)
+
+
+async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
+    """پیام جدید PV رو پردازش می‌کنه: نوتیف فوری + اسپاون reply task"""
+    name = acc.get("name") or aid
+    cfg = _load_pv_items()
+    if not cfg.get("enabled"): return
+
+    sender_str = str(sender_id)
+    user_info = {
+        "first_name": getattr(sender, "first_name", "") or "",
+        "last_name": getattr(sender, "last_name", "") or "",
+        "username": getattr(sender, "username", "") or "",
+    }
+    mtext = getattr(msg, "text", None) or getattr(msg, "message", "") or ""
+
+    flog(f"[pv] {name}: NEW msg from {sender_id} ({user_info.get('first_name')}): {mtext[:50]}")
+
+    try: _record_pv_visit(aid, sender_str, user_info)
+    except Exception: pass
+
+    # نوتیف فوری دریافت پیام
+    if cfg.get("notify", True) and cfg.get("notify_on_receive", True):
+        u_label = user_info.get("first_name") or user_info.get("username") or sender_str
+        delay_sec = int(cfg.get("delay_seconds", 120))
+        try:
+            if mtext:
+                await tg_send(
+                    f"🔔 <b>پیام PV جدید</b>\n"
+                    f"👤 {esc(u_label)}\n"
+                    f"💬 <code>{esc(mtext[:150])}</code>\n"
+                    f"⏱ پاسخ تا {delay_sec}s دیگه"
+                )
+            else:
+                await tg_send(
+                    f"🔔 <b>پیام PV جدید</b>\n"
+                    f"👤 {esc(u_label)}\n"
+                    f"📎 <i>(فایل/عکس/ویدیو)</i>\n"
+                    f"⏱ پاسخ تا {delay_sec}s دیگه"
+                )
+        except Exception as ne:
+            flog(f"[pv] notify receive err: {ne}", "warning")
+
+    # reply_once check
+    if cfg.get("reply_once", True) and _has_pv_replied(aid, sender_str):
+        flog(f"[pv] {name}: skip reply → already replied to {sender_id}")
+        return
+
+    # اگه reply task قبلاً در جریانه
+    key = f"{aid}:{sender_str}"
+    existing = _PV_REPLY_TASKS.get(key)
+    if existing and not existing.done():
+        flog(f"[pv] {name}: reply already in progress for {sender_id}")
+        return
+
+    # spawn reply task
+    stop_evt = _PV_STOP_EVENTS.get(aid)
+    if stop_evt is None:
+        stop_evt = asyncio.Event(); _PV_STOP_EVENTS[aid] = stop_evt
+
+    t = asyncio.create_task(_pv_send_reply(aid, acc, sender_id, user_info, stop_evt))
+    _PV_REPLY_TASKS[key] = t
+
+
+async def _pv_poller_worker(aid, acc, stop_event):
+    """Polling-based PV checker - هر N ثانیه (پیش‌فرض 5) چک می‌کنه"""
+    name = acc.get("name") or acc.get("phone") or aid
+    flog(f"[pv] {name}: poller started")
+
+    if aid not in _PV_SEEN_MSGS: _PV_SEEN_MSGS[aid] = {}
+    seen = _PV_SEEN_MSGS[aid]
+
+    first_run_done = False
+    my_id = None
+
+    while not stop_event.is_set():
+        cfg = _load_pv_items()
+        poll_sec = max(2, int(cfg.get("poll_seconds", 5)))
+
+        if not cfg.get("enabled"):
+            await asyncio.sleep(poll_sec); continue
+
+        cli = None
+        try:
+            cli, err = await _connect_with_retry(aid, acc["session_string"], name=name,
+                                                 tries=1, per_timeout=20)
+            if cli is None:
+                flog(f"[pv] {name}: connect fail: {err}", "warning")
+                for _ in range(poll_sec):
+                    if stop_event.is_set(): return
+                    await asyncio.sleep(1)
+                continue
+
+            if my_id is None:
+                try:
+                    me = await cli.get_me()
+                    my_id = getattr(me, "id", None)
+                except Exception: pass
+
+            try:
+                dialogs = await cli.get_dialogs()
+            except Exception as de:
+                flog(f"[pv] {name}: dialogs err: {type(de).__name__}: {de}", "warning")
+                dialogs = []
+
+            new_count = 0
+            for d in dialogs or []:
+                if stop_event.is_set(): break
+                try:
+                    is_user = getattr(d, "is_user", False)
+                    is_bot = getattr(d, "is_bot", False)
+                    if not is_user or is_bot: continue
+
+                    sender_id = getattr(d, "id", None)
+                    if not sender_id: continue
+                    if my_id and sender_id == my_id: continue
+
+                    sender = getattr(d, "entity", None)
+                    if sender is None: continue
+
+                    try:
+                        msgs = await cli.get_messages(sender, limit=3)
+                    except Exception:
+                        continue
+                    if not msgs: continue
+
+                    for m in msgs:
+                        mid = getattr(m, "id", None)
+                        if not mid: continue
+
+                        key = f"{sender_id}:{mid}"
+                        if key in seen: continue
+                        seen[key] = time.time()
+
+                        if getattr(m, "out", False): continue
+
+                        if not first_run_done:
+                            continue
+
+                        new_count += 1
+                        try:
+                            await _pv_handle_new_msg(cli, aid, acc, sender, sender_id, m)
+                        except Exception as he:
+                            flog(f"[pv] handle err: {type(he).__name__}: {he}", "warning")
+
+                except Exception:
+                    continue
+
+            if not first_run_done:
+                first_run_done = True
+                flog(f"[pv] {name}: first scan done ({len(seen)} msgs)")
+
+            # cleanup
+            cutoff = time.time() - 3600
+            for k in list(seen.keys()):
+                if seen[k] < cutoff: seen.pop(k, None)
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            flog(f"[pv] {name}: worker loop err: {type(e).__name__}: {e}", "warning")
-            await asyncio.sleep(20)
+            flog(f"[pv] {name}: loop err: {type(e).__name__}: {e}", "warning")
         finally:
             if cli:
                 try: await cli._disconnect()
                 except Exception: pass
+
+        for _ in range(poll_sec):
+            if stop_event.is_set(): return
+            await asyncio.sleep(1)
+
+    flog(f"[pv] {name}: poller stopped")
 
 
 async def start_pv_responders():
@@ -3396,29 +3454,32 @@ async def start_pv_responders():
         existing = PV_LISTENER_TASKS.get(aid)
         if existing and not existing.done():
             continue
-        if existing and existing.done():
-            flog(f"[pv] restarting dead worker for {aid}")
-            try: existing.exception()
-            except Exception: pass
         stop = asyncio.Event()
-        STATE.setdefault("pv_stops", {})[aid] = stop
-        t = asyncio.create_task(_pv_responder_worker(aid, acc, stop))
+        _PV_STOP_EVENTS[aid] = stop
+        t = asyncio.create_task(_pv_poller_worker(aid, acc, stop))
         PV_LISTENER_TASKS[aid] = t
-        flog(f"[pv] started for {aid}")
+        flog(f"[pv] started poller for {aid}")
+
 
 def _stop_all_pv():
-    for aid, st in list(STATE.get("pv_stops", {}).items()):
+    for aid, st in list(_PV_STOP_EVENTS.items()):
         try: st.set()
         except: pass
     for aid, t in list(PV_LISTENER_TASKS.items()):
         if not t.done(): t.cancel()
+    for key, t in list(_PV_REPLY_TASKS.items()):
+        if not t.done(): t.cancel()
     PV_LISTENER_TASKS.clear()
-    STATE["pv_stops"] = {}
+    _PV_REPLY_TASKS.clear()
+    _PV_STOP_EVENTS.clear()
+    _PV_SEEN_MSGS.clear()
+
 
 async def restart_all_pv():
     _stop_all_pv()
     await asyncio.sleep(1)
     await start_pv_responders()
+
 
 KEEPALIVE_SECONDS = 15 * 60
 PV_HEALTH_SECONDS = 5 * 60
@@ -3452,16 +3513,14 @@ async def keepalive_loop():
                         if t is None or t.done():
                             dead.append(aid)
                     if dead:
-                        flog(f"[pv-health] dead workers: {dead} — restarting")
+                        flog(f"[pv-health] dead pollers: {dead} — restarting")
                         for aid in dead:
                             PV_LISTENER_TASKS.pop(aid, None)
-                            st = STATE.get("pv_stops", {}).pop(aid, None)
+                            st = _PV_STOP_EVENTS.pop(aid, None)
                             if st:
                                 try: st.set()
                                 except: pass
                         await start_pv_responders()
-                    else:
-                        flog(f"[pv-health] all workers alive ({len(PV_LISTENER_TASKS)})")
 
             await asyncio.sleep(KEEPALIVE_SECONDS)
         except asyncio.CancelledError: raise
@@ -3678,13 +3737,15 @@ async def show_main():
     running = [o for o in ops if _op_effective_status(o) == "running"]
     listening = sum(1 for t in LISTENER_TASKS.values() if not t.done())
     pv_on = bool(_load_pv_items().get("enabled"))
+    pv_pollers = sum(1 for t in PV_LISTENER_TASKS.values() if t and not t.done())
     errs = len(_load_errors())
     tpls = len(list_templates())
     banned_n = len(_load_banned())
     seen_n = len(_load_seen())
     txt = head("🌀", "پنل سروش", VERSION)
     txt += f"👤 <b>{len(accounts)}</b>   ·   👂 <b>{listening}</b>   ·   🎯 <b>{tpls}</b>\n"
-    txt += f"💬 PV: <b>{'🟢' if pv_on else '⚪'}</b>   ·   🔍 seen: <b>{seen_n}</b>   ·   🚫 ban: <b>{banned_n}</b>\n"
+    txt += f"💬 PV: <b>{'🟢' if pv_on else '⚪'}</b> ({pv_pollers})   ·   🔍 seen: <b>{seen_n}</b>\n"
+    txt += f"🚫 ban: <b>{banned_n}</b>\n"
     txt += (f"🟢 <b>{len(running)}</b> در حال اجرا" if running else "⚪ فعال نیست")
     err_lbl = "⚠️ خطاها" + (f" ({errs})" if errs else "")
     rows = []
@@ -3721,11 +3782,16 @@ async def show_pv_menu():
     delay = int(cfg.get("delay_seconds", 120))
     once = bool(cfg.get("reply_once", True))
     notify_on = bool(cfg.get("notify", True))
+    notify_recv = bool(cfg.get("notify_on_receive", True))
+    notify_rep = bool(cfg.get("notify_on_reply", True))
+    poll_sec = int(cfg.get("poll_seconds", 5))
     items = cfg.get("items") or []
+    pollers = sum(1 for t in PV_LISTENER_TASKS.values() if t and not t.done())
     txt = head("💬", "پاسخ خودکار PV")
-    txt += f"وضعیت: <b>{'🟢 فعال' if enabled else '⚪ خاموش'}</b>\n"
+    txt += f"وضعیت: <b>{'🟢 فعال' if enabled else '⚪ خاموش'}</b>  ·  🔄 poll: <b>{pollers}</b>\n"
     txt += f"⏱ تایمر: <b>{delay}s</b>  ·  🔁 یک‌بار: <b>{'🟢' if once else '⚪'}</b>\n"
-    txt += f"🔔 نوتیف: <b>{'🟢' if notify_on else '⚪'}</b>\n"
+    txt += f"🔔 نوتیف: <b>{'🟢' if notify_on else '⚪'}</b>  ·  📥 دریافت: <b>{'🟢' if notify_recv else '⚪'}</b>  ·  📤 پاسخ: <b>{'🟢' if notify_rep else '⚪'}</b>\n"
+    txt += f"🔄 هر <b>{poll_sec}s</b> چک می‌کنه\n"
     txt += f"📨 پیام‌ها: <b>{len(items)}</b> عدد\n\n"
     if items:
         for i, it in enumerate(items, 1):
@@ -3734,12 +3800,14 @@ async def show_pv_menu():
             elif k == "forward": txt += f"{i}. 📎 Forward (id:<code>{it.get('message_id', '?')}</code>)\n"
             elif k == "delay": txt += f"{i}. ⏸ تأخیر {it.get('seconds', 3)}s\n"
     else:
-        txt += "<i>هیچ پیامی تنظیم نشده</i>\n\n"
-        txt += "<i>💡 هر عکس/ویدیو/فایلی که تو همین چت PV بفرستی ذخیره می‌شه</i>"
+        txt += "<i>هیچ پیامی تنظیم نشده</i>"
     rows = [
         [B(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), "pv:toggle")],
         [B(("🔔 نوتیف روشن" if notify_on else "🔕 نوتیف خاموش"), "pv:toggle_notify")],
+        [B(("📥 دریافت ✅" if notify_recv else "📥 دریافت ⚪"), "pv:toggle_notify_recv"),
+         B(("📤 پاسخ ✅" if notify_rep else "📤 پاسخ ⚪"), "pv:toggle_notify_rep")],
         [B("⏱ تایمر", "pv:set_delay"), B("🔁 یک‌بار" + (" ✅" if once else ""), "pv:toggle_once")],
+        [B(f"🔄 هر {poll_sec}s", "pv:set_poll")],
         [B("➕ متن", "pv:add_text")],
         [B("📎 ذخیره پیام (فایل/عکس)", "pv:add_saved")],
         [B("⏸ تأخیر", "pv:add_delay")],
@@ -4706,6 +4774,9 @@ async def _on_message_impl(update, context):
         if kind == "delay":
             try: cfg["delay_seconds"] = max(0, int(re.sub(r"[^\d]", "", text) or "120"))
             except: cfg["delay_seconds"] = 120
+        elif kind == "poll":
+            try: cfg["poll_seconds"] = max(2, int(re.sub(r"[^\d]", "", text) or "5"))
+            except: cfg["poll_seconds"] = 5
         elif kind == "add_text":
             items.append({"kind": "text", "text": text})
             cfg["items"] = items
@@ -4728,7 +4799,7 @@ async def _on_message_impl(update, context):
         items.append({"kind": "forward", "message_id": msg.message_id, "from_chat_id": cid})
         cfg["items"] = items
         _save_pv_items(cfg)
-        await tg_send("✅ ذخیره شد (موقع پاسخ forward می‌شه)")
+        await tg_send("✅ ذخیره شد")
         return await show_pv_menu()
 
     if conv.get("accphoto_upload"):
@@ -5079,23 +5150,36 @@ async def route_cb(cid, data):
         if sub == "menu":
             return await show_pv_menu()
         if sub == "test":
-            lines = ["🧪 <b>تست اتصال PV</b>", ""]
+            lines = ["🧪 <b>تست اتصال PV (polling)</b>", ""]
             lines.append(f"enabled: <b>{cfg.get('enabled')}</b>")
-            lines.append(f"tasks: <b>{len(PV_LISTENER_TASKS)}</b>")
+            lines.append(f"poll: <b>{cfg.get('poll_seconds',5)}s</b>")
+            lines.append(f"pollers: <b>{len(PV_LISTENER_TASKS)}</b>")
             for aid, t in PV_LISTENER_TASKS.items():
                 acc = get_account(aid)
                 anm = acc.get("name", aid) if acc else aid
                 st = "🟢 running" if (t and not t.done()) else "🔴 dead"
-                lines.append(f"· {esc(anm)}: {st}")
+                seen_n = len(_PV_SEEN_MSGS.get(aid, {}))
+                lines.append(f"· {esc(anm)}: {st} (seen:{seen_n})")
             if not PV_LISTENER_TASKS:
                 lines.append("")
-                lines.append("⚠️ هیچ تسکی برای PV اجرا نمی‌شه")
+                lines.append("⚠️ هیچ poller ای اجرا نمی‌شه")
                 lines.append("<i>روشن کن یا ری‌استارت بزن</i>")
             return await panel(head("🧪", "تست PV") + "\n".join(lines),
                                kb_([B("🔄 ری‌استارت", "pv:restart"), B("⬅️", "pv:menu")]),
                                page_tag="pv_test")
+        if sub == "set_poll":
+            get_conv(cid)["pv_wait"] = "poll"
+            return await ask("🔄 هر چند ثانیه چک کنه؟ (پیش‌فرض 5، حداقل 2):")
         if sub == "toggle_notify":
             cfg["notify"] = not bool(cfg.get("notify", True))
+            _save_pv_items(cfg)
+            return await show_pv_menu()
+        if sub == "toggle_notify_recv":
+            cfg["notify_on_receive"] = not bool(cfg.get("notify_on_receive", True))
+            _save_pv_items(cfg)
+            return await show_pv_menu()
+        if sub == "toggle_notify_rep":
+            cfg["notify_on_reply"] = not bool(cfg.get("notify_on_reply", True))
             _save_pv_items(cfg)
             return await show_pv_menu()
         if sub == "toggle":
@@ -5475,10 +5559,12 @@ async def route_cb(cid, data):
         if sub == "delok":
             _stop_listener_for(p[2])
             try:
-                st = STATE.get("pv_stops", {}).get(p[2])
+                st = _PV_STOP_EVENTS.get(p[2])
                 if st: st.set()
                 t = PV_LISTENER_TASKS.pop(p[2], None)
                 if t and not t.done(): t.cancel()
+                _PV_STOP_EVENTS.pop(p[2], None)
+                _PV_SEEN_MSGS.pop(p[2], None)
             except Exception: pass
             remove_account(p[2]); await tg_send("🗑")
             return await show_accounts()
