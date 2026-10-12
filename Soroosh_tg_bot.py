@@ -5,7 +5,7 @@ import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.7"
+VERSION = "Soroosh v27.9.9"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -1361,6 +1361,7 @@ def _detect_file_kind(file_path: str) -> str:
 
 
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
+    """v27.9.9: retry + upload-to-self + forward"""
     if not file_path:
         if caption:
             try:
@@ -1368,163 +1369,127 @@ async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -
                 if asyncio.iscoroutine(r): r = await r
                 return True, "text_only"
             except Exception as e:
-                return False, f"text:{type(e).__name__}:{_fmt_error(e)[:80]}"
+                return False, f"text:{type(e).__name__}"
         return False, "no_path"
     if not os.path.exists(file_path):
-        return False, f"not_found:{os.path.basename(file_path)}"
+        return False, "not_found"
 
     kind = _detect_file_kind(file_path)
-    fsize = os.path.getsize(file_path)
-    flog(f"[send-file] kind={kind} name={os.path.basename(file_path)} size={fsize}")
+    flog(f"[send-file] {os.path.basename(file_path)} kind={kind}")
 
-    tried: List[str] = []
-    details: List[str] = []
+    # ── تلاش ۱: مستقیم با retry ──
+    for attempt in range(1, 4):
+        flog(f"[send-file] attempt {attempt}/3")
 
-    def _log(prefix, e):
-        m = _fmt_error(e) or str(e)
-        details.append(f"{prefix}={m[:150]}")
-        flog(f"[send-file] {prefix} EXC {type(e).__name__}: {m[:300]}", "warning")
-
-    candidates = []
-    sf = getattr(cli, "send_file", None)
-    if sf: candidates.append(("send_file", sf))
-    if kind == "photo":
-        sp = getattr(cli, "send_photo", None)
-        if sp: candidates.append(("send_photo", sp))
-    if kind == "video":
-        sv = getattr(cli, "send_video", None)
-        if sv: candidates.append(("send_video", sv))
-    sd = getattr(cli, "send_document", None)
-    if sd: candidates.append(("send_document", sd))
-
-    for name, fn in candidates:
-        for kw in ({"caption": caption}, {}):
+        sf = getattr(cli, "send_file", None)
+        if sf:
             try:
-                r = fn(entity, file_path, **kw)
+                r = sf(entity, file_path, caption=caption)
                 if asyncio.iscoroutine(r): r = await r
-                flog(f"[send-file] OK {name}")
+                flog(f"[send-file] OK attempt={attempt}")
                 return True, "OK"
-            except TypeError:
-                tried.append(f"{name}:TypeErr"); continue
-            except FloodWaitError as fe:
-                return False, f"Flood {fe.seconds}s"
             except Exception as e:
-                _log(name, e)
-                tried.append(f"{name}:{type(e).__name__}")
-                break
+                err_s = str(e).upper()
+                flog(f"[send-file] send_file fail: {type(e).__name__}: {str(e)[:100]}", "warning")
+                if "FILE_REQUEST_RECEIVED_ON_CONNECTION_SERVER" in err_s or "SERVER" in err_s:
+                    break
 
-    sm = getattr(cli, "send_media", None)
-    if sm:
-        for kw in ({"caption": caption}, {}):
+        sd = getattr(cli, "send_document", None)
+        if sd:
             try:
-                r = sm(entity, file_path, **kw)
-                if asyncio.iscoroutine(r): r = await r
-                flog("[send-file] OK send_media")
-                return True, "OK"
-            except TypeError:
-                tried.append("sm:TypeErr"); continue
-            except FloodWaitError as fe:
-                return False, f"Flood {fe.seconds}s"
-            except Exception as e:
-                _log("send_media", e)
-                tried.append(f"sm:{type(e).__name__}")
-                break
-
-    try:
-        from splusthon.tl.functions.messages import SendMediaRequest
-        from splusthon.tl.types import (
-            InputMediaUploadedDocument, InputMediaUploadedPhoto,
-            DocumentAttributeFilename,
-        )
-        _IPU = InputPeerUser
-        if _IPU is None:
-            try:
-                from splusthon.tl.types import InputPeerUser as _IPU  # noqa
-            except Exception:
-                _IPU = None
-
-        raw = getattr(cli, "raw", None) or cli
-
-        actual_entity = entity
-        if isinstance(entity, int):
-            try:
-                actual_entity = await cli.get_entity(entity)
-                flog(f"[send-file] int resolved to {type(actual_entity).__name__}")
-            except Exception as ie:
-                _log("resolve_int_entity", ie)
-                actual_entity = entity
-        peer = None
-        try:
-            peer = await raw.get_input_entity(actual_entity)
-            flog("[send-file] peer= get_input_entity")
-        except Exception as pe:
-            _log("get_input_entity", pe)
-            try:
-                eid = getattr(actual_entity, "id", None) or (entity if isinstance(entity, int) else None)
-                eah = getattr(actual_entity, "access_hash", None)
-                if eid and eah and _IPU is not None:
-                    peer = _IPU(int(eid), int(eah))
-                    flog("[send-file] peer= InputPeerUser fallback")
-            except Exception as e2:
-                _log("InputPeerUser", e2)
-
-        if peer is None:
-            tried.append("no_peer")
-        else:
-            uploaded = await raw.upload_file(file_path)
-            fname = os.path.basename(file_path); low = fname.lower()
-            if kind == "photo":
-                media = InputMediaUploadedPhoto(file=uploaded)
-            else:
-                if   low.endswith((".mp4", ".mov", ".mkv", ".webm")): mime = "video/mp4"
-                elif low.endswith((".jpg", ".jpeg")):                   mime = "image/jpeg"
-                elif low.endswith(".png"):                              mime = "image/png"
-                elif low.endswith(".gif"):                              mime = "image/gif"
-                elif low.endswith(".pdf"):                              mime = "application/pdf"
-                else:                                                   mime = "application/octet-stream"
-                media = InputMediaUploadedDocument(
-                    file=uploaded, mime_type=mime,
-                    attributes=[DocumentAttributeFilename(file_name=fname)],
-                )
-
-            for variant in (
-                dict(peer=peer, media=media, message=caption or "",
-                     random_id=random.randint(-2**63, 2**63 - 1)),
-                dict(peer=peer, media=media, message=caption or "",
-                     random_id=random.randint(-2**63, 2**63 - 1),
-                     silent=False, background=False, clear_draft=False),
-            ):
                 try:
-                    r = raw(SendMediaRequest(**variant))
-                    if asyncio.iscoroutine(r): r = await r
-                    flog("[send-file] OK raw SendMediaRequest")
-                    return True, "OK"
-                except TypeError as te:
-                    tried.append(f"rawType:{str(te)[:40]}"); continue
-                except Exception as e:
-                    _log("raw_SendMedia", e)
-                    tried.append(f"raw:{type(e).__name__}"); break
-    except ImportError as ie:
-        tried.append(f"raw_imp:{ie}")
-    except Exception as e:
-        _log("raw_block", e)
-        tried.append(f"raw_block:{type(e).__name__}")
+                    r = sd(entity, file_path, caption=caption, force_document=True)
+                except TypeError:
+                    r = sd(entity, file_path, caption=caption)
+                if asyncio.iscoroutine(r): r = await r
+                flog(f"[send-file] OK via document")
+                return True, "OK-doc"
+            except Exception as e:
+                flog(f"[send-file] doc fail: {type(e).__name__}: {str(e)[:80]}", "warning")
 
+        if attempt < 3:
+            await asyncio.sleep(2 * attempt)
+
+    # ── تلاش ۲: آپلود به Saved Messages + فوروارد ──
+    flog("[send-file] trying upload-to-self + forward method")
+    try:
+        me = await cli.get_me()
+        if me:
+            mid = None
+            sf = getattr(cli, "send_file", None)
+            if sf:
+                try:
+                    r = sf(me, file_path)
+                    if asyncio.iscoroutine(r): r = await r
+                    mid = getattr(r, "id", None)
+                    if mid is None:
+                        upd = getattr(r, "updates", None) or r
+                        msgs = (getattr(upd, "updates", None) or
+                                getattr(upd, "messages", None) or [])
+                        for m in msgs:
+                            mid = getattr(m, "id", None)
+                            if mid: break
+                    flog(f"[send-file] uploaded to self: mid={mid}")
+                except Exception as se:
+                    flog(f"[send-file] self-upload fail: {type(se).__name__}: {str(se)[:80]}", "warning")
+
+            if mid:
+                fm = getattr(cli, "forward_messages", None)
+                if fm:
+                    try:
+                        r2 = fm(entity, mid, me)
+                        if asyncio.iscoroutine(r2): r2 = await r2
+                        if caption:
+                            try:
+                                r3 = cli.send_message(entity, caption)
+                                if asyncio.iscoroutine(r3): r3 = await r3
+                            except Exception: pass
+                        flog("[send-file] OK via helper forward")
+                        return True, "OK-fwd"
+                    except Exception as fe:
+                        flog(f"[send-file] helper forward fail: {type(fe).__name__}: {str(fe)[:80]}", "warning")
+
+                try:
+                    from splusthon.tl.functions.messages import ForwardMessagesRequest
+                    raw = getattr(cli, "raw", None) or cli
+                    try:
+                        target_peer = await raw.get_input_entity(entity)
+                    except Exception:
+                        target_peer = entity
+                    try:
+                        self_peer = await raw.get_input_entity(me)
+                    except Exception:
+                        self_peer = me
+                    rr = cli(ForwardMessagesRequest(
+                        from_peer=self_peer,
+                        id=[mid],
+                        to_peer=target_peer,
+                        random_id=[random.randint(-2**63, 2**63 - 1)],
+                    ))
+                    if asyncio.iscoroutine(rr): rr = await rr
+                    if caption:
+                        try:
+                            r3 = cli.send_message(entity, caption)
+                            if asyncio.iscoroutine(r3): r3 = await r3
+                        except Exception: pass
+                    flog("[send-file] OK via raw forward")
+                    return True, "OK-rawfwd"
+                except Exception as rfe:
+                    flog(f"[send-file] raw forward fail: {type(rfe).__name__}: {str(rfe)[:80]}", "warning")
+    except Exception as e:
+        flog(f"[send-file] forward method err: {type(e).__name__}: {str(e)[:80]}", "warning")
+
+    # ── آخرین شانس: کپشن به عنوان متن ──
     if caption:
         try:
             r = cli.send_message(entity, caption)
             if asyncio.iscoroutine(r): r = await r
-            flog("[send-file] WARN fallback to text_only")
-            return True, "text_only_fallback"
-        except Exception as e:
-            _log("text_fallback", e)
+            flog("[send-file] caption sent as text fallback")
+            return True, "text_fallback"
+        except Exception: pass
 
-    err_sum = " | ".join(tried[:6]) if tried else "no_methods"
-    detail  = " || ".join(details[:3])
-    flog(f"[send-file] FAILED {err_sum}  <-  {detail}", "error")
-    return False, f"all_failed:{err_sum} <- {detail[:220]}"
-
-
+    flog("[send-file] FAILED all methods", "error")
+    return False, "all_failed"
 async def soroosh_set_profile_photo(cli, file_path: str) -> Tuple[bool, str]:
     if not os.path.exists(file_path): return False, "فایل پیدا نشد"
     try:
