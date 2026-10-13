@@ -1,11 +1,11 @@
-# Soroosh_tg_bot.py — v27.9.13 (full upload params + raw SendMediaRequest + fwd_saved)
+# Soroosh_tg_bot.py — v27.9.17 (PV watermark + max_replies per user)
 import os, sys, json, ssl, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 from typing import Optional, Dict, Any, List, Set, Tuple
 
-VERSION = "Soroosh v27.9.13"
+VERSION = "Soroosh v27.9.17"
 
 def _detect_data_dir():
     env = os.environ.get("DATA_DIR", "").strip()
@@ -80,18 +80,14 @@ try:
     try: from splusthon.tl.types import InputPhoto, InputPhotoEmpty
     except Exception: InputPhoto = None; InputPhotoEmpty = None
 
-    # ── raw SendMedia API (v27.9.13) ──
     SendMediaRequest = None
     InputMediaUploadedDocument = None
     InputMediaUploadedPhoto = None
-    try:
-        from splusthon.tl.functions.messages import SendMediaRequest
+    try: from splusthon.tl.functions.messages import SendMediaRequest
     except Exception: pass
-    try:
-        from splusthon.tl.types import InputMediaUploadedDocument
+    try: from splusthon.tl.types import InputMediaUploadedDocument
     except Exception: pass
-    try:
-        from splusthon.tl.types import InputMediaUploadedPhoto
+    try: from splusthon.tl.types import InputMediaUploadedPhoto
     except Exception: pass
 
     InputChannel = None
@@ -142,7 +138,6 @@ try:
     print(f"[+] ExportInvite: {'OK' if ExportChatInviteRequest else 'NO'}")
     print(f"[+] GetFullChannel: {'OK' if GetFullChannelRequest else 'NO'}")
     print(f"[+] SendMediaRequest: {'OK' if SendMediaRequest else 'NO'}")
-    print(f"[+] InputMediaUploadedDocument: {'OK' if InputMediaUploadedDocument else 'NO'}")
 
     SOROOSH_AVAILABLE = True
 except ImportError as _e:
@@ -239,9 +234,13 @@ LDPROG_FILE      = os.path.join(SOROOSH_DIR, "linkdoni_progress.json")
 PV_REPLIES_FILE  = os.path.join(SOROOSH_DIR, "pv_replies.json")
 PV_ITEMS_FILE    = os.path.join(SOROOSH_DIR, "pv_items.json")
 PV_REPORT_FILE   = os.path.join(SOROOSH_DIR, "pv_report.json")
+PV_COUNTS_FILE   = os.path.join(SOROOSH_DIR, "pv_counts.json")   # ← جدید
+PV_WM_FILE       = os.path.join(SOROOSH_DIR, "pv_wm.json")       # ← جدید
 
 _SEEN_CACHE: Optional[Set[str]] = None
 _BANNED_CACHE: Optional[Dict[str, Any]] = None
+_PV_WM: Optional[Dict[str, Dict[str, int]]] = None               # ← جدید
+_PV_WM_DIRTY = False                                             # ← جدید
 
 def _load_seen() -> Set[str]:
     global _SEEN_CACHE
@@ -322,36 +321,65 @@ def _reset_ld_progress():
     try: _save(LDPROG_FILE, {})
     except Exception: pass
 
+
+# ═══════════════ ★ PV: water-mark + شمارنده (v27.9.17) ═══════════════
+def _pv_count(aid, uid) -> int:
+    d = _load(PV_COUNTS_FILE, {})
+    return int((d.get(aid) or {}).get(str(uid), 0))
+
+def _pv_count_add(aid, uid, delta):
+    d = _load(PV_COUNTS_FILE, {})
+    acc = d.setdefault(aid, {})
+    acc[str(uid)] = max(0, int(acc.get(str(uid), 0)) + delta)
+    _save(PV_COUNTS_FILE, d)
+
+def _pv_limit_reached(aid, uid, cfg) -> bool:
+    mx = int(cfg.get("max_replies", 1) or 0)
+    return mx > 0 and _pv_count(aid, uid) >= mx
+
+def _wm_load():
+    global _PV_WM
+    if _PV_WM is None:
+        d = _load(PV_WM_FILE, {})
+        _PV_WM = d if isinstance(d, dict) else {}
+    return _PV_WM
+
+def _wm_get(aid, uid) -> int:
+    try: return int((_wm_load().get(aid) or {}).get(str(uid), 0))
+    except Exception: return 0
+
+def _wm_set(aid, uid, mid):
+    global _PV_WM_DIRTY
+    w = _wm_load().setdefault(aid, {})
+    if int(mid) > int(w.get(str(uid), 0)):
+        w[str(uid)] = int(mid); _PV_WM_DIRTY = True
+
+def _wm_flush():
+    global _PV_WM_DIRTY
+    if _PV_WM_DIRTY:
+        try: _save(PV_WM_FILE, _wm_load())
+        except Exception: pass
+        _PV_WM_DIRTY = False
+
+
 def _load_pv_replies() -> Dict[str, Any]:
     d = _load(PV_REPLIES_FILE, {})
     return d if isinstance(d, dict) else {}
 
 def _save_pv_replies(d): _save(PV_REPLIES_FILE, d)
 
-def _mark_pv_replied(aid: str, user_id: str):
-    d = _load_pv_replies()
-    acc = d.setdefault(aid, {})
-    acc[str(user_id)] = int(time.time())
-    if len(acc) > 10000:
-        sorted_items = sorted(acc.items(), key=lambda x: x[1])
-        d[aid] = dict(sorted_items[-8000:])
-    _save_pv_replies(d)
-
-def _has_pv_replied(aid: str, user_id: str) -> bool:
-    d = _load_pv_replies()
-    return str(user_id) in (d.get(aid) or {})
-
 def _clear_pv_replies():
-    _save_pv_replies({})
+    _save(PV_COUNTS_FILE, {}); _save(PV_REPLIES_FILE, {})
 
 DEFAULT_PV_ITEMS = {
     "enabled": False,
-    "delay_seconds": 120,
+    "delay_seconds": 0,
     "reply_once": True,
+    "max_replies": 1,                 # ← جدید
     "notify": True,
     "notify_on_receive": True,
     "notify_on_reply": True,
-    "poll_seconds": 5,
+    "poll_seconds": 3,
     "items": [{"kind": "text", "text": "سلام 👋"}]
 }
 
@@ -617,6 +645,11 @@ def _load_errors() -> List[Dict[str, Any]]:
     return d if isinstance(d, list) else []
 
 def add_error(source: str, error: str, target: Any = None, account: Any = None):
+    err_up = str(error).upper()
+    if "CHANNELPRIVATEERROR" in err_up or "CHANNEL_PRIVATE" in err_up:
+        return
+    if "REQUEST WAS UNSUCCESSFUL" in err_up:
+        return
     errs = _load_errors()
     errs.append({"time": int(time.time()), "source": str(source)[:40], "error": str(error)[:300],
                  "target": (str(target)[:120] if target is not None else None),
@@ -836,6 +869,7 @@ async def send_to_channel(aid: str, idx: int, text: str):
     if idx < 0 or idx >= len(channels): return False, "کانال نیست"
     a = get_account(aid)
     if not a: return False, "اکانت نیست"
+    if not text or not text.strip(): return False, "متن خالی"
     cli = None
     try:
         cli, err = await _connect_with_retry(aid, a["session_string"], name=a.get("name"), tries=2)
@@ -1267,11 +1301,13 @@ async def _do_edit_msg(cli, entity, mid, new_text):
                 last_err = f"{mname}:{type(e).__name__}"; continue
     return False, last_err
 
+
 async def _send_with_edit_delay(cli, entity, real_text: str, placeholder: str = "سلام",
                                 edit_delay: float = 3.0, log=None, placeholder_list: str = "",
                                 delay_random: bool = False, delay_min: float = 2.0, delay_max: float = 6.0,
                                 multi_step: bool = False, multi_middle: str = "Hi"):
-    if not real_text: return False, "empty_text"
+    if not real_text or not str(real_text).strip():
+        return False, "empty_text"
     if placeholder_list and placeholder_list.strip():
         opts = [p.strip() for p in placeholder_list.split(",") if p.strip()]
         if opts: placeholder = random.choice(opts)
@@ -1323,7 +1359,10 @@ async def _send_with_edit_delay(cli, entity, real_text: str, placeholder: str = 
     if log: flog(f"[edit-delay] FAILED: {edit_err[:120]}", "warning")
     return True, f"edit_failed:{edit_err[:80]}"
 
+
 async def _send_to_entity(cli, entity, text, snd_cfg: Dict[str, Any], log=None):
+    if not text or not str(text).strip():
+        return False, "empty_text"
     use_edit = bool(snd_cfg.get("edit_delay_enabled", False))
     if use_edit:
         return await _send_with_edit_delay(cli, entity, text,
@@ -1348,6 +1387,7 @@ async def _send_to_entity(cli, entity, text, snd_cfg: Dict[str, Any], log=None):
             if "FORBIDDEN" in err_s or "CHAT_WRITE_FORBIDDEN" in err_s:
                 return False, f"BLOCKED:{_fmt_error(e)[:100]}"
             return False, f"{type(e).__name__}: {_fmt_error(e)}"
+
 
 async def _set_personal_channel(cli, pub_ent) -> Tuple[bool, str]:
     if UpdatePersonalChannelRequest is None: return False, "API_not_available"
@@ -1377,198 +1417,167 @@ def _detect_file_kind(file_path: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.13 — _send_file_to_entity با همه پارامترها + raw SendMedia
+# _send_file_to_entity — همان v27.9.16 (خطای واقعی + try/except جامع)
 # ══════════════════════════════════════════════════════════════════
 async def _send_file_to_entity(cli, entity, file_path: str, caption: str = "") -> Tuple[bool, str]:
-    """v27.9.13 — همه روش‌ها: send_file params، upload_file params، raw SendMediaRequest"""
     async def _aw(r):
         return (await r) if asyncio.iscoroutine(r) else r
 
-    if not file_path:
-        if caption:
-            try:
-                await _aw(cli.send_message(entity, caption)); return True, "text_only"
-            except Exception as e:
-                return False, f"text:{type(e).__name__}"
-        return False, "no_path"
-    if not os.path.exists(file_path): return False, "not_found"
-
-    fname = os.path.basename(file_path)
-    try: fsize = os.path.getsize(file_path)
-    except Exception: fsize = 0
-    kind = _detect_file_kind(file_path)
-    flog(f"[send-file] {fname} kind={kind} size={fsize}")
-    errs: List[str] = []
-
-    def _susp(e): return "USER_SUSPENDED" in str(e).upper()
-
-    # warmup
     try:
-        await asyncio.wait_for(cli.get_me(), timeout=15)
-    except Exception: pass
+        cap = caption if (caption and str(caption).strip()) else None
 
-    sf = getattr(cli, "send_file", None)
-    sd = getattr(cli, "send_document", None)
-    up = getattr(cli, "upload_file", None)
-
-    # ── A) send_file با پارامترهای مستند ──
-    if sf:
-        variants_a = [
-            ("plain", {"caption": caption}),
-            ("workers1", {"caption": caption, "workers": 1, "file_size": fsize}),
-            ("chunk", {"caption": caption, "workers": 1, "chunk_size": 512 * 1024, "file_size": fsize}),
-            ("doc", {"caption": caption, "force_document": True, "workers": 1, "file_size": fsize}),
-            ("doc_chunk", {"caption": caption, "force_document": True, "workers": 1, "chunk_size": 512 * 1024}),
-            ("force_file", {"caption": caption, "force_file": True}),
-        ]
-        for tag, kw in variants_a:
-            try:
-                await _aw(sf(entity, file_path, **kw))
-                flog(f"[send-file] OK sf:{tag}")
-                return True, f"OK-sf-{tag}"
-            except TypeError as te:
-                errs.append(f"sf:{tag}:TypeErr:{str(te)[:50]}")
-                continue
-            except FloodWaitError as fe:
-                await asyncio.sleep(min(fe.seconds + 1, 30))
-                errs.append(f"sf:{tag}:Flood{fe.seconds}")
-                continue
-            except Exception as e:
-                errs.append(f"sf:{tag}:{type(e).__name__}:{str(e)[:55]}")
-                flog(f"[send-file] {errs[-1]}", "warning")
-                if _susp(e): return False, "ACCOUNT_SUSPENDED"
-
-    # ── B) send_document ──
-    if sd:
-        try:
-            await _aw(sd(entity, file_path, caption=caption))
-            flog("[send-file] OK sd")
-            return True, "OK-sd"
-        except Exception as e:
-            errs.append(f"sd:{type(e).__name__}:{str(e)[:55]}")
-            flog(f"[send-file] {errs[-1]}", "warning")
-            if _susp(e): return False, "ACCOUNT_SUSPENDED"
-
-    # ── C) upload_file با پارامترهای مختلف + ارسال handle ──
-    if up:
-        for kb in (None, 512, 256, 128, 64, 32):
-            up_kw: Dict[str, Any] = {"file_name": fname, "use_cache": False}
-            if kb: up_kw["part_size_kb"] = kb
-            handle = None
-            try:
-                handle = await _aw(up(file_path, **up_kw))
-                flog(f"[upload_file] OK part_kb={kb}")
-            except TypeError:
-                # نسخه قدیمی‌تر پارامترها رو نمی‌شناسه
+        if not file_path:
+            if cap:
                 try:
-                    handle = await _aw(up(file_path))
-                    flog(f"[upload_file] OK (no-kw)")
+                    await _aw(cli.send_message(entity, cap)); return True, "text_only"
                 except Exception as e:
-                    errs.append(f"up[{kb}]:{type(e).__name__}:{str(e)[:55]}")
-                    flog(f"[send-file] {errs[-1]}", "warning")
-                    continue
-            except FloodWaitError as fe:
-                await asyncio.sleep(min(fe.seconds + 1, 30))
-                errs.append(f"up[{kb}]:Flood{fe.seconds}")
-                continue
-            except Exception as e:
-                errs.append(f"up[{kb}]:{type(e).__name__}:{str(e)[:55]}")
-                flog(f"[send-file] {errs[-1]}", "warning")
-                if _susp(e): return False, "ACCOUNT_SUSPENDED"
-                continue
+                    return False, f"text:{type(e).__name__}"
+            return False, "no_path"
 
-            if handle is None: continue
+        if not os.path.exists(file_path):
+            return False, "not_found"
 
-            # C1: send_file(entity, handle)
-            if sf:
-                for tag_h, kw_h in (
-                    ("h_plain", {"caption": caption}),
-                    ("h_doc", {"caption": caption, "force_document": True}),
-                ):
-                    try:
-                        await _aw(sf(entity, handle, **kw_h))
-                        flog(f"[send-file] OK sf:{tag_h} kb={kb}")
-                        return True, f"OK-sf-{tag_h}-{kb}"
-                    except Exception as e:
-                        errs.append(f"sf:{tag_h}[{kb}]:{type(e).__name__}:{str(e)[:45]}")
-                        flog(f"[send-file] {errs[-1]}", "warning")
+        fname = os.path.basename(file_path)
+        try: fsize = os.path.getsize(file_path)
+        except Exception: fsize = 0
+        kind = _detect_file_kind(file_path)
+        flog(f"[send-file] {fname} kind={kind} size={fsize} cap={'yes' if cap else 'no'}")
+        errs: List[str] = []
 
-            # C2: raw SendMediaRequest
-            if SendMediaRequest is not None and InputMediaUploadedDocument is not None:
-                for media_kind in ("doc", "photo"):
-                    media = None
-                    try:
-                        if media_kind == "doc":
-                            try:
-                                media = InputMediaUploadedDocument(file=handle, caption=caption)
-                            except TypeError:
-                                media = InputMediaUploadedDocument(file=handle)
-                        else:
-                            if InputMediaUploadedPhoto is None: continue
-                            try:
-                                media = InputMediaUploadedPhoto(file=handle)
-                            except TypeError:
-                                media = InputMediaUploadedPhoto(handle)
-                    except Exception as me:
-                        errs.append(f"media[{media_kind}]:{type(me).__name__}")
-                        continue
-                    if media is None: continue
+        def _susp(e): return "USER_SUSPENDED" in str(e).upper()
 
-                    try:
-                        raw = getattr(cli, "raw", None) or cli
-                        try: peer = await _aw(raw.get_input_entity(entity))
-                        except Exception:
-                            try: peer = await _aw(cli.get_input_entity(entity))
-                            except Exception: peer = entity
-                        try: rid = raw._get_request_msg_id()
-                        except Exception:
-                            try: rid = cli._get_request_msg_id()
-                            except Exception: rid = random.getrandbits(62)
-                        await _aw(cli(SendMediaRequest(peer=peer, media=media, random_id=rid)))
-                        flog(f"[send-file] OK raw:{media_kind} kb={kb}")
-                        return True, f"OK-raw-{media_kind}-{kb}"
-                    except TypeError as te:
-                        errs.append(f"raw[{media_kind}][{kb}]:TypeErr:{str(te)[:45]}")
-                    except Exception as e:
-                        errs.append(f"raw[{media_kind}][{kb}]:{type(e).__name__}:{str(e)[:45]}")
-                        flog(f"[send-file] {errs[-1]}", "warning")
-                        if _susp(e): return False, "ACCOUNT_SUSPENDED"
-
-    # ── D) آپلود به Saved + forward ──
-    try:
-        me = await cli.get_me()
-        if me and sf:
-            try:
-                r = await _aw(sf(me, file_path))
-                mid = getattr(r, "id", None)
-                if mid is None:
-                    upd = getattr(r, "updates", None) or r
-                    for m in (getattr(upd, "updates", None) or getattr(upd, "messages", None) or []):
-                        mid = getattr(m, "id", None)
-                        if mid: break
-                if mid:
-                    fm = getattr(cli, "forward_messages", None)
-                    if fm:
-                        await _aw(fm(entity, mid, me))
-                        if caption:
-                            try: await _aw(cli.send_message(entity, caption))
-                            except Exception: pass
-                        flog("[send-file] OK via self-forward")
-                        return True, "OK-self-fwd"
-            except Exception as e:
-                errs.append(f"self:{type(e).__name__}:{str(e)[:45]}")
-    except Exception: pass
-
-    # ── E) آخرین راه: کپشن به‌صورت متن ──
-    if caption:
         try:
-            await _aw(cli.send_message(entity, caption))
-            return True, "text_fallback"
+            await asyncio.wait_for(cli.get_me(), timeout=15)
         except Exception: pass
 
-    tail = " | ".join(errs[-5:])[:250] if errs else "no_variants"
-    flog(f"[send-file] ALL FAILED: {tail}", "error")
-    return False, f"all_failed: {tail}"
+        sf = getattr(cli, "send_file", None)
+        sd = getattr(cli, "send_document", None)
+        up = getattr(cli, "upload_file", None)
+
+        # A) send_file
+        if sf:
+            variants_a = []
+            if cap:
+                variants_a = [
+                    ("plain", {"caption": cap}),
+                    ("workers1", {"caption": cap, "workers": 1, "file_size": fsize}),
+                    ("doc", {"caption": cap, "force_document": True, "workers": 1, "file_size": fsize}),
+                ]
+            else:
+                variants_a = [
+                    ("no_cap", {}),
+                    ("no_cap_doc", {"force_document": True}),
+                    ("no_cap_workers", {"workers": 1, "file_size": fsize}),
+                    ("no_cap_force_file", {"force_file": True}),
+                ]
+            for tag, kw in variants_a:
+                try:
+                    await _aw(sf(entity, file_path, **kw))
+                    flog(f"[send-file] OK sf:{tag}")
+                    return True, f"OK-sf-{tag}"
+                except TypeError as te:
+                    errs.append(f"sf:{tag}:TypeErr:{str(te)[:50]}"); continue
+                except FloodWaitError as fe:
+                    await asyncio.sleep(min(fe.seconds + 1, 30))
+                    errs.append(f"sf:{tag}:Flood{fe.seconds}"); continue
+                except Exception as e:
+                    errs.append(f"sf:{tag}:{type(e).__name__}:{str(e)[:55]}")
+                    if _susp(e): return False, "ACCOUNT_SUSPENDED"
+
+        # B) send_document
+        if sd:
+            try:
+                if cap:
+                    await _aw(sd(entity, file_path, caption=cap))
+                else:
+                    await _aw(sd(entity, file_path))
+                flog("[send-file] OK sd")
+                return True, "OK-sd"
+            except TypeError:
+                try:
+                    await _aw(sd(entity, file_path))
+                    return True, "OK-sd-nocap"
+                except Exception as e:
+                    errs.append(f"sd:{type(e).__name__}:{str(e)[:55]}")
+            except Exception as e:
+                errs.append(f"sd:{type(e).__name__}:{str(e)[:55]}")
+                if _susp(e): return False, "ACCOUNT_SUSPENDED"
+
+        # C) upload_file + handle
+        if up:
+            for kb in (None, 512, 256, 128, 64, 32):
+                up_kw: Dict[str, Any] = {"file_name": fname, "use_cache": False}
+                if kb: up_kw["part_size_kb"] = kb
+                handle = None
+                try:
+                    handle = await _aw(up(file_path, **up_kw))
+                except TypeError:
+                    try:
+                        handle = await _aw(up(file_path))
+                    except Exception as e:
+                        errs.append(f"up[{kb}]:{type(e).__name__}:{str(e)[:55]}")
+                        continue
+                except FloodWaitError as fe:
+                    await asyncio.sleep(min(fe.seconds + 1, 30))
+                    errs.append(f"up[{kb}]:Flood{fe.seconds}"); continue
+                except Exception as e:
+                    errs.append(f"up[{kb}]:{type(e).__name__}:{str(e)[:55]}")
+                    if _susp(e): return False, "ACCOUNT_SUSPENDED"
+                    continue
+
+                if handle is None: continue
+
+                if sf:
+                    for tag_h, kw_h in (
+                        ("h_plain", {"caption": cap} if cap else {}),
+                        ("h_doc", {"caption": cap, "force_document": True} if cap else {"force_document": True}),
+                    ):
+                        try:
+                            await _aw(sf(entity, handle, **kw_h))
+                            return True, f"OK-sf-{tag_h}-{kb}"
+                        except Exception as e:
+                            errs.append(f"sf:{tag_h}[{kb}]:{type(e).__name__}:{str(e)[:45]}")
+
+        # D) self-forward
+        try:
+            me = await cli.get_me()
+            if me and sf:
+                try:
+                    r = await _aw(sf(me, file_path))
+                    mid = getattr(r, "id", None)
+                    if mid is None:
+                        upd = getattr(r, "updates", None) or r
+                        for m in (getattr(upd, "updates", None) or getattr(upd, "messages", None) or []):
+                            mid = getattr(m, "id", None)
+                            if mid: break
+                    if mid:
+                        fm = getattr(cli, "forward_messages", None)
+                        if fm:
+                            await _aw(fm(entity, mid, me))
+                            if cap:
+                                try: await _aw(cli.send_message(entity, cap))
+                                except Exception: pass
+                            return True, "OK-self-fwd"
+                except Exception as e:
+                    errs.append(f"self:{type(e).__name__}:{str(e)[:45]}")
+        except Exception: pass
+
+        # E) caption fallback
+        if cap:
+            try:
+                await _aw(cli.send_message(entity, cap))
+                return True, "text_fallback"
+            except Exception: pass
+
+        tail = " | ".join(errs[-5:])[:250] if errs else "no_variants"
+        flog(f"[send-file] ALL FAILED: {tail}", "error")
+        return False, f"all_failed: {tail}"
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        flog(f"[send-file] UNEXPECTED: {type(e).__name__}: {e}", "error")
+        return False, f"exception:{type(e).__name__}:{str(e)[:120]}"
 
 
 async def soroosh_set_profile_photo(cli, file_path: str) -> Tuple[bool, str]:
@@ -3196,12 +3205,10 @@ async def _listener_loop(aid, acc, stop_event):
             raw = cli.raw
             @raw.on(events.NewMessage(incoming=True))
             async def _on_new(event):
+                # v27.9.17: پیام PV خودکار «سلام» نمی‌فرستد؛ فقط شمارش
                 try:
-                    if not getattr(event, "is_private", False): return
-                    if getattr(event, "out", False): return
-                    STATE["listener_new_count"] = STATE.get("listener_new_count", 0) + 1
-                    try: await event.reply("سلام 👋")
-                    except Exception: pass
+                    if getattr(event, "is_private", False) and not getattr(event, "out", False):
+                        STATE["listener_new_count"] = STATE.get("listener_new_count", 0) + 1
                 except Exception: pass
             while not stop_event.is_set(): await asyncio.sleep(2)
             try: await raw.disconnect()
@@ -3245,7 +3252,7 @@ async def restart_all_listeners():
 
 
 # ══════════════════════════════════════════════════════════════════
-# ⭐ v27.9.13 — PV POLLING + fwd_saved + upload with full params
+# PV POLLING — v27.9.17 (watermark + max_replies per user)
 # ══════════════════════════════════════════════════════════════════
 PV_LISTENER_TASKS: Dict[str, asyncio.Task] = {}
 _PV_SEEN_MSGS: Dict[str, Dict[str, float]] = {}
@@ -3253,299 +3260,175 @@ _PV_REPLY_TASKS: Dict[str, asyncio.Task] = {}
 _PV_STOP_EVENTS: Dict[str, asyncio.Event] = {}
 
 
+async def _sleep_or_stop(ev, sec):
+    try: await asyncio.wait_for(ev.wait(), timeout=sec)
+    except asyncio.TimeoutError: pass
+
+
 async def _pv_send_reply(aid, acc, sender_id, user_info, stop_event, sender_entity=None):
     name = acc.get("name") or aid
-    cfg = _load_pv_items()
-    delay_sec = int(cfg.get("delay_seconds", 120))
-    flog(f"[pv] {name}: reply task started for {sender_id}, delay={delay_sec}s")
-
-    if delay_sec > 0:
-        for _ in range(delay_sec):
-            if stop_event.is_set(): return
-            await asyncio.sleep(1)
-
     sender_str = str(sender_id)
-    cli = None
-    send_ok = True
-    send_err = None
+    key = f"{aid}:{sender_str}"
+    cfg = _load_pv_items()
+    cli = None; connected = False; send_ok = True; send_err = None
+
+    def _fail(msg):
+        nonlocal send_ok, send_err
+        send_ok = False; send_err = str(msg)[:150]
 
     try:
+        for _ in range(int(cfg.get("delay_seconds", 0))):
+            if stop_event.is_set():
+                _pv_count_add(aid, sender_str, -1); return
+            await asyncio.sleep(1)
+        cfg = _load_pv_items()
         cli, err = await _connect_with_retry(aid, acc["session_string"], name=name, tries=2, per_timeout=20)
         if cli is None:
-            send_ok = False; send_err = f"connect: {err}"
+            _fail(f"connect: {err}")
         else:
-            target = None
-            try:
-                dialogs = await cli.get_dialogs()
-                for d in dialogs or []:
-                    if getattr(d, "id", None) == sender_id and getattr(d, "entity", None) is not None:
-                        target = d.entity; break
-            except Exception as _de:
-                flog(f"[pv] dialogs resolve fail: {type(_de).__name__}", "warning")
-            if target is None and sender_entity is not None:
-                target = sender_entity
+            connected = True
+            target = sender_entity
             if target is None:
                 try: target = await cli.get_entity(sender_id)
-                except Exception: pass
-            if target is None and user_info.get("username"):
-                try: target = await cli.get_entity(user_info["username"].lstrip("@"))
-                except Exception: pass
-            if target is None:
-                target = sender_id
-            flog(f"[pv] target type: {type(target).__name__}")
-
-            try:
-                await asyncio.wait_for(cli.get_me(), timeout=15)
-                await asyncio.sleep(1.5)
-            except Exception: pass
-
-            items = cfg.get("items") or []
-            for item in items:
+                except Exception: target = sender_id
+            for item in cfg.get("items") or []:
                 if stop_event.is_set(): break
                 kind = item.get("kind", "text")
                 try:
-                    if kind == "text":
-                        txt = item.get("text") or ""
-                        if txt:
-                            r = cli.send_message(target, txt)
-                            if asyncio.iscoroutine(r): r = await r
-                            await asyncio.sleep(random.uniform(1.0, 2.5))
-
+                    if kind == "text" and item.get("text"):
+                        r = cli.send_message(target, item["text"])
+                        if asyncio.iscoroutine(r): await r
                     elif kind == "file":
-                        fpath = item.get("file_path")
-                        fcap = item.get("caption") or ""
-                        if fpath and os.path.exists(fpath):
-                            _ok_f, _err_f = await _send_file_to_entity(cli, target, fpath, fcap)
-                            if not _ok_f:
-                                send_ok = False
-                                send_err = str(_err_f)[:150]
-                            await asyncio.sleep(random.uniform(1.0, 2.5))
-                        else:
-                            send_ok = False
-                            send_err = f"file missing: {os.path.basename(str(fpath))}"
-
-                    elif kind == "forward":
-                        mid = item.get("message_id")
-                        fcid = item.get("from_chat_id") or FORCED_OWNER
-                        if mid and APP:
-                            try:
-                                await APP.bot.copy_message(chat_id=sender_id, from_chat_id=fcid, message_id=int(mid))
-                                await asyncio.sleep(random.uniform(1.0, 2.5))
-                            except Exception as fe:
-                                send_ok = False; send_err = f"copy: {str(fe)[:100]}"
-
+                        fp = item.get("file_path")
+                        if fp and os.path.exists(fp):
+                            ok, e2 = await _send_file_to_entity(cli, target, fp, item.get("caption") or "")
+                            if not ok: _fail(e2)
+                        else: _fail("file missing")
                     elif kind == "fwd_saved":
-                        mid = int(item.get("message_id", 0))
-                        if mid:
-                            try:
-                                me = await cli.get_me()
-                                fm = getattr(cli, "forward_messages", None)
-                                if fm:
-                                    r = fm(target, mid, me)
-                                    if asyncio.iscoroutine(r): r = await r
-                                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                                    flog(f"[pv] fwd_saved OK mid={mid}")
-                                else:
-                                    send_ok = False
-                                    send_err = "no_forward_messages_api"
-                            except Exception as fe:
-                                send_ok = False
-                                send_err = f"fwd_saved:{type(fe).__name__}:{str(fe)[:80]}"
-                                flog(f"[pv] fwd_saved FAIL mid={mid}: {send_err}", "warning")
-
+                        me = await cli.get_me()
+                        fm = getattr(cli, "forward_messages", None)
+                        if not fm: _fail("no_forward_api")
+                        else:
+                            r = fm(target, int(item.get("message_id", 0)), me)
+                            if asyncio.iscoroutine(r): await r
                     elif kind == "delay":
                         await asyncio.sleep(int(item.get("seconds", 3)))
-
+                        continue
+                    await asyncio.sleep(random.uniform(0.8, 1.8))
                 except FloodWaitError as fe:
-                    await asyncio.sleep(fe.seconds + 1)
-                    send_ok = False; send_err = f"Flood {fe.seconds}s"
+                    _fail(f"Flood {fe.seconds}s"); await asyncio.sleep(min(fe.seconds + 1, 30))
                 except Exception as e:
-                    send_ok = False; send_err = f"{type(e).__name__}: {str(e)[:120]}"
+                    _fail(f"{type(e).__name__}: {str(e)[:100]}")
+    except asyncio.CancelledError:
+        if not connected: _pv_count_add(aid, sender_str, -1)
+        raise
+    except Exception as e:
+        _fail(f"{type(e).__name__}: {str(e)[:100]}")
     finally:
         if cli:
             try: await cli._disconnect()
             except Exception: pass
+        _PV_REPLY_TASKS.pop(key, None)
 
-    if send_ok and cfg.get("reply_once", True):
-        _mark_pv_replied(aid, sender_str)
+    if not connected:
+        _pv_count_add(aid, sender_str, -1)
     try: _record_pv_reply(aid, sender_str, ok=send_ok, err=send_err)
     except Exception: pass
-
     if cfg.get("notify", True) and cfg.get("notify_on_reply", True):
-        u_label = user_info.get("first_name") or user_info.get("username") or sender_str
-        try:
-            if send_ok:
-                await tg_send(f"✅ پاسخ PV به <b>{esc(u_label)}</b> ارسال شد")
-            else:
-                await tg_send(f"❌ پاسخ PV به <b>{esc(u_label)}</b> خطا: <code>{esc(send_err or '?')}</code>")
-        except Exception: pass
-
-    flog(f"[pv] {name}: replied to {sender_id} ({'OK' if send_ok else 'FAIL'})")
-    _PV_REPLY_TASKS.pop(f"{aid}:{sender_str}", None)
+        u = user_info.get("first_name") or user_info.get("username") or sender_str
+        await tg_send(f"✅ پاسخ به <b>{esc(u)}</b>" if send_ok
+                      else f"❌ پاسخ به <b>{esc(u)}</b>: <code>{esc(send_err or '?')}</code>")
 
 
 async def _pv_handle_new_msg(cli, aid, acc, sender, sender_id, msg):
-    name = acc.get("name") or aid
     cfg = _load_pv_items()
     if not cfg.get("enabled"): return
-
-    sender_str = str(sender_id)
-    user_info = {
-        "first_name": getattr(sender, "first_name", "") or "",
-        "last_name": getattr(sender, "last_name", "") or "",
-        "username": getattr(sender, "username", "") or "",
-    }
-    mtext = getattr(msg, "text", None) or getattr(msg, "message", "") or ""
-
-    flog(f"[pv] {name}: NEW msg from {sender_id} ({user_info.get('first_name')}): {mtext[:50]}")
-
-    try: _record_pv_visit(aid, sender_str, user_info)
+    uid = str(sender_id); key = f"{aid}:{uid}"
+    info = {"first_name": getattr(sender, "first_name", "") or "",
+            "last_name": getattr(sender, "last_name", "") or "",
+            "username": getattr(sender, "username", "") or ""}
+    try: _record_pv_visit(aid, uid, info)
     except Exception: pass
 
+    if _pv_limit_reached(aid, uid, cfg): return
+    ex = _PV_REPLY_TASKS.get(key)
+    if ex and not ex.done(): return
+
+    _pv_count_add(aid, uid, +1)
     if cfg.get("notify", True) and cfg.get("notify_on_receive", True):
-        u_label = user_info.get("first_name") or user_info.get("username") or sender_str
-        delay_sec = int(cfg.get("delay_seconds", 120))
-        try:
-            if mtext:
-                await tg_send(
-                    f"🔔 <b>پیام PV جدید</b>\n"
-                    f"👤 {esc(u_label)}\n"
-                    f"💬 <code>{esc(mtext[:150])}</code>\n"
-                    f"⏱ پاسخ تا {delay_sec}s دیگه"
-                )
-            else:
-                await tg_send(
-                    f"🔔 <b>پیام PV جدید</b>\n"
-                    f"👤 {esc(u_label)}\n"
-                    f"📎 <i>(فایل/عکس/ویدیو)</i>\n"
-                    f"⏱ پاسخ تا {delay_sec}s دیگه"
-                )
-        except Exception as ne:
-            flog(f"[pv] notify receive err: {ne}", "warning")
+        u = info["first_name"] or info["username"] or uid
+        mt = getattr(msg, "text", None) or getattr(msg, "message", "") or "📎"
+        await tg_send(f"🔔 <b>{esc(u)}</b>: <code>{esc(mt[:120])}</code>")
 
-    if cfg.get("reply_once", True) and _has_pv_replied(aid, sender_str):
-        flog(f"[pv] {name}: skip reply → already replied to {sender_id}")
-        return
-
-    key = f"{aid}:{sender_str}"
-    existing = _PV_REPLY_TASKS.get(key)
-    if existing and not existing.done():
-        flog(f"[pv] {name}: reply already in progress for {sender_id}")
-        return
-
-    stop_evt = _PV_STOP_EVENTS.get(aid)
-    if stop_evt is None:
-        stop_evt = asyncio.Event(); _PV_STOP_EVENTS[aid] = stop_evt
-
-    t = asyncio.create_task(_pv_send_reply(aid, acc, sender_id, user_info, stop_evt, sender))
-    _PV_REPLY_TASKS[key] = t
+    ev = _PV_STOP_EVENTS.get(aid)
+    if ev is None: ev = _PV_STOP_EVENTS[aid] = asyncio.Event()
+    _PV_REPLY_TASKS[key] = asyncio.create_task(
+        _pv_send_reply(aid, acc, sender_id, info, ev, sender))
 
 
 async def _pv_poller_worker(aid, acc, stop_event):
-    name = acc.get("name") or acc.get("phone") or aid
+    global _PV_WM_DIRTY
+    name = acc.get("name") or aid
+    cli = None; my_id = None
     flog(f"[pv] {name}: poller started")
-
-    if aid not in _PV_SEEN_MSGS: _PV_SEEN_MSGS[aid] = {}
-    seen = _PV_SEEN_MSGS[aid]
-
-    first_run_done = False
-    my_id = None
-
-    while not stop_event.is_set():
-        cfg = _load_pv_items()
-        poll_sec = max(2, int(cfg.get("poll_seconds", 5)))
-
-        if not cfg.get("enabled"):
-            await asyncio.sleep(poll_sec); continue
-
-        cli = None
-        try:
-            cli, err = await _connect_with_retry(aid, acc["session_string"], name=name,
-                                                 tries=1, per_timeout=20)
-            if cli is None:
-                flog(f"[pv] {name}: connect fail: {err}", "warning")
-                for _ in range(poll_sec):
-                    if stop_event.is_set(): return
-                    await asyncio.sleep(1)
-                continue
-
-            if my_id is None:
-                try:
-                    me = await cli.get_me()
-                    my_id = getattr(me, "id", None)
-                except Exception: pass
-
+    try:
+        while not stop_event.is_set():
+            cfg = _load_pv_items()
+            poll = max(2, int(cfg.get("poll_seconds", 3)))
+            if not cfg.get("enabled"):
+                await _sleep_or_stop(stop_event, poll); continue
             try:
-                dialogs = await cli.get_dialogs()
-            except Exception as de:
-                flog(f"[pv] {name}: dialogs err: {type(de).__name__}: {de}", "warning")
-                dialogs = []
+                if cli is None:
+                    cli, err = await _connect_with_retry(aid, acc["session_string"], name=name, tries=1, per_timeout=20)
+                    if cli is None:
+                        await _sleep_or_stop(stop_event, 10); continue
+                    my_id = getattr((await cli.get_me()), "id", None)
 
-            new_count = 0
-            for d in dialogs or []:
-                if stop_event.is_set(): break
-                try:
-                    is_user = getattr(d, "is_user", False)
-                    is_bot = getattr(d, "is_bot", False)
-                    if not is_user or is_bot: continue
+                dialogs = await asyncio.wait_for(cli.get_dialogs(limit=60), timeout=30)
+                first = not (_wm_load().get(aid) or {}).get("_init")
 
-                    sender_id = getattr(d, "id", None)
-                    if not sender_id: continue
-                    if my_id and sender_id == my_id: continue
-
+                for d in dialogs or []:
+                    if not getattr(d, "is_user", False) or getattr(d, "is_bot", False): continue
+                    uid = getattr(d, "id", None)
+                    if not uid or (my_id and uid == my_id): continue
                     sender = getattr(d, "entity", None)
                     if sender is None: continue
-
-                    try:
-                        msgs = await cli.get_messages(sender, limit=3)
-                    except Exception:
-                        continue
-                    if not msgs: continue
-
-                    for m in msgs:
-                        mid = getattr(m, "id", None)
-                        if not mid: continue
-
-                        key = f"{sender_id}:{mid}"
-                        if key in seen: continue
-                        seen[key] = time.time()
-
-                        if getattr(m, "out", False): continue
-
-                        if not first_run_done:
-                            continue
-
-                        new_count += 1
+                    last = getattr(d, "message", None)
+                    if last is None:
                         try:
-                            await _pv_handle_new_msg(cli, aid, acc, sender, sender_id, m)
-                        except Exception as he:
-                            flog(f"[pv] handle err: {type(he).__name__}: {he}", "warning")
+                            ms = await cli.get_messages(sender, limit=1)
+                            last = ms[0] if ms else None
+                        except Exception: last = None
+                    mid = getattr(last, "id", None)
+                    if not mid or int(mid) <= _wm_get(aid, uid): continue
+                    _wm_set(aid, uid, mid)
+                    if first or getattr(last, "out", False): continue
+                    try:
+                        dt = getattr(last, "date", None)
+                        if dt and time.time() - dt.timestamp() > 3600: continue
+                    except Exception: pass
+                    try: await _pv_handle_new_msg(cli, aid, acc, sender, uid, last)
+                    except Exception as he: flog(f"[pv] handle: {type(he).__name__}: {he}", "warning")
 
-                except Exception:
-                    continue
-
-            if not first_run_done:
-                first_run_done = True
-                flog(f"[pv] {name}: first scan done ({len(seen)} msgs)")
-
-            cutoff = time.time() - 3600
-            for k in list(seen.keys()):
-                if seen[k] < cutoff: seen.pop(k, None)
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            flog(f"[pv] {name}: loop err: {type(e).__name__}: {e}", "warning")
-        finally:
-            if cli:
-                try: await cli._disconnect()
-                except Exception: pass
-
-        for _ in range(poll_sec):
-            if stop_event.is_set(): return
-            await asyncio.sleep(1)
-
-    flog(f"[pv] {name}: poller stopped")
+                if first:
+                    _wm_load().setdefault(aid, {})["_init"] = 1
+                    _PV_WM_DIRTY = True
+                _wm_flush()
+            except asyncio.CancelledError: raise
+            except Exception as e:
+                flog(f"[pv] {name}: {type(e).__name__}: {e}", "warning")
+                if cli:
+                    try: await cli._disconnect()
+                    except Exception: pass
+                    cli = None
+                await _sleep_or_stop(stop_event, 8); continue
+            await _sleep_or_stop(stop_event, poll)
+    finally:
+        _wm_flush()
+        if cli:
+            try: await cli._disconnect()
+            except Exception: pass
+        flog(f"[pv] {name}: poller stopped")
 
 
 async def start_pv_responders():
@@ -3554,8 +3437,7 @@ async def start_pv_responders():
         flog("[pv] disabled — skip"); return
     for aid, acc in list_accounts().items():
         existing = PV_LISTENER_TASKS.get(aid)
-        if existing and not existing.done():
-            continue
+        if existing and not existing.done(): continue
         stop = asyncio.Event()
         _PV_STOP_EVENTS[aid] = stop
         t = asyncio.create_task(_pv_poller_worker(aid, acc, stop))
@@ -3835,30 +3717,19 @@ async def _download_tg_file(media_obj, aid: str, prefix: str) -> str:
 
 
 async def show_main():
-    accounts = list_accounts(); ops = _load_ops()
-    running = [o for o in ops if _op_effective_status(o) == "running"]
-    listening = sum(1 for t in LISTENER_TASKS.values() if not t.done())
+    accounts = list_accounts()
+    running = [o for o in _load_ops() if _op_effective_status(o) == "running"]
     pv_on = bool(_load_pv_items().get("enabled"))
-    pv_pollers = sum(1 for t in PV_LISTENER_TASKS.values() if t and not t.done())
-    errs = len(_load_errors())
-    tpls = len(list_templates())
-    banned_n = len(_load_banned())
-    seen_n = len(_load_seen())
-    txt = head("🌀", "پنل سروش", VERSION)
-    txt += f"👤 <b>{len(accounts)}</b>   ·   👂 <b>{listening}</b>   ·   🎯 <b>{tpls}</b>\n"
-    txt += f"💬 PV: <b>{'🟢' if pv_on else '⚪'}</b> ({pv_pollers})   ·   🔍 seen: <b>{seen_n}</b>\n"
-    txt += f"🚫 ban: <b>{banned_n}</b>\n"
-    txt += (f"🟢 <b>{len(running)}</b> در حال اجرا" if running else "⚪ فعال نیست")
-    err_lbl = "⚠️ خطاها" + (f" ({errs})" if errs else "")
+    txt = head("🌀", "سروش", VERSION)
+    txt += f"👤 {len(accounts)}  ·  💬 PV {'🟢' if pv_on else '⚪'}  ·  " + (f"🟢 {len(running)} فعال" if running else "⚪ بیکار")
     rows = []
-    if running:
-        rows.append([B(f"🟢 فعال ({len(running)})", f"op:view:{running[0]['id']}")])
+    if running: rows.append([B(f"🟢 در حال اجرا ({len(running)})", f"op:view:{running[0]['id']}")])
     rows += [
         [B("📤 ارسال", "send:start"), B("🤝 جوینر", "jl:start")],
         [B("🚪 لفتر", "lf:start"), B("🎯 قالب‌ها", "at:menu")],
-        [B("📱 اکانت‌ها", "menu:acc"), B("📊 آمار", "menu:stats")],
-        [B("👂 لیسنر", "menu:listen"), B("💬 PV", "menu:pv")],
-        [B(err_lbl, "menu:errors"), B(f"🔍 Cache ({seen_n}/{banned_n})", "menu:cache")],
+        [B("📱 اکانت‌ها", "menu:acc"), B("💬 PV", "menu:pv")],
+        [B("📊 آمار", "menu:stats"), B("⚠️ خطاها", "menu:errors"), B("🔍 Cache", "menu:cache")],
+        [B("⬅️ انتخاب پنل", "mode:home")],
     ]
     await panel(txt, kb_(*rows), page_tag="main")
 
@@ -3880,52 +3751,28 @@ async def show_cache_menu():
 
 async def show_pv_menu():
     cfg = _load_pv_items()
-    enabled = bool(cfg.get("enabled"))
-    delay = int(cfg.get("delay_seconds", 120))
-    once = bool(cfg.get("reply_once", True))
-    notify_on = bool(cfg.get("notify", True))
-    notify_recv = bool(cfg.get("notify_on_receive", True))
-    notify_rep = bool(cfg.get("notify_on_reply", True))
-    poll_sec = int(cfg.get("poll_seconds", 5))
+    en = bool(cfg.get("enabled")); mx = int(cfg.get("max_replies", 1) or 0)
     items = cfg.get("items") or []
-    pollers = sum(1 for t in PV_LISTENER_TASKS.values() if t and not t.done())
+    notify_on = bool(cfg.get("notify", True))
     txt = head("💬", "پاسخ خودکار PV")
-    txt += f"وضعیت: <b>{'🟢 فعال' if enabled else '⚪ خاموش'}</b>  ·  🔄 poll: <b>{pollers}</b>\n"
-    txt += f"⏱ تایمر: <b>{delay}s</b>  ·  🔁 یک‌بار: <b>{'🟢' if once else '⚪'}</b>\n"
-    txt += f"🔔 نوتیف: <b>{'🟢' if notify_on else '⚪'}</b>  ·  📥 دریافت: <b>{'🟢' if notify_recv else '⚪'}</b>  ·  📤 پاسخ: <b>{'🟢' if notify_rep else '⚪'}</b>\n"
-    txt += f"🔄 هر <b>{poll_sec}s</b> چک می‌کنه\n"
-    txt += f"📨 پیام‌ها: <b>{len(items)}</b> عدد\n\n"
-    if items:
-        for i, it in enumerate(items, 1):
-            k = it.get("kind", "text")
-            if k == "text": txt += f"{i}. 💬 <code>{esc(short(it.get('text', ''), 40))}</code>\n"
-            elif k == "forward": txt += f"{i}. 📎 Forward (id:<code>{it.get('message_id', '?')}</code>)\n"
-            elif k == "delay": txt += f"{i}. ⏸ تأخیر {it.get('seconds', 3)}s\n"
-            elif k == "file": txt += f"{i}. 📁 <code>{esc(os.path.basename(it.get('file_path', '?')))}</code>\n"
-            elif k == "fwd_saved": txt += f"{i}. 📨 Fwd-Saved mid=<code>{it.get('message_id', '?')}</code>\n"
-    else:
-        txt += "<i>هیچ پیامی تنظیم نشده</i>"
+    txt += f"{'🟢 فعال' if en else '⚪ خاموش'}  ·  ⏱ {cfg.get('delay_seconds', 0)}s  ·  📨 {len(items)} پیام\n"
+    txt += f"👥 تعداد پاسخ به هر کاربر: <b>{mx if mx else '∞'}</b>  ·  🔔 {'🟢' if notify_on else '⚪'}\n\n"
+    for i, it in enumerate(items, 1):
+        k = it.get("kind", "text")
+        if k == "text": txt += f"{i}. 💬 <code>{esc(short(it.get('text', ''), 40))}</code>\n"
+        elif k == "file": txt += f"{i}. 📁 <code>{esc(os.path.basename(it.get('file_path', '?')))}</code>\n"
+        elif k == "fwd_saved": txt += f"{i}. 📨 fwd_saved mid={it.get('message_id', '?')}\n"
+        elif k == "delay": txt += f"{i}. ⏸ {it.get('seconds', 3)}s\n"
     rows = [
-        [B(("🔴 خاموش کن" if enabled else "🟢 روشن کن"), "pv:toggle")],
-        [B(("🔔 نوتیف روشن" if notify_on else "🔕 نوتیف خاموش"), "pv:toggle_notify")],
-        [B(("📥 دریافت ✅" if notify_recv else "📥 دریافت ⚪"), "pv:toggle_notify_recv"),
-         B(("📤 پاسخ ✅" if notify_rep else "📤 پاسخ ⚪"), "pv:toggle_notify_rep")],
-        [B("⏱ تایمر", "pv:set_delay"), B("🔁 یک‌بار" + (" ✅" if once else ""), "pv:toggle_once")],
-        [B(f"🔄 هر {poll_sec}s", "pv:set_poll")],
-        [B("➕ متن", "pv:add_text")],
-        [B("📎 ذخیره پیام (فایل/عکس)", "pv:add_saved")],
-        [B("⏸ تأخیر", "pv:add_delay")],
-        [B("📥 لیست Saved Messages", "pv:list_saved")],
-        [B("📨 فوروارد از Saved (با آیدی)", "pv:add_fwd")],
+        [B("🔴 خاموش کن" if en else "🟢 روشن کن", "pv:toggle")],
+        [B(f"👥 پاسخ/کاربر: {mx if mx else '∞'}", "pv:cycle_max"), B("⏱ تایمر", "pv:set_delay")],
+        [B("➕ متن", "pv:add_text"), B("📎 فایل", "pv:add_saved"), B("⏸ تأخیر", "pv:add_delay")],
+        [B("📋 پیام‌ها", "pv:list"), B("📊 گزارش", "pv:report:0")],
+        [B("🔔 نوتیف " + ("✅" if notify_on else "⚪"), "pv:toggle_notify"),
+         B("🧹 ریست شمارنده", "pv:clear_replies")],
+        [B("🔄 ری‌استارت", "pv:restart"), B("🧪 تست", "pv:test")],
+        nav(),
     ]
-    if items:
-        rows.append([B("📋 مشاهده/حذف", "pv:list")])
-        rows.append([B("🗑 پاک کردن همه", "pv:clear")])
-    rows.append([B("📊 گزارش PV", "pv:report:0")])
-    rows.append([B("🧪 تست اتصال PV", "pv:test")])
-    rows.append([B("🔄 ری‌استارت", "pv:restart")])
-    rows.append([B("🧹 پاک replied cache", "pv:clear_replies")])
-    rows.append(nav())
     await panel(txt, kb_(*rows), page_tag="pv_menu")
 
 async def show_pv_list():
@@ -3935,10 +3782,9 @@ async def show_pv_list():
     for i, it in enumerate(items, 1):
         k = it.get("kind", "text")
         if k == "text": txt += f"\n{i}. 💬 <code>{esc(short(it.get('text', ''), 60))}</code>"
-        elif k == "forward": txt += f"\n{i}. 📎 Forward id=<code>{it.get('message_id', '?')}</code>"
-        elif k == "delay": txt += f"\n{i}. ⏸ <b>{it.get('seconds', 3)}s</b>"
         elif k == "file": txt += f"\n{i}. 📁 <code>{esc(os.path.basename(it.get('file_path', '?')))}</code>"
-        elif k == "fwd_saved": txt += f"\n{i}. 📨 Fwd-Saved mid=<code>{it.get('message_id', '?')}</code>"
+        elif k == "fwd_saved": txt += f"\n{i}. 📨 fwd_saved mid=<code>{it.get('message_id', '?')}</code>"
+        elif k == "delay": txt += f"\n{i}. ⏸ <b>{it.get('seconds', 3)}s</b>"
     rows = []
     for i in range(len(items)):
         rows.append([B(f"🗑 {i+1}", f"pv:del:{i}")])
@@ -3968,9 +3814,7 @@ async def show_pv_report(page=0):
                 "reply_ok": data.get("reply_ok", False),
                 "blocked": data.get("blocked", False),
                 "error": data.get("error"),
-                "first_seen": data.get("first_seen", 0),
                 "last_seen": data.get("last_seen", 0),
-                "replied_at": data.get("replied_at"),
             })
     rows_data.sort(key=lambda x: x["last_seen"], reverse=True)
     PER = 8
@@ -4009,7 +3853,7 @@ async def show_pv_report(page=0):
         if page < pages - 1: pr.append(B("▶️", f"pv:report:{page+1}"))
         nav_btns.append(pr)
     nav_btns.append([B("🔄 بروزرسانی", f"pv:report:{page}")])
-    nav_btns.append([B("🗑 پاک کردن گزارش", "pv:report_clear")])
+    nav_btns.append([B("🗑 پاک کردن", "pv:report_clear")])
     nav_btns.append([B("⬅️ بازگشت", "pv:menu")])
     await panel(txt, kb_(*nav_btns), page_tag=f"pv_report:{page}")
 
@@ -4880,11 +4724,11 @@ async def _on_message_impl(update, context):
         cfg = _load_pv_items()
         items = cfg.get("items") or []
         if kind == "delay":
-            try: cfg["delay_seconds"] = max(0, int(re.sub(r"[^\d]", "", text) or "120"))
-            except: cfg["delay_seconds"] = 120
+            try: cfg["delay_seconds"] = max(0, int(re.sub(r"[^\d]", "", text) or "0"))
+            except: cfg["delay_seconds"] = 0
         elif kind == "poll":
-            try: cfg["poll_seconds"] = max(2, int(re.sub(r"[^\d]", "", text) or "5"))
-            except: cfg["poll_seconds"] = 5
+            try: cfg["poll_seconds"] = max(2, int(re.sub(r"[^\d]", "", text) or "3"))
+            except: cfg["poll_seconds"] = 3
         elif kind == "add_text":
             items.append({"kind": "text", "text": text})
             cfg["items"] = items
@@ -4893,19 +4737,6 @@ async def _on_message_impl(update, context):
             except: sec = 3
             items.append({"kind": "delay", "seconds": sec})
             cfg["items"] = items
-        elif kind == "add_fwd":
-            try:
-                mid = int(re.sub(r"[^\d]", "", text) or "0")
-                if mid > 0:
-                    items.append({"kind": "fwd_saved", "message_id": mid})
-                    cfg["items"] = items
-                    await tg_send(f"✅ fwd_saved mid={mid}")
-                else:
-                    await tg_send("❌ آیدی نامعتبر")
-                    return await show_pv_menu()
-            except Exception as e:
-                await tg_send(f"❌ {type(e).__name__}")
-                return await show_pv_menu()
         _save_pv_items(cfg)
         await tg_send("✅")
         return await show_pv_menu()
@@ -4929,14 +4760,8 @@ async def _on_message_impl(update, context):
         items = cfg.get("items") or []
 
         if local_path:
-            items.append({
-                "kind": "file",
-                "file_path": local_path,
-                "caption": caption
-            })
-            await tg_send(
-                f"✅ فایل ذخیره شد: <code>{os.path.basename(local_path)}</code>"
-            )
+            items.append({"kind": "file", "file_path": local_path, "caption": caption})
+            await tg_send(f"✅ فایل ذخیره شد: <code>{os.path.basename(local_path)}</code>")
         else:
             items.append({"kind": "text", "text": caption})
             await tg_send("✅ ذخیره شد")
@@ -5293,38 +5118,33 @@ async def route_cb(cid, data):
         if sub == "menu":
             return await show_pv_menu()
         if sub == "test":
-            lines = ["🧪 <b>تست اتصال PV (polling)</b>", ""]
+            lines = ["🧪 <b>تست اتصال PV (watermark mode)</b>", ""]
             lines.append(f"enabled: <b>{cfg.get('enabled')}</b>")
-            lines.append(f"poll: <b>{cfg.get('poll_seconds',5)}s</b>")
+            lines.append(f"poll: <b>{cfg.get('poll_seconds', 3)}s</b>")
+            lines.append(f"max_replies/user: <b>{cfg.get('max_replies', 1)}</b>")
             lines.append(f"pollers: <b>{len(PV_LISTENER_TASKS)}</b>")
+            wm = _wm_load()
             for aid, t in PV_LISTENER_TASKS.items():
                 acc = get_account(aid)
                 anm = acc.get("name", aid) if acc else aid
                 st = "🟢 running" if (t and not t.done()) else "🔴 dead"
-                seen_n = len(_PV_SEEN_MSGS.get(aid, {}))
-                lines.append(f"· {esc(anm)}: {st} (seen:{seen_n})")
+                wn = len([k for k in (wm.get(aid) or {}) if k != "_init"])
+                lines.append(f"· {esc(anm)}: {st} (chats tracked: {wn})")
             if not PV_LISTENER_TASKS:
                 lines.append("")
                 lines.append("⚠️ هیچ poller ای اجرا نمی‌شه")
-                lines.append("<i>روشن کن یا ری‌استارت بزن</i>")
             return await panel(head("🧪", "تست PV") + "\n".join(lines),
                                kb_([B("🔄 ری‌استارت", "pv:restart"), B("⬅️", "pv:menu")]),
                                page_tag="pv_test")
         if sub == "set_poll":
             get_conv(cid)["pv_wait"] = "poll"
-            return await ask("🔄 هر چند ثانیه چک کنه؟ (پیش‌فرض 5، حداقل 2):")
+            return await ask("🔄 هر چند ثانیه چک کنه؟ (پیش‌فرض 3، حداقل 2):")
+        if sub == "set_delay":
+            get_conv(cid)["pv_wait"] = "delay"
+            return await ask("⏱ تاخیر قبل از پاسخ (ثانیه، 0 = آنی):")
         if sub == "toggle_notify":
             cfg["notify"] = not bool(cfg.get("notify", True))
-            _save_pv_items(cfg)
-            return await show_pv_menu()
-        if sub == "toggle_notify_recv":
-            cfg["notify_on_receive"] = not bool(cfg.get("notify_on_receive", True))
-            _save_pv_items(cfg)
-            return await show_pv_menu()
-        if sub == "toggle_notify_rep":
-            cfg["notify_on_reply"] = not bool(cfg.get("notify_on_reply", True))
-            _save_pv_items(cfg)
-            return await show_pv_menu()
+            _save_pv_items(cfg); return await show_pv_menu()
         if sub == "toggle":
             cfg["enabled"] = not bool(cfg.get("enabled"))
             _save_pv_items(cfg)
@@ -5334,9 +5154,11 @@ async def route_cb(cid, data):
         if sub == "toggle_once":
             cfg["reply_once"] = not bool(cfg.get("reply_once", True))
             _save_pv_items(cfg); return await show_pv_menu()
-        if sub == "set_delay":
-            get_conv(cid)["pv_wait"] = "delay"
-            return await ask("⏱ تایمر (ثانیه):")
+        if sub == "cycle_max":
+            seq = [1, 2, 3, 5, 0]
+            cur = int(cfg.get("max_replies", 1) or 0)
+            cfg["max_replies"] = seq[(seq.index(cur) + 1) % len(seq)] if cur in seq else 1
+            _save_pv_items(cfg); return await show_pv_menu()
         if sub == "add_text":
             get_conv(cid)["pv_wait"] = "add_text"
             return await ask("💬 متن پیام:")
@@ -5346,72 +5168,6 @@ async def route_cb(cid, data):
         if sub == "add_saved":
             get_conv(cid)["pv_save_msg"] = True
             return await ask("📎 پیام/عکس/ویدیو/فایل رو بفرست:")
-        if sub == "add_fwd":
-            get_conv(cid)["pv_wait"] = "add_fwd"
-            return await ask(
-                "🆔 آیدی پیام داخل Saved Messages اکانت:\n\n"
-                "<i>برای دیدن لیست آیدی‌ها، از «📥 لیست Saved Messages» استفاده کن</i>"
-            )
-        if sub == "list_saved":
-            accounts = list_accounts()
-            if not accounts:
-                await tg_send("❌ اکانتی نیست")
-                return await show_pv_menu()
-            aid = list(accounts.keys())[0]
-            a = accounts[aid]
-            await panel("⏳ خواندن Saved Messages...", page_tag="pv_saved_list")
-            lines = []
-            cli = None
-            try:
-                cli, err = await _connect_with_retry(aid, a["session_string"], name=a.get("name"), tries=2)
-                if cli is None:
-                    lines = [f"❌ اتصال: {esc(str(err)[:150])}"]
-                else:
-                    try: me = await cli.get_me()
-                    except Exception: me = None
-                    msgs = []
-                    try:
-                        if me:
-                            try: await asyncio.sleep(0.5)
-                            except Exception: pass
-                            msgs = await cli.get_messages(me, limit=20)
-                    except Exception as me_ex:
-                        lines = [f"❌ خواندن پیام‌ها: {esc(type(me_ex).__name__)}: {esc(str(me_ex)[:100])}"]
-                    if not lines:
-                        if not msgs:
-                            lines = ["<i>Saved Messages خالیه</i>"]
-                        else:
-                            lines.append("")
-                            for m in msgs:
-                                mid = getattr(m, "id", None)
-                                txt = (getattr(m, "text", None)
-                                       or getattr(m, "message", "")
-                                       or "")
-                                has_media = bool(getattr(m, "media", None))
-                                has_doc = bool(getattr(m, "document", None))
-                                has_photo = bool(getattr(m, "photo", None))
-                                has_video = bool(getattr(m, "video", None))
-                                icon = "📎"
-                                if has_photo: icon = "🖼"
-                                elif has_video: icon = "🎬"
-                                elif has_doc: icon = "📁"
-                                elif not has_media: icon = "💬"
-                                lines.append(
-                                    f"{icon} <code>{mid}</code> · {esc(short(txt, 45))}"
-                                )
-            except Exception as e:
-                lines = [f"❌ {esc(type(e).__name__)}: {esc(str(e)[:120])}"]
-            finally:
-                if cli:
-                    try: await cli._disconnect()
-                    except Exception: pass
-            body = head("📥", "Saved Messages",
-                        esc(a.get("name", "?"))) + "\n".join(lines)
-            return await panel(body,
-                               kb_([B("➕ افزودن با آیدی", "pv:add_fwd"),
-                                    B("🔄 بروزرسانی", "pv:list_saved")],
-                                   [B("⬅️ بازگشت", "pv:menu")]),
-                               page_tag="pv_saved_list")
         if sub == "list": return await show_pv_list()
         if sub == "del" and len(p) >= 3:
             try: i = int(p[2])
@@ -5426,7 +5182,13 @@ async def route_cb(cid, data):
         if sub == "restart":
             await restart_all_pv(); await tg_send("🔄"); return await show_pv_menu()
         if sub == "clear_replies":
-            _clear_pv_replies(); await tg_send("🧹"); return await show_pv_menu()
+            _clear_pv_replies()
+            try: _save(PV_WM_FILE, {})
+            except Exception: pass
+            global _PV_WM, _PV_WM_DIRTY
+            _PV_WM = None; _PV_WM_DIRTY = False
+            await tg_send("🧹 شمارنده و watermark ریست شد")
+            return await show_pv_menu()
         if sub == "report":
             try: pg = int(p[2]) if len(p) > 2 else 0
             except: pg = 0
