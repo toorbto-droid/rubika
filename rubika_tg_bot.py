@@ -19,7 +19,7 @@ _SC = str.maketrans({
     'S':'ꜱ','T':'ᴛ','U':'ᴜ','V':'ᴠ','W':'ᴡ','X':'x','Y':'ʏ','Z':'ᴢ',
 })
 def SC(s): return str(s).translate(_SC)
-def HLINE(): return "━━━━━━━━━━━━━━━━━━━━━━"
+def HLINE(): return "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 TICK = "⤳"
 
 # ═══════════════ DATA DIR ═══════════════
@@ -2118,10 +2118,10 @@ def head(icon, title, sub=None):
     s = f"{{{icon}}} {SC(title)}"
     if sub: s += f"  ({sub})"
     return "\n" + s + "\n" + HLINE() + "\n"
-def mrow(emoji, key, value, key_width=16):
+def mrow(emoji, key, value, key_width=22):
     k = SC(str(key))
     pad = " " * max(1, key_width - len(k))
-    return f"{emoji}{TICK}{k}{pad}: {value}"
+    return f"{emoji}{TICK}{k}{pad}  :  {value}"
 def dots(cur, total):
     return "".join("●" if i <= cur else "○" for i in range(1, total+1)) + f"  {cur}/{total}"
 def _bar(pct, n=14):
