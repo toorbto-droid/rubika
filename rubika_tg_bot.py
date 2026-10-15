@@ -2459,6 +2459,29 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, filters as tg_filters)
 from telegram.request import HTTPXRequest
 
+# ─── PATCH v74.1 ──────────────────────────────────────────────
+HR = globals().get("HR", "━━━━━━━━━━━━")
+PAGE_SIZE = globals().get("PAGE_SIZE", 6)
+_TMP_EDIT = globals().get("_TMP_EDIT", {})
+
+if "esc" not in globals():
+    def esc(s): return _html.escape(str(s if s is not None else ""))
+
+if "short" not in globals():
+    def short(s, n=40):
+        s = str(s or "").replace("\n", " ")
+        return s if len(s) <= n else s[:n-1] + "…"
+
+if "kb_" not in globals():
+    def kb_(*rows):
+        return InlineKeyboardMarkup([list(r) for r in rows if r])
+
+if "dots" not in globals():
+    def dots(cur, total):
+        return "".join("●" if i <= cur else "○" for i in range(1, total+1)) + f"  {cur}/{total}"
+# ─── END PATCH ────────────────────────────────────────────────
+
+
 HR = "━━━━━━━━━━━━"
 PAGE_SIZE = 6
 _TMP_EDIT = {}
