@@ -1,11 +1,11 @@
-# rubika_tg_bot.py — v74 (merged: Rubika + Soroosh features · bilingual fa/en · colored buttons)
+# rubika_tg_bot.py — v75 (fixed · fast · exact rubpy API · same UI as original)
 # Railway-ready · token/owner from app.py or env
 import os, sys, ssl, json, socket, asyncio, time, glob, re, threading, secrets, queue
 import logging, traceback, concurrent.futures, inspect, random, hashlib
 import html as _html
 import builtins
 
-VERSION = "v74"
+VERSION = "v75"
 
 # ══════════════════════════════════════════════════════════════
 # DATA DIR
@@ -115,7 +115,7 @@ except Exception: pass
 from rubpy import Client as _C
 
 # ══════════════════════════════════════════════════════════════
-# i18n + colored buttons (ported from Soroosh)
+# i18n + colored buttons
 # ══════════════════════════════════════════════════════════════
 LANG_FILE = os.path.join(DATA_DIR, "lang.json")
 _LANG = {"v": None}
@@ -155,8 +155,6 @@ _TR = {
  "on":{"fa":"روشن","en":"on"},"off":{"fa":"خاموش","en":"off"},
  "all":{"fa":"همه","en":"all"},"empty":{"fa":"خالی","en":"empty"},
  "loading":{"fa":"در حال بارگذاری...","en":"loading..."},"not_found":{"fa":"پیدا نشد.","en":"not found."},
- "saved":{"fa":"ذخیره شد","en":"saved"},"deleted":{"fa":"حذف شد","en":"deleted"},
- "cleared":{"fa":"پاک شد","en":"cleared"},"restarted":{"fa":"ری‌استارت شد","en":"restarted"},
  "enter":{"fa":"بفرست","en":"send"},"phone":{"fa":"شماره","en":"phone"},"id":{"fa":"شناسه","en":"id"},
  "name":{"fa":"نام","en":"name"},"last_name":{"fa":"فامیل","en":"last name"},
  "username":{"fa":"یوزرنیم","en":"username"},"bio":{"fa":"بیو","en":"bio"},
@@ -337,6 +335,8 @@ def mrow(emoji, key, value):
     k = T(key) if key in _TR else str(key)
     if is_en(): k = SC(k)
     return f"{emoji} : {k} : {value}"
+def dots(cur, total):
+    return "".join("●" if i <= cur else "○" for i in range(1, total+1)) + f"  {cur}/{total}"
 
 # ══════════════════════════════════════════════════════════════
 # ACCOUNT LOCKS
@@ -1141,9 +1141,21 @@ async def _resolve_target(bot, t):
     return None, None
 
 async def get_all_chats_raw(bot):
+    """دریافت لیست چتها — نسخه اصلاح‌شده برای rubpy"""
+    out = []
     try:
-        chats = _g(await bot.get_chats(), "chats") or []
-        out = []
+        # rubpy: get_chats() یک async iterator برمی‌گرداند
+        result = bot.get_chats()
+        if asyncio.iscoroutine(result): result = await result
+        chats = []
+        if hasattr(result, "__aiter__"):
+            async for c in result:
+                chats.append(c)
+                if len(chats) >= 500: break
+        elif isinstance(result, list):
+            chats = result
+        elif isinstance(result, dict):
+            chats = result.get("chats") or result.get("data") or []
         for c in chats:
             a = _g(c, "abs_object", "absObject") or c
             guid = _candidate_guid(a) or _candidate_guid(c)
@@ -1155,9 +1167,9 @@ async def get_all_chats_raw(bot):
                         "username": _g(a, "username","user_name","userName") or "",
                         "is_blocked": bool(_g(a, "is_blocked") or _g(c, "is_blocked")),
                         "raw": _to_plain(c)})
-        return out
-    except Exception:
-        return []
+    except Exception as e:
+        print(f"[get_all_chats_raw] {type(e).__name__}: {e}")
+    return out
 
 def _is_true_group(c):
     t = (c.get("type") or "").strip()
@@ -1339,7 +1351,7 @@ def _save_op(op):
     else: ops.append(op)
     _save_ops(ops)
 def _op_stats(op):
-    if op.get("type") == "joinlef":
+    if op.get("type") in ("joinlef","autotar","lefter"):
         p = op.get("progress") or {}
         joined = p.get("joined", 0); failed = p.get("failed", 0)
         total = p.get("total", 0); done = joined + failed
@@ -1356,7 +1368,7 @@ def _op_stats(op):
     return s
 def _op_effective_status(op):
     st = op.get("status", "draft")
-    if op.get("type") == "joinlef":
+    if op.get("type") in ("joinlef","autotar","lefter"):
         if st in ("done","failed","cancelled","paused"): return st
         return "running"
     if st == "scheduled":
@@ -1374,6 +1386,8 @@ def _op_effective_status(op):
     return "queued"
 def _op_short_title(op, n=32):
     if op.get("type") == "joinlef": return "🤝 Joiner"
+    if op.get("type") == "lefter": return "🚪 Lefter"
+    if op.get("type") == "autotar": return "🎯 AutoTar"
     p = op.get("payload") or {}
     if p.get("file"):
         base = f"{KIND_ICON.get(p.get('kind'),'📎')} {p.get('file_name','فایل')}"
@@ -1583,7 +1597,7 @@ async def run_workers(cfg, log):
     log(f"🎯 تمام! ✅{s['done']} ❌{s['failed']}")
 
 # ══════════════════════════════════════════════════════════════
-# JOINER
+# JOINER — اصلاح‌شده با API صحیح rubpy
 # ══════════════════════════════════════════════════════════════
 def _hash_of(link):
     if not link: return ""
@@ -1596,12 +1610,21 @@ def _hash_of(link):
     return "x:" + s[:50]
 
 async def _try_join_single(bot, link):
+    """
+    عضویت با استفاده از API صحیح rubpy.
+    rubpy: bot.join_chat(chat=guid_or_link)
+    """
     is_link = ("://" in link) or ("rubika.ir" in link.lower()) or ("/joing/" in link.lower())
-    if is_link:
-        fn = getattr(bot, "join_group", None)
-        if fn:
+    # روش ۱: استفاده از join_chat (ساده‌ترین و مستقیم‌ترین)
+    fn = getattr(bot, "join_chat", None)
+    if fn:
+        for kw in ({"chat": link}, {"chat": link, "request_needed": False},
+                   {"object_guid": link} if not is_link else None):
+            if kw is None: continue
             try:
-                r = fn(link=link)
+                kw2 = _filter_kwargs(fn, kw)
+                if not kw2: continue
+                r = fn(**kw2)
                 if asyncio.iscoroutine(r): r = await r
                 if _is_ok_response(r):
                     guid = extract_chat_guid(r)
@@ -1611,35 +1634,46 @@ async def _try_join_single(bot, link):
                         _find_keys(d, ("object_guid","chat_guid","group_guid","channel_guid","guid"), found)
                         guid = (found.get("object_guid") or found.get("chat_guid") or
                                 found.get("group_guid") or found.get("channel_guid") or found.get("guid"))
-                    return True, guid, "join_group"
+                    return True, guid, "join_chat"
                 err = _fmt_error(r)
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                     return True, None, "already"
+                return False, err, "join-failed"
+            except TypeError: continue
+            except Exception as e:
+                err = _fmt_error(e)
+                if "ALREADY" in err.upper() or "MEMBER" in err.upper():
+                    return True, None, "already"
+                # اگه با chat کار نکرد، با روش بعدی امتحان کن
+                continue
+    # روش ۲: join_group_by_link برای لینک‌های دعوت
+    if is_link:
+        fn = getattr(bot, "join_group_by_link", None)
+        if fn:
+            try:
+                r = fn(link=link)
+                if asyncio.iscoroutine(r): r = await r
+                if _is_ok_response(r):
+                    guid = extract_chat_guid(r)
+                    return True, guid, "join_group_by_link"
+                err = _fmt_error(r)
+                if "ALREADY" in err.upper(): return True, None, "already"
                 return False, err, "join-failed"
             except Exception as e:
                 err = _fmt_error(e)
                 if "ALREADY" in err.upper() or "MEMBER" in err.upper():
                     return True, None, "already"
-                return False, err, "join-failed"
-        return False, "no-method", "join-failed"
+    # روش ۳: join_channel_action برای کانال‌ها
     guid, kind = await _resolve_target(bot, link)
-    if not guid: return False, "resolve-failed", "resolve"
-    try:
-        if kind == "Channel" or (guid and guid[0].lower() == "c"):
-            r = bot.join_channel_action(channel_guid=guid, action="Join")
-        else:
-            r = bot.join_chat(chat=guid)
-        if asyncio.iscoroutine(r): r = await r
-        if _is_ok_response(r): return True, guid, "join"
-        err = _fmt_error(r)
-        if "ALREADY" in err.upper() or "MEMBER" in err.upper():
-            return True, guid, "already"
-        return False, err, "join-failed"
-    except Exception as e:
-        err = _fmt_error(e)
-        if "ALREADY" in err.upper() or "MEMBER" in err.upper():
-            return True, guid, "already"
-        return False, err, "join-failed"
+    if guid:
+        try:
+            fn = getattr(bot, "join_channel_action", None)
+            if fn:
+                r = fn(channel_guid=guid, action="Join")
+                if asyncio.iscoroutine(r): r = await r
+                if _is_ok_response(r): return True, guid, "join_channel_action"
+        except Exception: pass
+    return False, "no-join-method", "join-failed"
 
 async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
     found = set(); anchor = None; read_total = 0; batch = 25
@@ -1674,7 +1708,7 @@ async def _extract_links_from_bot(bot, guid, limit=500, want=None, log=None):
         if new_anchor == anchor: break
         anchor = new_anchor
         if want and len(found) >= want: break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)  # کاهش تاخیر
     return found
 
 JOIN_DEFAULTS = ["@linkdony_rubikas","@lovo_lovoo0","@CBkJCCFE1IZHOEMRXTHDONBZMQLEJJGK"]
@@ -1694,20 +1728,16 @@ async def _joiner_worker_for_account(aid, acc, op_id, join_delay, max_join, auto
             guid, kind = await _resolve_target(bot, link)
             if not guid: continue
             try:
-                if kind == "Channel" or (guid and guid[0].lower() == "c"):
-                    r = bot.join_channel_action(channel_guid=guid, action="Join")
-                else:
-                    r = bot.join_chat(chat=guid)
-                if asyncio.iscoroutine(r): r = await r
-                if _is_ok_response(r):
-                    linkdoni_guids.append(guid)
+                ok, res, tag = await _try_join_single(bot, link)
+                if ok:
+                    linkdoni_guids.append(guid if guid else res)
                     async with lock:
                         op = _get_op(op_id)
                         if op:
                             op["progress"].setdefault("linkdoni_ok", []).append(link)
                             _save_op(op)
             except Exception: pass
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         if not linkdoni_guids: return
         async with lock:
             op = _get_op(op_id)
@@ -1815,13 +1845,17 @@ async def run_joiner_lefter(op, log):
     _OP_LOCKS.pop(op["id"], None)
 
 # ══════════════════════════════════════════════════════════════
-# LEFTER
+# LEFTER — اصلاح‌شده با API صحیح rubpy
 # ══════════════════════════════════════════════════════════════
 async def _lefter_collect(bot, mode="all", exclude_ids=None):
+    """جمع‌آوری گروه‌ها/کانال‌ها برای ترک — اصلاح‌شده"""
     exclude_ids = exclude_ids or set()
     out = []
-    try: chats = await get_all_chats_raw(bot)
-    except Exception: return out
+    try:
+        chats = await get_all_chats_raw(bot)
+    except Exception as e:
+        print(f"[lefter_collect] {type(e).__name__}: {e}")
+        return out
     for c in chats or []:
         try:
             ctype = (c.get("type") or "").strip()
@@ -1839,24 +1873,51 @@ async def _lefter_collect(bot, mode="all", exclude_ids=None):
     return out
 
 async def _lefter_leave_one(bot, target):
+    """
+    ترک گروه/کانال با API صحیح rubpy.
+    rubpy: bot.leave_chat(object_guid=guid)
+    """
     guid = target.get("guid"); kind = target.get("kind")
-    try:
-        if kind == "channel" or (guid and guid[0].lower() == "c"):
-            fn = getattr(bot, "join_channel_action", None)
-            if fn:
+    if not guid: return False, "no-guid"
+    # روش ۱: leave_chat (متد اصلی rubpy)
+    fn = getattr(bot, "leave_chat", None)
+    if fn:
+        for kw in ({"object_guid": guid}, {"chat": guid}, {"object_guid": guid, "type": "Global"}):
+            try:
+                kw2 = _filter_kwargs(fn, kw)
+                if not kw2: continue
+                r = fn(**kw2)
+                if asyncio.iscoroutine(r): r = await r
+                return True, None
+            except TypeError: continue
+            except Exception as e:
+                msg = str(e).upper()
+                if "NOT_MEMBER" in msg or "ALREADY" in msg: return True, "already_left"
+                # اگه leave_chat کار نکرد، روش بعدی
+                continue
+    # روش ۲: join_channel_action با action=Leave
+    if kind == "channel" or (guid and guid[0].lower() == "c"):
+        fn = getattr(bot, "join_channel_action", None)
+        if fn:
+            try:
                 r = fn(channel_guid=guid, action="Leave")
                 if asyncio.iscoroutine(r): r = await r
                 return True, None
-        fn = getattr(bot, "leave_chat", None) or getattr(bot, "leave_group", None)
-        if fn:
-            r = fn(chat=guid)
+            except Exception as e:
+                msg = str(e).upper()
+                if "NOT_MEMBER" in msg or "ALREADY" in msg: return True, "already_left"
+    # روش ۳: remove_chat
+    fn = getattr(bot, "remove_chat", None)
+    if fn:
+        try:
+            r = fn(object_guid=guid)
             if asyncio.iscoroutine(r): r = await r
             return True, None
-        return False, "no-leave-method"
-    except Exception as e:
-        msg = str(e).upper()
-        if "NOT_MEMBER" in msg or "ALREADY" in msg: return True, "already_left"
-        return False, _fmt_error(e)
+        except Exception as e:
+            msg = str(e).upper()
+            if "NOT_MEMBER" in msg or "ALREADY" in msg: return True, "already_left"
+            return False, _fmt_error(e)
+    return False, "no-leave-method"
 
 async def _lefter_worker(aid, acc, op_id, mode, delay, log):
     nm = acc.get("name") or aid
@@ -2227,7 +2288,7 @@ def _stop_pv_for_account(aid):
     if t and not t.done(): t.cancel()
 
 # ══════════════════════════════════════════════════════════════
-# LISTENER (پیام‌های سرویس ورود روبیکا)
+# LISTENER
 # ══════════════════════════════════════════════════════════════
 LISTENER_SEEN = {}
 LISTENER_SEEN_LOCK = threading.Lock()
@@ -2459,29 +2520,6 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, filters as tg_filters)
 from telegram.request import HTTPXRequest
 
-# ─── PATCH v74.1 ──────────────────────────────────────────────
-HR = globals().get("HR", "━━━━━━━━━━━━")
-PAGE_SIZE = globals().get("PAGE_SIZE", 6)
-_TMP_EDIT = globals().get("_TMP_EDIT", {})
-
-if "esc" not in globals():
-    def esc(s): return _html.escape(str(s if s is not None else ""))
-
-if "short" not in globals():
-    def short(s, n=40):
-        s = str(s or "").replace("\n", " ")
-        return s if len(s) <= n else s[:n-1] + "…"
-
-if "kb_" not in globals():
-    def kb_(*rows):
-        return InlineKeyboardMarkup([list(r) for r in rows if r])
-
-if "dots" not in globals():
-    def dots(cur, total):
-        return "".join("●" if i <= cur else "○" for i in range(1, total+1)) + f"  {cur}/{total}"
-# ─── END PATCH ────────────────────────────────────────────────
-
-
 HR = "━━━━━━━━━━━━"
 PAGE_SIZE = 6
 _TMP_EDIT = {}
@@ -2490,6 +2528,9 @@ def esc(s): return _html.escape(str(s if s is not None else ""))
 def short(s, n=40):
     s = str(s or "").replace("\n", " ")
     return s if len(s) <= n else s[:n-1] + "…"
+
+def kb_(*rows):
+    return InlineKeyboardMarkup([list(r) for r in rows if r])
 
 def authorized(update):
     try: return update.effective_chat.id == FORCED_OWNER
@@ -2772,8 +2813,6 @@ async def send_step_accounts(cid, s):
     rows.append([B("🏠 "+T("back_to_panel"), "menu:main")])
     txt = head("📤", "send", dots(1,4)) + T("send_step1") + "\n" + _send_summary(s)
     await panel(txt, kb_(*rows))
-
-def dots(cur, total): return "".join("●" if i <= cur else "○" for i in range(1, total+1)) + f"  {cur}/{total}"
 
 async def send_step_compose(cid, s):
     txt = head("📤", "send", dots(2,4)) + T("send_step2") + _send_summary(s)
@@ -3393,7 +3432,7 @@ async def show_errors(page=0):
         return await panel(head("⚠️", "errors") + T("errors_none"), kb_(nav()))
     PER = 5; pages = max(1, -(-len(errors) // PER)); page = max(0, min(page, pages-1))
     chunk = errors[page*PER:(page+1)*PER]
-    txt = head("⚠️", "errors", f"{page+1}/{pages}") 
+    txt = head("⚠️", "errors", f"{page+1}/{pages}")
     for e in chunk:
         t = time.strftime('%m/%d %H:%M', time.localtime(e.get("time", 0)))
         txt += f"\n🕐 <code>{esc(t)}</code> · <b>{esc(e.get('source','?'))}</b>\n"
@@ -3414,7 +3453,7 @@ async def show_op_detail(oid):
     s = _op_stats(op); bar, _ = _op_progress_bar(op)
     txt = head("📋", f"{op['id']}")
     txt += f"{ico} <b>{esc(ttl)}</b>\n\n<code>{esc(bar)}</code>\n\n"
-    if op.get("type") == "joinlef":
+    if op.get("type") in ("joinlef","autotar","lefter"):
         p = op.get("progress") or {}
         txt += f"📍 {esc(p.get('phase','—'))}\n"
         txt += f"✅ {s['done']} · ❌ {s['failed']}\n"
@@ -4434,13 +4473,11 @@ async def route_cb(cid, data):
         if sub == "stop" and oid:
             op = _get_op(oid)
             if op:
-                if op.get("type") == "joinlef":
+                if op.get("type") in ("joinlef","autotar"):
                     t = JL_JOBS.get(oid)
                     if t and not t.done(): t.cancel()
-                    op["status"] = "cancelled"
-                    op["finished_at"] = int(time.time())
-                    _save_op(op)
-                elif op.get("type") == "autotar":
+                    op["status"] = "cancelled"; op["finished_at"] = int(time.time()); _save_op(op)
+                elif op.get("type") == "lefter":
                     op["status"] = "cancelled"; _save_op(op)
                 else:
                     op["status"] = "paused"
