@@ -528,18 +528,32 @@ def clear_errors():
 def list_accounts(): return _load(ACC_FILE, {})
 def save_accounts(a): _save(ACC_FILE, a)
 def get_account(aid): return list_accounts().get(aid)
-def add_account(aid, phone, name, session_name, user_guid=None):
+def add_account(aid, phone, name, session_string, user_id=None):
+    """دقیقاً مثل سروش: session_string در accounts.json ذخیره میشه."""
     accounts = list_accounts()
-    accounts[aid] = {"phone":phone,"name":name,"session_name":session_name,
-        "user_guid":user_guid,"created":int(time.time()),"channels":[]}
+    accounts[aid] = {"phone": phone, "name": name, "session_string": session_string,
+                     "user_id": user_id, "created": int(time.time()), "channels": []}
     save_accounts(accounts); return accounts[aid]
+
 def remove_account(aid):
-    accounts = list_accounts(); accounts.pop(aid, None); save_accounts(accounts)
+    accounts = list_accounts(); a = accounts.pop(aid, None); save_accounts(accounts)
     _STATS_CACHE.pop(aid, None)
+    if a:
+        sess = a.get("session_string") or a.get("session_name") or os.path.join(SESSIONS_DIR, aid)
+        for f in glob.glob(sess + "*"):
+            try: os.remove(f)
+            except Exception: pass
     try: _delete_pv_account(aid)
     except Exception: pass
     try: _clear_seen(aid); _clear_banned(aid); _reset_ld_progress(aid)
     except Exception: pass
+
+def _get_sess_path(aid):
+    """helper — مسیر سشن (سبک سروش)."""
+    acc = get_account(aid) or {}
+    return acc.get("session_string") or _get_sess_path(aid)
+
+
 def get_stored_channels(aid):
     a = get_account(aid); return list(a.get("channels") or []) if a else []
 def get_own_channel_ids(aid):
@@ -583,7 +597,6 @@ def _get_account_lock(aid):
         return _ACCOUNT_LOCKS[aid]
 
 class SafeClient:
-    """Wrapper around rubpy.Client that auto-loads session and provides direct async methods."""
     def __init__(self, aid, session_path, name=None, use_lock=True):
         self.aid = aid; self.session_path = session_path; self.name = name or aid
         self._client = None
@@ -624,7 +637,9 @@ class SafeClient:
         if self._client is None: raise AttributeError(f"not connected: {name}")
         return getattr(self._client, name)
 
-async def _connect_with_retry(aid, session_path, name=None, tries=3, per_timeout=35):
+async def _connect_with_retry(aid, session_path=None, name=None, tries=3, per_timeout=35):
+    if session_path is None:
+        session_path = _get_sess_path(aid)
     last_err = None
     for i in range(tries):
         cli = None
@@ -650,6 +665,7 @@ async def _connect_with_retry(aid, session_path, name=None, tries=3, per_timeout
             except Exception: pass
             await asyncio.sleep(2 + i)
     return None, last_err
+
 
 # ═══════════════ RUBPY HELPERS (with exact API) ═══════════════
 def _to_dict(o):
@@ -923,64 +939,51 @@ def ensure_rubika_loop():
             _rubika_loop_thread = threading.Thread(target=_run_rubika_loop, daemon=True, name="rubika-loop")
             _rubika_loop_thread.start(); time.sleep(0.5)
 
-async def rubika_send_code(phone_raw):
-    ensure_rubika_loop()
-    phone = normalize_phone(phone_raw)
-    loop = asyncio.get_running_loop(); fut = loop.create_future()
-    async def _do():
-        aid = "acc_" + secrets.token_hex(4)
-        sess_path = os.path.join(SESSIONS_DIR, aid)
-        _LOGIN_TMP[phone] = {"aid":aid,"sess_path":sess_path,"step":"start"}
-        # rubpy Client will prompt for input() for code/pass — we handle via fake input
-        return {"ok":True,"phone":phone,"aid":aid}
-    return await _do()
-
 async def _do_full_login(phone, code, admin_id):
-    """Interactive login using rubpy, feeding code via fake input."""
+    """interactive login — دقیقاً مثل سروش."""
     aid = "acc_" + secrets.token_hex(4)
     sess_path = os.path.join(SESSIONS_DIR, aid)
     loop = asyncio.get_running_loop()
     input_queue = queue.Queue()
     pending_inputs[admin_id] = {"step":"login","q":input_queue,"aid":aid,"sess_path":sess_path}
     def fake_input(prompt=""):
-        msg = str(prompt).strip() or "مقدار بعدی:"
-        asyncio.run_coroutine_threadsafe(tg_send(f"📨 {msg}"), loop)
+        msg = str(prompt).strip() or "مقدار بعدی رو بفرست:"
+        asyncio.run_coroutine_threadsafe(tg_send(f"📨 {msg}", parse_mode="HTML"), loop)
         try: return input_queue.get(timeout=300)
         except Exception as e: raise RuntimeError(f"input timeout: {e}")
-    # seed the code
     input_queue.put(code)
-
     def worker():
-        old = builtins.input if hasattr(builtins, "input") else None
         import builtins as _b
         old_in = _b.input
         _b.input = fake_input
         try:
             async def run():
-                cli = _RClient(name=sess_path)
-                await cli.start(phone_number=phone)
-                me = await cli.get_me()
-                try: await cli.disconnect()
+                c = _RClient(name=sess_path)
+                await c.start(phone_number=phone)
+                me = await c.get_me()
+                try: await c.disconnect()
                 except Exception: pass
                 return me
             return asyncio.run(run())
         finally:
             _b.input = old_in
-
     try:
         me = await asyncio.to_thread(worker)
         d = _to_dict(me); u = d.get("user") or {}
-        name = u.get("first_name") or phone
+        name = (f"{u.get('first_name','') or ''} {u.get('last_name','') or ''}").strip() or phone
         guid = u.get("user_guid") or u.get("guid")
         add_account(aid, phone, name, sess_path, guid)
         pending_inputs.pop(admin_id, None)
-        return {"ok":True,"aid":aid,"name":name}
+        flog(f"[login] OK {aid} -> {sess_path}.rp")
+        return {"ok": True, "aid": aid, "name": name}
     except Exception as e:
         for f in glob.glob(sess_path + "*"):
             try: os.remove(f)
             except Exception: pass
         pending_inputs.pop(admin_id, None)
-        return {"ok":False,"status":str(e)[:300]}
+        flog(f"[login] FAIL: {e}", "error")
+        return {"ok": False, "status": str(e)[:300]}
+
 
 # ═══════════════ LEFTER ═══════════════
 async def _lefter_collect(bot, mode="all", exclude_ids=None):
@@ -1023,7 +1026,7 @@ async def _lefter_worker(aid, acc, op_id, mode, delay, log):
     cli = None
     try:
         await _set_phase(T("ph_connect"))
-        cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=3)
+        cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=3)
         if cli is None: await _finish(T("ph_connect_fail", n=err)); return
         await _set_phase(T("ph_collecting"))
         own_ids = get_own_channel_ids(aid)
@@ -1107,7 +1110,7 @@ async def _joiner_worker(aid, acc, op_id, join_delay, max_join, auto_msg, log):
         await _refresh_op_panel(op_id)
     try:
         await _set_phase(T("ph_connect"))
-        cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=3)
+        cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=3)
         if cli is None: await _finish(T("ph_connect_fail", n=err)); return
         try:
             me = await asyncio.wait_for(cli.get_me(), timeout=25)
@@ -1330,7 +1333,7 @@ async def _send_worker(aid, acc, op_id, cfg, stop, log):
         await _refresh_op_panel(op_id)
     try:
         await _set_phase(T("ph_connect"))
-        cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=3)
+        cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=3)
         if cli is None:
             async with lock:
                 op2 = _get_op(op_id)
@@ -1509,7 +1512,7 @@ async def _auto_tar_worker(aid, acc, op_id, tpl, log):
         await _refresh_op_panel(op_id)
     try:
         await _phase(T("ph_connect"))
-        cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=3)
+        cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=3)
         if cli is None: await _finish(T("ph_connect_fail", n=err)); return
         me = await cli.get_me(); me_d = _to_dict(me)
         my_guid = (me_d.get("user") or {}).get("user_guid") or me_d.get("user_guid")
@@ -1667,7 +1670,7 @@ async def _pv_send_reply(aid, acc, sender_guid, cfg, stop_event):
             await asyncio.sleep(1)
         cfg = _load_pv_account(aid)
         try:
-            cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=2, per_timeout=20)
+            cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=2, per_timeout=20)
             if cli: connected = True
             else: _fail(f"connect: {err}")
         except Exception as e: _fail(f"{type(e).__name__}")
@@ -1714,7 +1717,7 @@ async def _pv_poller_worker(aid, acc, stop_event):
             if not cfg.get("enabled"): await _sleep_or_stop(stop_event, poll); continue
             try:
                 if cli is None:
-                    cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=1, per_timeout=20)
+                    cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=1, per_timeout=20)
                     if cli is None: await _sleep_or_stop(stop_event, 10); continue
                     me = await cli.get_me(); me_d = _to_dict(me)
                     my_guid = (me_d.get("user") or {}).get("user_guid") or me_d.get("user_guid")
@@ -1792,7 +1795,7 @@ async def _listener_loop(aid, acc, stop_event):
     while not stop_event.is_set():
         cli = None
         try:
-            cli, err = await _connect_with_retry(aid, acc["session_name"], name=name, tries=3)
+            cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=name, tries=3)
             if cli is None: await asyncio.sleep(30); continue
             while not stop_event.is_set(): await asyncio.sleep(5)
         except asyncio.CancelledError: raise
@@ -1833,7 +1836,7 @@ async def keepalive_loop():
             for aid, acc in list_accounts().items():
                 cli = None
                 try:
-                    cli, err = await _connect_with_retry(aid, acc["session_name"], name=acc.get("name"), tries=2)
+                    cli, err = await _connect_with_retry(aid, _get_sess_path(aid), name=acc.get("name"), tries=2)
                     if cli: await cli.get_me()
                 except Exception: pass
                 finally:
