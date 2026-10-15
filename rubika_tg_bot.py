@@ -4765,4 +4765,4 @@ def main(token: str = None, owner_id: int = None):
 
 if __name__ == "__main__":
     try: main()
-    except KeyboardInterrupt: print("\n[!] قطع")
+    except KeyboardInterrupt: print("\n[!] هقطع")
